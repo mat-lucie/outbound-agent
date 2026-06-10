@@ -1,0 +1,384 @@
+# ICP (Ideal Customer Profile) scoring configuration — template.
+#
+# Copy this file to config/icp.yaml and edit it to define YOUR ICP. The live
+# config/icp.yaml is gitignored (see config/.gitignore); only this
+# *.example.yaml template is tracked. If config/icp.yaml is absent, the engine
+# falls back to THIS file, so the shipped defaults below are the active ICP.
+#
+# This file holds the DETERMINISTIC scoring inputs only: keyword lists, industry
+# buckets, numeric weights, thresholds, and geography lists. The qualifier's
+# scoring MATH/LOGIC lives in workflows/quality_gate.py and is unchanged by this
+# externalization — only the SOURCE of these values moved from hardcoded
+# literals to this file.
+#
+# The values below are a NEUTRAL, generic-B2B starting point — replace them with
+# your own ICP. A complete worked example (the reference operator this engine was
+# example) lives at examples/acme/config/icp.yaml; read it side-by-side for a
+# fully fleshed-out, multi-language ICP.
+#
+# The LLM tiebreaker prompt's narrative ICP slots live under `qualifier_prompt:`
+# below. They feed config/prompts/qualifier.md.j2, which assembles them with the
+# STATIC engine scaffolding (the JSON output contract) into the full
+# QUALIFIER_SYSTEM_PROMPT. The output-format / lane semantics stay in the
+# template — that is engine contract, not operator-tunable ICP.
+#
+# Order matters for keyword lists that are scanned for the FIRST positional
+# match (disqualifier families) — preserve the ordering intent when editing.
+
+# ── LLM qualifier prompt slots ───────────────────────────────────────
+# Narrative, ICP-specific pieces of the LLM tiebreaker's system prompt. These
+# render through config/prompts/qualifier.md.j2 into QUALIFIER_SYSTEM_PROMPT.
+# Only the ICP narrative is here; the JSON output contract is STATIC in the
+# template (it is the shape the qualifier parses, not operator-tunable ICP).
+qualifier_prompt:
+  # One-line product / target description. Rendered as:
+  #   "You qualify B2B LinkedIn prospects for {product_summary}."
+  product_summary: "Acme (a B2B SaaS platform for mid-to-large enterprises)"
+
+  # Geography / market gate paragraph. Rendered after the static lead-in
+  #   "Two ICP lanes — classify into exactly one. "
+  geography_requirement: >-
+    The prospect should sit at a company in your served market. Adjust or remove
+    this gate to match where you actually sell.
+
+  # The ICP-lane description blocks, one string per lane, rendered in order
+  # separated by a blank line. Bold/markdown markers are part of the value.
+  lanes:
+    - >-
+      **ICP 1 — Enterprise (PRIMARY):** Larger organizations with an established
+      buying committee and budget for new tooling. Target buyer is the leader
+      who owns the relevant function (e.g. VP / Director / Head of the team that
+      would adopt the product), not an individual contributor.
+    - >-
+      **ICP 2 — Mid-market (SECONDARY):** Smaller, faster-moving companies where
+      a single decision-maker (founder, owner, department head) can approve a
+      purchase. Title is a clear decision-maker for the relevant function.
+
+  # Hard-disqualifier bullets. Each string is one bullet (the template adds the
+  # leading "- "). Edit these to match who is NEVER a fit for your product.
+  disqualifiers:
+    - "Consultants, freelancers, advisors (unless clearly an operational role inside a target company)"
+    - "Academics, professors, researchers, students"
+    - "Direct competitors and vendors selling a substitute product"
+    - "Individuals with no authority or influence over the relevant buying decision"
+    - "Roles in functions your product does not serve"
+    - "Non-profits and institutions outside your commercial market (adjust if they are in-scope for you)"
+    - "Junior / individual-contributor roles without manager scope"
+    - "Sales / commercial / marketing roles — they sit on the revenue side and rarely own the buying decision for an operational tool. **Exception:** roles that explicitly own the function your product serves."
+
+  # Short glosses for the two ICP lanes, rendered into the static output-format
+  # line: "`icp_lane` is 1 for ICP 1 ({lane_labels[0]}), 2 for ICP 2
+  # ({lane_labels[1]})." Exactly TWO entries.
+  lane_labels:
+    - "enterprise"
+    - "mid-market"
+
+# ── Persona classification keywords ──────────────────────────────────
+# Used to bucket a prospect into a persona, and by the role-fit scorer to detect
+# champion / executive / operations signals. Replace with the title language
+# that matters for YOUR buyer.
+roles:
+  # Change-agent / champion signals → the "champion" persona bucket.
+  digitalization_keywords:
+    - transformation
+    - innovation
+    - modernization
+    - automation
+    - digital
+
+  # C-level / VP executive signals (paired with a domain signal → exec sponsor).
+  executive_keywords:
+    - ceo
+    - coo
+    - cfo
+    - cto
+    - cio
+    - "vp "
+    - vice president
+    - chief
+    - president
+    - svp
+    - evp
+    - c-level
+
+  # Core operational-domain signals for the function your product serves.
+  operations_keywords:
+    - operations
+    - operating
+    - delivery
+    - production
+    - logistics
+    - supply chain
+    - planning
+    - scheduling
+
+  # Decision-maker titles (apply to all lanes). Substring matching, so shorter
+  # forms subsume longer ones ("director" covers "director of operations", etc).
+  decision_maker_keywords:
+    - "vp "
+    - director
+    - head of
+    - chief
+    - president
+    - ceo
+    - coo
+    - cfo
+    - cto
+    - cio
+    - general manager
+    - country manager
+    - owner
+    - founder
+
+  # False-positive guards on decision_maker_keywords. "coo" matches
+  # "coordinator" via substring; these suppress the spurious credit.
+  # MUST be disjoint from decision_maker_keywords.
+  decision_maker_exemptions:
+    - coordinator
+
+  # Generic influencer signals (manager / lead / etc).
+  influencer_keywords:
+    - manager
+    - lead
+    - principal
+
+# ── Geography ─────────────────────────────────────────────────────────
+geography:
+  # Out-of-scope global-scope titles, if you only sell into a specific region.
+  # Leave empty (or edit) if geography does not constrain your ICP.
+  global_executive_keywords:
+    - "global "
+    - worldwide
+    - group head
+
+  # In-region override: titles that mention your served region are exempt from
+  # the global-only demote above (the schema key name is fixed; the VALUES are
+  # the region markers that matter for you). Edit to your market.
+  latam_geo_override:
+    - north america
+    - united states
+    - canada
+
+  # Language detection by location. The engine picks a content language from the
+  # prospect's location; list the location markers that map to each language you
+  # send in. These are illustrative — edit to your markets (and content/).
+  pt_locations:
+    - portugal
+    - brazil
+    - brasil
+  es_locations:
+    - spain
+    - españa
+    - mexico
+    - méxico
+    - argentina
+    - colombia
+    - chile
+  en_locations:
+    - united states
+    - usa
+    - canada
+    - united kingdom
+    - uk
+    - australia
+    - ireland
+
+# ── Industry ICP buckets ──────────────────────────────────────────────
+# In-ICP labels are the sectors you sell into (get +industry_bonus_in_icp).
+# "Other" is the classifier's "not a fit" signal (gets the penalty). Membership
+# is case-sensitive: callers pass canonical capitalized labels. Replace with
+# your own served sectors.
+industries:
+  in_icp:
+    - Software
+    - Technology
+    - Manufacturing
+    - Retail
+    - Healthcare
+    - Financial Services
+    - Logistics
+  off_icp:
+    - Other
+
+# ── Scoring weights ───────────────────────────────────────────────────
+# Numeric deltas applied by the scorers. Changing these shifts scores; the
+# combination LOGIC (which delta fires when) is fixed in quality_gate.py.
+weights:
+  industry_bonus_in_icp: 12       # in-ICP industry boost
+  industry_penalty_off_icp: -25   # "Other" / not-a-fit penalty
+  # Combined bonus when an ops-domain influencer is at an in-ICP company. The
+  # role+industry signals are correlated, so this single joint signal replaces
+  # the additive role + industry bonuses.
+  ops_in_industrial_combined: 30
+
+# ── Thresholds / score bands ──────────────────────────────────────────
+# Band labels track the verdict-path branches in score_prospect:
+# <40 deterministic_reject, 40-59 borderline-reject side, 60-75 borderline-pass
+# side, >75 deterministic pass. Order matters (low → high).
+thresholds:
+  score_band_labels:
+    - "<40"
+    - "40-59"
+    - "60-75"
+    - ">75"
+
+# ── Disqualifier keyword families ─────────────────────────────────────
+# Each family is a hard-or-penalty disqualifier. TITLE-keyed families
+# (sales/junior_ic/hr/finance/innovation) word-boundary match; COMPANY-keyed
+# families (pe/state_owned) substring match. ORDER MATTERS for the company and
+# title families — the scorer picks the earliest positional match. Replace these
+# placeholders with the disqualifiers that matter for YOUR ICP.
+disqualifiers:
+  # Direct competitors / substitute vendors (matched against title + company).
+  competitor_keywords:
+    - competitor inc
+    - substitute software
+
+  # Academics / researchers.
+  academic_keywords:
+    - professor
+    - academic
+    - researcher
+    - phd student
+    - university
+    - postdoc
+
+  # Consultants / advisory (matched against title + company).
+  consultant_keywords:
+    - consultant
+    - consulting
+    - freelance
+    - advisory
+    - advisor
+
+  # Sales / commercial / marketing roles — revenue side, not the operational
+  # buyer. Word-boundary matched so "sales" does not match "salesforce".
+  sales_role_keywords:
+    - sales
+    - account executive
+    - account manager
+    - key account
+    - business development
+    - biz dev
+    - channel manager
+    - partnerships
+    - customer success
+    - growth
+    - marketing
+    - go-to-market
+    - gtm
+    - revenue operations
+    - revops
+    - pre-sales
+    - presales
+    - solutions engineer
+    - sales engineer
+
+  # Exemptions: a sales-keyword is incidental, the role is core to the function
+  # your product serves (e.g. Sales & Operations Planning is an ops function).
+  sales_role_ops_exemptions:
+    - s&op
+    - sales and operations planning
+    - sales & operations planning
+
+  # Junior / IC roles. Word-boundary matched.
+  junior_ic_keywords:
+    - coordinator
+    - analyst
+    - specialist
+    - assistant
+    - associate
+    - intern
+    - engineer i
+    - engineer ii
+
+  # Seniority signals that subsume a junior/IC keyword ("Senior Coordinator").
+  # Substring match so multi-token phrases like "head of" catch.
+  junior_ic_exemptions:
+    - senior
+    - sr.
+    - "sr "
+    - "lead "
+    - "head "
+    - chief
+    - principal
+    - director
+    - manager
+    - "vp "
+    - president
+
+  # HR roles (TITLE-keyed, word-boundary, OPS_OVERRIDE can bypass).
+  hr_keywords:
+    - chro
+    - hrbp
+    - chief human resources
+    - chief people officer
+    - human resources
+    - hr director
+    - hr manager
+    - vp hr
+    - head of hr
+    - head of people
+    - vp people
+    - people operations
+    - talent acquisition
+    - talent management
+
+  # Finance roles (TITLE-keyed, word-boundary, OPS_OVERRIDE can bypass).
+  finance_keywords:
+    - cfo
+    - chief financial
+    - vp finance
+    - finance director
+    - finance manager
+    - head of finance
+    - treasurer
+    - controller
+    - tax director
+    - investor relations
+    - fp&a
+    - financial planning and analysis
+    - accounting director
+
+  # Innovation / R&D / academic-liaison roles (TITLE-keyed, OPS_OVERRIDE bypass).
+  innovation_keywords:
+    - r&d
+    - r & d
+    - research and development
+    - research & development
+    - head of r&d
+    - head of research
+    - innovation lab
+    - innovation hub
+    - innovation center
+    - academic liaison
+    - university relations
+
+  # Private-equity / investor firm names (COMPANY-keyed, substring, no bypass).
+  # Replace with the investor-owner names you want to screen out, if any.
+  pe_keywords:
+    - private equity fund
+    - private equity partners
+    - private equity firm
+
+  # Out-of-scope organizations (COMPANY-keyed, substring, no bypass). Replace
+  # with the kinds of organizations you never sell to (e.g. government, NGOs).
+  state_owned_keywords:
+    - government of
+    - ministry of
+    - state-owned
+
+  # OPS_OVERRIDE bypass: title phrases operational enough that an
+  # HR/Finance/Innovation match is treated as incidental. Word-boundary matched.
+  # Company-based disqualifiers (state-owned, PE) ignore this.
+  ops_override_keywords:
+    - vp operations
+    - vp ops
+    - director of operations
+    - head of operations
+    - operations manager
+    - supply chain director
+    - supply chain manager
+    - head of supply chain
+    - s&op
+    - sales and operations planning

@@ -1,0 +1,52 @@
+{
+  "claims": [
+    {
+      "id": "reschedule-seconds",
+      "claim": "reschedules in seconds / reprograma en segundos / replaneja em segundos",
+      "languages": ["en", "es", "pt"],
+      "type": "capability",
+      "evidence": "Live product capability: the rescheduling engine recomputes the plan from current constraints in under 30 seconds. Demonstrable in any live demo session.",
+      "status": "demoable"
+    },
+    {
+      "id": "hours-to-seconds",
+      "claim": "Planners go from hours of manual work to seconds / pasan de horas de trabajo manual a segundos / passam de horas de trabalho manual para segundos",
+      "languages": ["en", "es", "pt"],
+      "type": "capability",
+      "evidence": "Live product capability: the manual planning step is replaced by the optimizer. The before/after contrast is demonstrable end-to-end in a demo session.",
+      "status": "demoable"
+    },
+    {
+      "id": "scheduler-3-4-hours-daily",
+      "claim": "scheduler was spending 3-4 hours a day / programador passava 3-4 horas por dia / programador se aventaba 3-4 horas diarias",
+      "languages": ["en", "es", "pt"],
+      "type": "outcome",
+      "evidence": "Observed pattern across early pilot plants (multiple customer discovery interviews). The 3-4h range is a representative observed estimate, not a controlled study average.",
+      "status": "demoable"
+    },
+    {
+      "id": "scheduler-half-day-reorganizing",
+      "claim": "scheduler was spending half a day reorganizing / programador se aventaba medio día reorganizando / programador passava meio dia reorganizando",
+      "languages": ["en", "es", "pt"],
+      "type": "outcome",
+      "evidence": "Observed in pilot plants when a rush order triggers a manual plan rebuild. Consistent with the 3-4h/day observation; 'half a day' is the specific replanning event cost.",
+      "status": "demoable"
+    },
+    {
+      "id": "plant-200-skus-three-shifts",
+      "claim": "plant running 200 SKUs across three shifts / planta con 200 SKUs y tres turnos / planta com 200 SKUs e três turnos",
+      "languages": ["en", "es", "pt"],
+      "type": "outcome",
+      "evidence": "Representative anonymized customer profile observed in pilot engagements. Specific figures (200 SKUs, 3 shifts) are not a single named customer.",
+      "status": "demoable"
+    },
+    {
+      "id": "alignment-meetings-3-plus-hours",
+      "claim": "3+ hours a day in alignment meetings / 3+ horas al día en juntas de alineación / 3+ horas por dia em reuniões de alinhamento",
+      "languages": ["en", "es", "pt"],
+      "type": "outcome",
+      "evidence": "Pattern observed in customer interviews. The '3+' figure is based on self-reported planner estimates in discovery sessions.",
+      "status": "demoable"
+    }
+  ]
+}

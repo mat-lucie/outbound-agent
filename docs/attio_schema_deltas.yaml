@@ -1,0 +1,1426 @@
+# Attio schema-delta manifest (F-PR-3.5)
+#
+# Single source of truth for every Attio schema addition across the 45-PR
+# refactor plan. Each entry declares:
+#   - object: the Attio object (existing or new)
+#   - slug:   the attribute slug (omitted for new-object entries; the
+#             new-object row carries `is_new_object: true`)
+#   - type:   text | select | number | date | datetime | record_reference
+#             | long_text | checkbox | currency | list_text
+#   - options: list of string select options (required when type=select)
+#   - pr_id:  the PR that ships this entry
+#   - status: planned | shipped | verified | descoped
+#       descoped = writer code shipped/registered but the Attio object is
+#       intentionally absent per the minimize-objects decision; data lives
+#       in a filesystem cache. Code must not WARN/ERROR on the expected
+#       missing-object case.
+#   - write_owner_module: dotted module path of the SOLE writer for this
+#     attribute; multi-writer entries use a list. Consulted at runtime
+#     by F-PR-4's AttioWriter to raise UnauthorizedAttioWriteError on
+#     out-of-band writes.
+#   - note: free-text rationale (optional)
+#
+# Validator: `scripts/validate_attio_schema_deltas.py`
+#   - Internal consistency (no Attio access): no duplicate (object, slug);
+#     select types have options; valid type strings; valid status values;
+#     every entry has a pr_id + write_owner_module.
+#   - Optional Attio collision check (--check-attio): warns when a
+#     planned attribute slug already exists on the target object with a
+#     different type.
+#
+# Update protocol:
+#   - F-PR-3.5 lands this manifest with all entries status=planned.
+#   - Each later PR's diff flips its own entries planned -> shipped.
+#   - The §9 done-criterion verification flips shipped -> verified.
+#   - `descoped` is a terminal state for minimize-objects entries: the
+#     writer code is shipped but the Attio object is intentionally never
+#     deployed (data lives in a filesystem cache). It does not transition
+#     back to shipped/verified.
+#   - New entries land in PR diffs that touch them; the validator runs
+#     in CI on every PR.
+
+schema_version: 1
+plan_version: "1.7"
+last_updated: "2026-06-01"  # Wave-2-A holdback rethink: experiment + weekly_kpi_snapshot → descoped (filesystem); cohort_membership/person_merge_audit/weekly_strategy_brief/diagnostic_run deleted (unbuilt/dead; all 404 live).
+
+# Wave-2-A deploy holdback per agent-4 rethink (2026-05-25):
+# These new_objects + every attribute targeting them are NOT to be
+# deployed as standalone Attio objects. The decision is to collapse
+# their data into column collections on existing objects (companies,
+# people, deals, linkedin_outreach, daily_run, operator_review_queue)
+# rather than spend Attio per-object surface area. Final placement
+# pending a Wave-2 follow-up planning effort (subagent-driven).
+#
+# Per-entity collapse target + writer audit is tracked in
+# docs/audits/wave-2-holdback-rethink-TODO.md.
+#
+# Until that rethink lands:
+#  * status=shipped on these entries reflects WRITER CODE shipped,
+#    NOT Attio schema deployed. Do not interpret as "live in Attio".
+#  * scripts/migrate_attio_schema_F-PR-3.5b.py skips deploy of these
+#    objects + their child attrs (reads this list).
+#  * scripts/validate_attio_schema_deltas.py --check-attio-shipped
+#    skips these objects + their child attrs (reads this list).
+#  * The 17-attr R2-B1 blocker is resolved for attrs targeting EXISTING
+#    objects (linkedin_outreach, companies, deals, people, daily_run);
+#    the held-back attrs land via the rethink follow-up.
+#
+# Wave-2-A ext rationale: llm_budget_ledger was originally in this list
+# but is hot-pathed via workflows.llm_dispatch.dispatch_llm (every LLM
+# call). Holding it back would crash §3.7 cost-cap on the next dispatch
+# (404 on _find_ledger_row). It now deploys as a regular Attio object
+# in this wave; the file-system journal refactor (refactor-QA Rec #2)
+# can land later as a non-blocking improvement.
+deploy_holdback_objects:
+  - experiment
+  - weekly_kpi_snapshot
+# tracker_url: docs/audits/wave-2-holdback-rethink-TODO.md
+
+# ============================================================
+# NEW ATTIO OBJECTS
+# ============================================================
+new_objects:
+  - object: operator_review_queue
+    pr_id: F-PR-3
+    status: shipped
+    purpose: "Typed escalation queue. One row per operator decision; idempotent on (type, idempotency_key)."
+    note: |
+      Full attribute spec in `attributes:` below (object: operator_review_queue).
+      Object-creation is operator-reversible only (Attio object deletion
+      requires manual UI action). Bootstrap migration logs to JSONL at
+      ~/.outbound-agent/audit/F-PR-3-bootstrap-{date}.jsonl per the §3.13
+      MigrationRunWriter carve-out (Migration Run object lands in F-PR-3.7,
+      which retroactively backfills a Migration Run row from this JSONL).
+      Per refactor-QA Rec #3, 11 one-time configuration-decision slugs
+      collapsed into the meta-slug `configuration_decision` + a required
+      `decision_key` field. Total enum size: 79 slugs (was 89).
+
+  - object: reclassification_run
+    pr_id: F-PR-3.7
+    status: shipped
+    purpose: "Reclassification provenance per §3.12. Every reclassified record gets last_classified_by → this object."
+    note: |
+      Created by scripts/migrate_attio_F2_reclassification_migration_objects.py.
+      Used by every classifier rerun via
+      workflows/reclassification_run_writer.py::ReclassificationRunWriter.
+
+  - object: migration_run
+    pr_id: F-PR-3.7
+    status: shipped
+    purpose: "Migration provenance per §3.13. Every migrated record gets last_migrated_by → this object."
+    note: |
+      Created by scripts/migrate_attio_F2_reclassification_migration_objects.py.
+      Used by every migrate_/backfill_ script via
+      workflows/migration_run_writer.py::MigrationRunWriter. F-PR-3
+      bootstrap retroactively backfilled by
+      scripts/backfill_F1_bootstrap_to_migration_run.py.
+
+  - object: experiment
+    pr_id: F-PR-6
+    status: descoped
+    descoped_reason: "filesystem-cache (experiments.tsv); cohort recomputable from linkedin_outreach.experiment_id"
+    purpose: "Cohort identity for variant testing per §3.2. Replaces experiments.tsv as source of truth; TSV becomes regenerable cache (experiments.tsv.cache)."
+    note: "Wave-2-A: descoped. The F-PR-6 migration was NEVER executed — GET /objects/experiment returns 404 in production Attio. experiments.tsv remains the source-of-truth filesystem cache; the cohort is recomputable from linkedin_outreach.experiment_id. PR-33 verdict_v1/v2/dm3_window_settles_at also descoped (below)."
+
+  - object: daily_run
+    pr_id: F-PR-8
+    status: shipped
+    purpose: "Per-run summary object replacing the local state-files. F-PR-7 flock + F-PR-2 audit log feed into here. Cross-machine uniqueness on (run_date, machine_id) provides the cross-machine half of the concurrent-run guard started in F-PR-7."
+    note: "Hosts run-end summary counters: prospect_pool_size, due_dmN_count, degree_unknown_count, reply_detection_status, starvation_signal, nurture_silent_skipped_count. Identity attrs (run_date, machine_id, hostname, started_at, completed_at, status) ship with F-PR-8."
+
+  - object: llm_budget_ledger
+    pr_id: PR-35
+    status: shipped
+    purpose: "Per-(step, week_starting) cost ceiling per §3.7. Pulled out of Wave-2-A holdback (2026-05-25) because workflows.llm_dispatch.dispatch_llm hot-paths through LLMBudgetLedger.try_reserve every LLM call; missing object would 404 and crash the cost cap. refactor-QA Rec #2 (file-system journal collapse) can land later as a non-blocking refactor."
+
+  - object: weekly_kpi_snapshot
+    pr_id: PR-30
+    status: descoped
+    descoped_reason: "filesystem-cache (reports/weekly-kpi/<week>.json)"
+    purpose: "Agent-readable sidecar for the weekly KPI report (fixes QA-v1 minor D.PR-30). One row per `/sales-weekly report` run; HTML email is a derived view. Subagents query historical reports by filtering on week_starting."
+
+  - object: data_quality_report
+    pr_id: PR-43.5
+    status: shipped
+    purpose: "Weekly data-quality dashboard with the 8 metrics from §4.10 + 4 alarm thresholds (P0/P1 split per Round-4 D29)."
+
+# ============================================================
+# NEW ATTRIBUTES ON EXISTING OBJECTS
+# ============================================================
+attributes:
+
+  # ---------- Operator Review Queue (F-PR-3) ----------
+  # All written by workflows.escalation.escalate(). The migration script
+  # is the source of truth for the runtime schema; these manifest entries
+  # let F-PR-3.5's validator catch future PRs that try to claim the same
+  # (object, slug) with a different type.
+  - object: operator_review_queue
+    slug: type
+    type: select
+    options: ["see workflows.escalation_schemas.ESCALATION_TYPES (79 slugs)"]
+    pr_id: F-PR-3
+    status: shipped
+    write_owner_module: workflows.escalation.escalate
+    note: "Live option list is workflows.escalation_schemas.ESCALATION_TYPES — the migration script reads it at runtime. The placeholder string here exists because the manifest validator requires non-empty options on select types; cross-PR collision detection only needs the slug+type pair."
+
+  - object: operator_review_queue
+    slug: decision_key
+    type: select
+    options: ["see workflows.escalation_schemas.CONFIGURATION_DECISION_KEYS (11 keys)"]
+    pr_id: F-PR-3
+    status: shipped
+    write_owner_module: workflows.escalation.escalate
+    note: "Only set when type='configuration_decision' (refactor-QA Rec #3 meta-slug)."
+
+  - object: operator_review_queue
+    slug: idempotency_key
+    type: text
+    options: null
+    pr_id: F-PR-3
+    status: shipped
+    write_owner_module: workflows.escalation.escalate
+
+  - object: operator_review_queue
+    slug: uniqueness_key
+    type: text
+    options: null
+    pr_id: F-PR-3
+    status: shipped
+    write_owner_module: workflows.escalation.escalate
+    note: "Computed as `type|decision_key|idempotency_key`. Attio v2 text attributes are searchable but not indexed; cron-driven single-process callers (post-F-PR-7 flock) avoid the race window in practice."
+
+  - object: operator_review_queue
+    slug: payload_json
+    type: long_text
+    options: null
+    pr_id: F-PR-3
+    status: shipped
+    write_owner_module: workflows.escalation.escalate
+
+  - object: operator_review_queue
+    slug: status
+    type: select
+    options: [open, resolved, dismissed, auto_resolved_default, rejected]
+    pr_id: F-PR-3
+    status: shipped
+    write_owner_module: [workflows.escalation.escalate, workflows.escalation_resolver, workflows.sales_approve, workflows.industry_approve]
+    note: "Multi-writer: agent opens (escalate); operator resolves; resolver default-expires; sales_approve (PR-32) approves/rejects variant_proposal_pending rows; industry_approve (FU-2) approves/rejects industry_low_confidence rows. workflows.escalation_resolver ships with PR-30."
+
+  - object: operator_review_queue
+    slug: opened_at
+    type: datetime
+    options: null
+    pr_id: F-PR-3
+    status: shipped
+    write_owner_module: workflows.escalation.escalate
+
+  - object: operator_review_queue
+    slug: resolved_at
+    type: datetime
+    options: null
+    pr_id: F-PR-3
+    status: shipped
+    write_owner_module: [workflows.escalation.escalate, workflows.escalation_resolver, workflows.sales_approve, workflows.industry_approve]
+    note: "Set when status flips off 'open'."
+
+  - object: operator_review_queue
+    slug: deadline
+    type: date
+    options: null
+    pr_id: F-PR-3
+    status: shipped
+    write_owner_module: workflows.escalation.escalate
+
+  - object: operator_review_queue
+    slug: decision_json
+    type: long_text
+    options: null
+    pr_id: F-PR-3
+    status: shipped
+    write_owner_module: [workflows.escalation.escalate, workflows.escalation_resolver, workflows.sales_approve, workflows.industry_approve]
+    note: "Operator's recorded decision payload (when status=resolved). escalate() may pre-seed with the recommended_option. PR-32 sales_approve writes the operator's approve/reject rationale here. FU-2 industry_approve writes the operator_choice + suggested_vertical + company_record_id here."
+
+  - object: operator_review_queue
+    slug: decision_source
+    type: text
+    options: null
+    pr_id: F-PR-3
+    status: shipped
+    write_owner_module: [workflows.escalation.escalate, workflows.escalation_resolver]
+    note: "Lifecycle: 'agent_opened' -> 'operator' | 'expired_default_<details>'."
+
+  - object: operator_review_queue
+    slug: agent_host
+    type: text
+    options: null
+    pr_id: F-PR-3
+    status: shipped
+    write_owner_module: workflows.escalation.escalate
+
+  # ---------- LinkedIn Outreach: per-step send timestamps (PR-9a) ----------
+  - object: linkedin_outreach
+    slug: dm1_sent_at
+    type: datetime
+    options: null
+    pr_id: PR-9a
+    status: shipped
+    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends]
+    note: |
+      §3.15 backfill exception: PR-9b's scripts.backfill_per_step_timestamps
+      is the second authorized writer, scoped to one-shot historical
+      backfill only. PR-9.5's scripts.attio_dedup is the third, scoped
+      to the §3.11 MAX-non-null union-merge of duplicate group entries.
+      The fourth, workflows.pb_send_recovery.recover_unrecorded_dm_sends,
+      re-records a DM advance PB confirmed but the local process never wrote
+      (crash recovery), routed through the same §3.15 AttioWriter path.
+      Per-step DM send timestamps. Pre-PR-9b only last_contact_date
+      existed; PR-9b backfills these from PB action history + Attio
+      note created_at.
+
+  - object: linkedin_outreach
+    slug: dm2_sent_at
+    type: datetime
+    options: null
+    pr_id: PR-9a
+    status: shipped
+    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends]
+    note: "Multi-writer per §3.15 + §3.11 union-merge + crash-recovery (see dm1_sent_at note)."
+
+  - object: linkedin_outreach
+    slug: dm3_sent_at
+    type: datetime
+    options: null
+    pr_id: PR-9a
+    status: shipped
+    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends]
+    note: "Multi-writer per §3.15 + §3.11 union-merge + crash-recovery (see dm1_sent_at note)."
+
+  - object: linkedin_outreach
+    slug: response_received_at
+    type: datetime
+    options: null
+    pr_id: PR-9a
+    status: shipped
+    write_owner_module: [workflows.detect_responses.classify_reply, scripts.attio_dedup]
+    note: "Multi-writer per §3.11: dedup applies MAX-non-null union-merge across duplicates at merge time."
+
+  - object: linkedin_outreach
+    slug: canonical_linkedin_url
+    type: text
+    options: null
+    pr_id: PR-9a
+    status: shipped
+    write_owner_module: [workflows.weekly_prospect._build_prospect_entry_attrs, scripts.backfill_canonical_linkedin_url]
+    note: "Multi-writer per §3.15: PROSPECT-commit for new entries + one-shot backfill for existing rows (Round-3 blocker B2 fix)."
+
+  - object: linkedin_outreach
+    slug: vanity_url_slug
+    type: text
+    options: null
+    pr_id: PR-9a
+    status: shipped
+    write_owner_module: [workflows.weekly_prospect._build_prospect_entry_attrs, scripts.backfill_vanity_url_slug]
+    note: "PR-14 ships the backfill script. Schema created by PR-9a; vanity slug extraction function _vanity_url_slug() added to clients/attio.py."
+
+  # ---------- LinkedIn Outreach: experiment cohort identity (PR-21/22) ----------
+  - object: linkedin_outreach
+    slug: experiment_id
+    type: text
+    options: null
+    pr_id: PR-21
+    status: shipped
+    write_owner_module:
+      - workflows.weekly_prospect._build_prospect_entry_attrs
+      - workflows.daily_check.run_connection_requests
+      - workflows.daily_check.detect_accepted_connections
+      - scripts.migrate_experiments_tsv_to_attio
+      - scripts.attio_dedup
+      - scripts.backfill_experiment_id_archaeology
+    note: |
+      Immutable once set (§3.1 red line). Six authorized writers (PR-22 adds 6th):
+        1. weekly_prospect._build_prospect_entry_attrs — PROSPECT-commit stamp
+        2. daily_check.run_connection_requests — Pattern-A flip (via
+           pre_invite_check._pre_invite_degree_check), inherits to "accepted"
+        3. daily_check.detect_accepted_connections — Phase 0 ACCEPTED flip,
+           preserves existing experiment_id (NEW in PR-21 v2)
+        4. scripts.migrate_experiments_tsv_to_attio — F-PR-6 seed migration
+        5. scripts.attio_dedup — PR-9.5 union-merge no-conflict stamp
+        6. scripts.backfill_experiment_id_archaeology — PR-22 legacy archaeology
+           (writes only to NULL frozen_at rows; never overwrites non-NULL)
+      "no_active_experiment" is NOT a valid value — rows with NULL experiment_id
+      are measurement-excluded (omitted from cohort iteration).
+
+  - object: linkedin_outreach
+    slug: experiment_id_frozen_at
+    type: select
+    options:
+      - prospect
+      - connection_sent
+      - accepted
+      - legacy_pre_tsv_era
+      - legacy_inferred_by_archaeology
+      - legacy_pure_unknown
+    pr_id: PR-21
+    status: shipped
+    write_owner_module:
+      - workflows.weekly_prospect._build_prospect_entry_attrs
+      - workflows.daily_check.run_connection_requests
+      - workflows.pre_invite_check._pre_invite_degree_check
+      - workflows.daily_check.detect_accepted_connections
+      - scripts.migrate_experiments_tsv_to_attio
+      - scripts.attio_dedup
+      - scripts.backfill_experiment_id_archaeology
+    note: |
+      §3.1 full enum (6 values — no "no_active_experiment" sentinel, never add it).
+      Seven authorized writers (PR-22 adds 7th):
+        1. weekly_prospect._build_prospect_entry_attrs — PROSPECT-commit ("prospect")
+        2. daily_check.run_connection_requests — thread-through to pre_invite_check
+        3. pre_invite_check._pre_invite_degree_check — Pattern-A flip WriteIntent
+           writer_module; stamps "accepted" (same module as stage + last_contact_date)
+        4. daily_check.detect_accepted_connections — Phase 0 ACCEPTED flip (NEW v2)
+        5. scripts.migrate_experiments_tsv_to_attio — F-PR-6 seed migration
+        6. scripts.attio_dedup — PR-9.5 union-merge no-conflict stamp
+        7. scripts.backfill_experiment_id_archaeology — PR-22 legacy archaeology
+           (stamps legacy_inferred_by_archaeology or legacy_pure_unknown on NULL
+           frozen_at rows only; never overwrites non-NULL values)
+      Note: experiment_id has 6 writers (pre_invite_check is read-only there).
+      Phase 0 stamps "accepted" while preserving experiment_id — new in PR-21 v2.
+      PR-9.5's scripts.attio_dedup stamps frozen_at in lockstep with
+      experiment_id when the union-merge inherits a single non-null cohort identity.
+
+  - object: linkedin_outreach
+    slug: experiment_id_backfill_confidence
+    type: number
+    options: null
+    pr_id: PR-22
+    status: shipped
+    write_owner_module: scripts.backfill_experiment_id_archaeology
+    note: |
+      §3.10 cohort archaeology confidence in [0.0, 1.0].
+      Sole writer: scripts.backfill_experiment_id_archaeology (PR-22).
+      Threshold 0.80 → legacy_inferred_by_archaeology (MEASUREMENT-INCLUDED,
+      SEND-INELIGIBLE); below threshold → legacy_pure_unknown (MEASUREMENT-
+      EXCLUDED, SEND-INELIGIBLE). Both tiers store the confidence score here
+      so operators can audit the distribution and adjust the threshold.
+
+  # ---------- LinkedIn Outreach: cadence + lane (PR-12, PR-39) ----------
+  - object: linkedin_outreach
+    slug: language
+    type: select
+    options: [es, en, pt]
+    pr_id: PR-12
+    status: shipped
+    write_owner_module:
+      - workflows.weekly_prospect._build_prospect_entry_attrs
+      - scripts.backfill_language
+    note: |
+      Multi-writer. PR-12 added models.resolution.resolve_language as
+      a READ-validator (raises MissingLanguageError on missing/invalid
+      values) — it never writes Attio. Plan §3.15's "PRIMARY writer"
+      label was inaccurate; the actual contract is read-validator vs.
+      PROSPECT-commit writer. PR-26 (scripts.backfill_language) is a
+      one-shot backfill co-writer that only fills null/empty values
+      (natural-filter idempotency); registered alongside the
+      PROSPECT-commit path.
+
+  - object: linkedin_outreach
+    slug: next_eligible_send_date
+    type: date
+    options: null
+    pr_id: PR-12
+    status: shipped
+    write_owner_module:
+      - workflows.daily_check.run_dm_sequencing
+      - workflows.consistency_sweep.run_company_tally_consistency_sweep
+    note: "Forward-only cadence floor stamped after each confirmed DM send. Computed via models.business_calendar.advance_off_weekend (Sat -> Mon, Sun -> Mon); never shorter than the in-memory dm_sequencer.earliest_send_date. 2026-06-09: consistency_sweep added as co-writer for desync repair path."
+
+  - object: linkedin_outreach
+    slug: nurture_re_eligible_at
+    type: date
+    options: null
+    pr_id: PR-39
+    status: shipped
+    write_owner_module: [workflows.gtm.nurture_backfill, workflows.daily_check.run_dm_sequencing]
+    note: "PR-39 cadence policy per §3.18. Multi-writer with belt-and-suspenders NULL-out for suppression-class rows (minor M9)."
+
+  - object: linkedin_outreach
+    slug: cadence_lane
+    type: select
+    options: [enterprise, target, legacy]
+    pr_id: PR-39
+    status: shipped
+    write_owner_module: workflows.weekly_prospect._build_prospect_entry_attrs
+    note: "Set at PROSPECT-commit per ICP lane. Drives lane-rank ordering in daily_check (PR #51 already shipped this rank logic on legacy ad-hoc lane string; PR-39 promotes to typed attribute)."
+
+  # ---------- Companies: industry classification confidence (PR-25) ----------
+  # NOTE: These attrs live on `companies`, NOT `linkedin_outreach`.
+  # Industry is a property of the company entity (one company may have many outreach
+  # threads; duplicating industry on each row would denormalize without benefit).
+  # The original planned entries used linkedin_outreach (pre-spec typo) — corrected
+  # here to match plan §5 line 733 which explicitly specifies object: companies.
+  - object: companies
+    slug: industry_vertical_status
+    type: select
+    options: [confirmed, unknown, low_confidence]
+    pr_id: PR-25
+    status: planned
+    write_owner_module:
+      - workflows.industry_classifier.classify_with_confidence
+      - workflows.industry_approve
+      - scripts.reclassify_industry
+    note: "FU-2: workflows.industry_approve flips this to 'confirmed' when an operator approves an industry_low_confidence queue row. PR-25 (scripts.reclassify_industry) is registered as a co-writer for the backfill path."
+
+  - object: companies
+    slug: industry_vertical_confidence
+    type: number
+    options: null
+    pr_id: PR-25
+    status: planned
+    write_owner_module:
+      - workflows.industry_classifier.classify_with_confidence
+      - scripts.reclassify_industry
+
+  - object: companies
+    slug: industry_vertical
+    type: select
+    options: ["see models.campaign.INDUSTRY_LABELS (11 canonical labels)"]
+    pr_id: FU-2
+    status: planned
+    write_owner_module:
+      - workflows.industry_approve
+      - scripts.reclassify_industry
+    note: "Operator-confirmed vertical written by workflows.industry_approve on industry_low_confidence approval. PR-25 (scripts.reclassify_industry) is registered as a co-writer for the backfill path. Options list is models.campaign.INDUSTRY_LABELS.keys() — placeholder string here exists because the manifest validator requires non-empty options on select types (same convention as operator_review_queue.type). The legacy direct attio.update_company path in workflows.industry_classifier.backfill_missing_industries bypasses AttioWriter entirely and is not gated by this registration."
+
+  - object: linkedin_outreach
+    slug: suppress_re_engagement
+    type: checkbox
+    options: null
+    pr_id: PR-37
+    status: shipped
+    write_owner_module: [workflows.cross_channel_suppression, scripts.attio_dedup]
+    note: |
+      True for response_classification ∈ {negative, defensive, hard_no}
+      + NOT_INTERESTED. Logical-OR-merged on dedup per §3.11 —
+      scripts.attio_dedup is a registered writer so a winner that
+      previously held False can be flipped to True when any duplicate
+      carries a suppression flag.
+
+  - object: linkedin_outreach
+    slug: had_connection_note
+    type: checkbox
+    options: null
+    pr_id: PR-20
+    status: shipped
+    write_owner_module: [workflows.detect_responses.detect_responses, scripts.attio_dedup]
+    note: "PR-20 B-SD-008 false-positive guard: set True when LinkedIn's auto-acceptance note is detected (dm_step=0 + total_messages=1 + short body per _CONNECTION_NOTE_MAX_CHARS=100). Logical-OR-merged on dedup per §3.11 (same pattern as suppress_re_engagement). Written by detect_responses.detect_responses in the connection-note skip branch."
+
+  # ---------- LinkedIn Outreach: weekly batch traceability (PR-28, PR-43) ----------
+  - object: linkedin_outreach
+    slug: week_starting
+    type: date
+    options: null
+    pr_id: PR-28
+    status: shipped
+    write_owner_module: workflows.weekly_prospect.weekly_finalize_idempotent
+
+  - object: linkedin_outreach
+    slug: prospect_committed_at
+    type: datetime
+    options: null
+    pr_id: PR-43
+    status: shipped
+    write_owner_module: workflows.weekly_prospect._build_prospect_entry_attrs
+
+  - object: linkedin_outreach
+    slug: invite_eligible_after
+    type: date
+    options: null
+    pr_id: PR-43
+    status: shipped
+    write_owner_module: workflows.weekly_prospect._build_prospect_entry_attrs
+    note: "Computed from prospect_committed_at + quarantine business days."
+
+  # ---------- LinkedIn Outreach: recheck-cache architecture (F-PR-8, §3.5) ----------
+  - object: linkedin_outreach
+    slug: last_observed_degree
+    type: select
+    options: [first, second, third, unknown]
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_check.run_connection_requests
+    note: |
+      Per §3.5 (Attio-resident recheck cache wins over file-local). Replaces
+      ~/.outbound-agent/cache/recheck.json as source of truth for previously-
+      observed degree state on CONNECTION_SENT entries. Local JSON becomes
+      a thin regenerable cache. Attio enum values are first/second/third/
+      unknown — encoded without ordinal-numeric prefixes so Attio's select
+      type doesn't require quoting.
+
+  - object: linkedin_outreach
+    slug: last_observed_at
+    type: date
+    options: null
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_check.run_connection_requests
+    note: "Pair with last_observed_degree per §3.5."
+
+  # ---------- LinkedIn Outreach: Phase-1 auto-research brownfield attrs ----------
+  # These 11 attrs existed in production Attio before the §3.15 registry
+  # contract was retrofitted. Wave-2-A surfaces them in the manifest so the
+  # manifest⇔registry consistency test (test_registry_owners_match_manifest_write_owners)
+  # passes after the registry additions. Status=verified — already in
+  # production, never part of any planned delta.
+  - object: linkedin_outreach
+    slug: persona
+    type: select
+    options: [digitalization_champions, operations_leaders, executive_sponsors, mx_midmarket_manufacturing, co_midmarket_manufacturing, cl_midmarket_manufacturing]
+    pr_id: WAVE-2-A
+    status: verified
+    write_owner_module: workflows.weekly_prospect._build_prospect_entry_attrs
+    note: "Brownfield. Set at PROSPECT-commit from the score_result. Options mirror production select_options."
+
+  - object: linkedin_outreach
+    slug: score_breakdown
+    type: text
+    options: null
+    pr_id: WAVE-2-A
+    status: verified
+    write_owner_module:
+      - workflows.weekly_prospect._build_prospect_entry_attrs
+      - scripts.rescore_prospect_cohort
+    note: "Brownfield. JSON sidecar of component scores + reasons. Multi-writer: PROSPECT-commit + cohort rescore."
+
+  - object: linkedin_outreach
+    slug: scoring_lane
+    type: select
+    options: [target_company_mode, enterprise_mode, legacy]
+    pr_id: WAVE-2-A
+    status: verified
+    write_owner_module:
+      - workflows.weekly_prospect._build_prospect_entry_attrs
+      - scripts.rescore_prospect_cohort
+    note: "Brownfield. Live Attio type=select (target_company_mode | enterprise_mode | legacy). Promoted to typed cadence_lane via PR-39."
+
+  - object: linkedin_outreach
+    slug: icp_lane
+    type: select
+    options: [target_pass, enterprise_pass, borderline_pass, borderline_reject, deterministic_reject]
+    pr_id: WAVE-2-A
+    status: verified
+    write_owner_module: workflows.weekly_prospect._build_prospect_entry_attrs
+    note: "Brownfield. Live Attio type=select (5 verdict-lane options). Legacy column kept for manual UI override; no active writer today — registered under the canonical Phase-1 writer so a future re-stamp path lands against an already-registered slug. icp_lane_persisted is the live numeric (1=enterprise, 2=mid-market) writer."
+
+  - object: linkedin_outreach
+    slug: llm_rationale
+    type: text
+    options: null
+    pr_id: WAVE-2-A
+    status: verified
+    write_owner_module:
+      - workflows.weekly_prospect._build_prospect_entry_attrs
+      - scripts.rescore_prospect_cohort
+    note: "Brownfield. Haiku qualifier rationale on borderline scores."
+
+  - object: linkedin_outreach
+    slug: verdict_path
+    type: select
+    options: [target_pass, enterprise_pass, borderline_pass, borderline_reject, deterministic_reject, borderline_llm_error]
+    pr_id: WAVE-2-A
+    status: verified
+    write_owner_module:
+      - workflows.weekly_prospect._build_prospect_entry_attrs
+      - scripts.rescore_prospect_cohort
+    note: "Brownfield. Live Attio type=select (6 options). Stratification audit field for score_prospect verdict path. NOTE: workflows/quality_gate.py writes refined values like deterministic_reject_sales_role / borderline_cost_exhausted that are NOT in this option set — separate drift to audit."
+
+  - object: linkedin_outreach
+    slug: icp_lane_persisted
+    type: number
+    options: null
+    pr_id: WAVE-2-A
+    status: verified
+    write_owner_module: workflows.weekly_prospect._build_prospect_entry_attrs
+    note: "Brownfield. Haiku ICP-lane verdict (1=enterprise, 2=mid-market) on borderline scores."
+
+  - object: linkedin_outreach
+    slug: quality_score_band
+    type: select
+    options: ["<40", "40-59", "60-75", ">75"]
+    pr_id: WAVE-2-A
+    status: verified
+    write_owner_module: workflows.weekly_prospect._build_prospect_entry_attrs
+    note: "Brownfield. Discrete band derived from quality_score for stratification. Created by scripts/migrate_attio_schema.py (Phase 1 ICP auto-research)."
+
+  - object: linkedin_outreach
+    slug: last_response_text
+    type: text
+    options: null
+    pr_id: WAVE-2-A
+    status: verified
+    write_owner_module: workflows.detect_responses.detect_responses
+    note: "Brownfield. Truncated body of the latest classified reply. Stamped alongside response_classification."
+
+  - object: linkedin_outreach
+    slug: defensive_score
+    type: number
+    options: null
+    pr_id: WAVE-2-A
+    status: verified
+    write_owner_module: workflows.detect_responses.detect_responses
+    note: "Brownfield. LLM defensive-likelihood score [0,1] on detected reply. Phase-1 auto-research."
+
+  - object: linkedin_outreach
+    slug: engagement_score
+    type: number
+    options: null
+    pr_id: WAVE-2-A
+    status: verified
+    write_owner_module: workflows.detect_responses.detect_responses
+    note: "Brownfield. LLM engagement-likelihood score [0,1] on detected reply. Phase-1 auto-research."
+
+  # ---------- LinkedIn Outreach: dedup + merge bookkeeping (PR-9.5) ----------
+  - object: linkedin_outreach
+    slug: merged_into
+    type: record_reference
+    options: null
+    pr_id: PR-9.5
+    status: planned
+    write_owner_module: scripts.attio_dedup
+    note: "Soft-delete pointer per §3.11. Cross-channel suppression follows merged_into chains."
+
+  # ---------- LinkedIn Outreach: provenance pointers ----------
+  - object: linkedin_outreach
+    slug: last_classified_by
+    type: record_reference
+    options: null
+    pr_id: F-PR-3.7
+    status: shipped
+    write_owner_module: workflows.reclassification_run_writer.ReclassificationRunWriter
+    note: "Points to a Reclassification Run row. Set whenever a classifier reruns over this record."
+
+  - object: linkedin_outreach
+    slug: last_migrated_by
+    type: record_reference
+    options: null
+    pr_id: F-PR-3.7
+    status: shipped
+    write_owner_module: workflows.migration_run_writer.MigrationRunWriter
+    note: "Points to a Migration Run row. Set whenever a migration/backfill script mutates this record."
+
+  # ---------- Companies: provenance pointer (#18) ----------
+  - object: companies
+    slug: last_migrated_by
+    type: record_reference
+    options: null
+    pr_id: F-PR-3.7
+    status: shipped
+    write_owner_module: workflows.migration_run_writer.MigrationRunWriter
+    note: |
+      Points to a Migration Run row. Mirrors linkedin_outreach.last_migrated_by
+      so company-targeted migrations (e.g. the Wave-2 per-company throttle
+      backfill) record their §3.13 back-pointer. The attribute was missing on
+      companies, so MigrationRunWriter._stamp_back_pointers 404'd for every
+      company-targeted modification. Deployed 2026-05-28 via
+      scripts/migrate_attio_companies_last_migrated_by.py --apply.
+      Forensics caveat: the ~247 company writes that predate this deploy
+      remain un-stamped (the attribute did not exist when they ran); a
+      re-stamp backfill is an optional follow-up, not done here.
+
+  # ---------- Migration Run: cross-reference to Reclassification Run (PR-9b) ----------
+  - object: migration_run
+    slug: reclassification_run_id
+    type: text
+    options: null
+    pr_id: PR-9b
+    status: planned
+    write_owner_module: workflows.migration_run_writer.MigrationRunWriter
+    note: |
+      Cross-reference to the Reclassification Run that ran in tandem with
+      this migration (when applicable). Backfill scripts that infer values
+      AND mutate records open both writers; this field records the rec_run
+      run_id so the two rows can be joined for forensics.
+      Optional — empty when the script does pure schema work without
+      classifier-style inference.
+
+  # ---------- Companies: per-company throttle (PR-13) ----------
+  - object: companies
+    slug: last_outreach_at
+    type: datetime
+    options: null
+    pr_id: PR-13
+    status: shipped
+    write_owner_module:
+      - workflows.daily_check.run_dm_sequencing
+      - workflows.daily_check.run_connection_requests
+      - scripts.backfill_per_company_outreach_state
+    note: |
+      Per §3.8 30-day throttle TTL (default-on-expiry of the
+      `throttle_ttl_policy_decision` row). Read by
+      `workflows.throttle.company_throttle_permits`; both daily_check
+      send paths write via the shared
+      `workflows.daily_check._write_company_throttle_tally` helper.
+      PR-13 (scripts.backfill_per_company_outreach_state) is a one-shot
+      backfill co-writer for rows pre-dating incremental tracking.
+
+  - object: companies
+    slug: last_outreach_person_id
+    type: record_reference
+    options: null
+    pr_id: PR-13
+    status: shipped
+    write_owner_module:
+      - workflows.daily_check.run_dm_sequencing
+      - workflows.daily_check.run_connection_requests
+      - scripts.backfill_per_company_outreach_state
+
+  - object: companies
+    slug: last_outreach_step
+    type: select
+    options: [CONNECTION_SENT, DM1, DM2, DM3]
+    pr_id: PR-13
+    status: shipped
+    write_owner_module:
+      - workflows.daily_check.run_dm_sequencing
+      - workflows.daily_check.run_connection_requests
+      - scripts.backfill_per_company_outreach_state
+
+  - object: companies
+    slug: last_outreach_experiment_id
+    type: text
+    options: null
+    pr_id: PR-13
+    status: shipped
+    write_owner_module:
+      - workflows.daily_check.run_dm_sequencing
+      - workflows.daily_check.run_connection_requests
+      - scripts.backfill_per_company_outreach_state
+
+  # ---------- Companies: HQ classification (PR-27) ----------
+  - object: companies
+    slug: company_hq_country
+    type: text
+    options: null
+    pr_id: PR-27
+    status: planned
+    write_owner_module: workflows.weekly_prospect.classify_company_hq
+
+  - object: companies
+    slug: company_hq_confidence
+    type: number
+    options: null
+    pr_id: PR-27
+    status: planned
+    write_owner_module: workflows.weekly_prospect.classify_company_hq
+
+  # ---------- People: cross-channel outreach tracking (PR-40) ----------
+  - object: people
+    slug: outreach_channel
+    type: select
+    options: [linkedin, email, association_outreach]
+    pr_id: PR-40
+    status: shipped
+    write_owner_module: [workflows.cross_channel_suppression, scripts.migrate_association_outreach_to_attio]
+    note: "PR-40 promotes content/association_outreach.json into Attio. Multi-writer: cross_channel_suppression stamps at outreach-time; the migration script seeds the historical association-outreach pool. JSON file renamed .deprecated on successful migration. Object slug is 'people' (plural) matching the Attio API URL — `/objects/people/records/`."
+
+  # ---------- Deals: provenance (PR-38) ----------
+  - object: deals
+    slug: created_via
+    type: select
+    options: [agent_auto, agent_confirm, operator_manual, operator_unknown]
+    pr_id: PR-38
+    status: shipped
+    write_owner_module: [workflows.deal_creation.create_deal_from_response, scripts.backfill_operator_unknown_deals]
+
+  - object: deals
+    slug: creation_idempotency_key
+    type: text
+    options: null
+    pr_id: PR-38
+    status: shipped
+    write_owner_module: workflows.deal_creation.create_deal_from_response
+    note: "Round-4 D25 idempotency. f'{person_record_id}_{response_classification}_{response_received_at.isoformat()}' so re-runs of the same positive-response signal are no-ops."
+
+  # ---------- daily_run: identity + lease state (F-PR-8) ----------
+  - object: daily_run
+    slug: run_date
+    type: date
+    options: null
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_run.open_daily_run
+    note: "Local date when the daily run started. Composed with machine_id into uniqueness_key for cross-machine concurrent-run protection."
+
+  - object: daily_run
+    slug: machine_id
+    type: text
+    options: null
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_run.open_daily_run
+    note: "Derived from socket.gethostname() at process start. Distinct laptops sharing the same operator account are distinct machines."
+
+  - object: daily_run
+    slug: uniqueness_key
+    type: text
+    options: null
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_run.open_daily_run
+    note: "f'{run_date}|{machine_id}' — Attio is_unique=True. Second invocation on the same run_date from a different machine_id collides here and raises ConcurrentRunInAttio."
+
+  - object: daily_run
+    slug: hostname
+    type: text
+    options: null
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_run.open_daily_run
+    note: "socket.gethostname() raw value. Kept alongside machine_id for human readability in Attio."
+
+  - object: daily_run
+    slug: started_at
+    type: datetime
+    options: null
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_run.open_daily_run
+
+  - object: daily_run
+    slug: completed_at
+    type: datetime
+    options: null
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_run.open_daily_run
+    note: "Null while the run is in flight; set on context-manager __exit__ (whether successful or failed)."
+
+  - object: daily_run
+    slug: status
+    type: select
+    options: [running, completed, failed, aborted]
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_run.open_daily_run
+
+  - object: daily_run
+    slug: process_id
+    type: number
+    options: null
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_run.open_daily_run
+
+  - object: daily_run
+    slug: run_id
+    type: text
+    options: null
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_run.open_daily_run
+    note: "Free-form identifier from the caller (e.g., 'sales-daily-2026-05-21-12345'); useful for joining audit log JSONL to the daily_run row."
+
+  - object: daily_run
+    slug: connections_sent
+    type: number
+    options: null
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_run.record_send
+    note: "Authoritative replacement for ~/.outbound-agent/daily_limits.json connections counter. record_send() is the sole writer."
+
+  - object: daily_run
+    slug: messages_sent
+    type: number
+    options: null
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_run.record_send
+    note: "Authoritative replacement for ~/.outbound-agent/daily_limits.json messages counter."
+
+  - object: daily_run
+    slug: visits_sent
+    type: number
+    options: null
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_run.record_send
+    note: "Authoritative replacement for ~/.outbound-agent/daily_limits.json visits counter."
+
+  - object: daily_run
+    slug: failure_details
+    type: long_text
+    options: null
+    pr_id: F-PR-8
+    status: shipped
+    write_owner_module: workflows.daily_run.open_daily_run
+    note: "Captured on context-manager __exit__ when the run raises. Repr of exception + traceback first 4KB."
+
+  # ---------- daily_run: run-end summary counters (PR-17) ----------
+  - object: daily_run
+    slug: prospect_pool_size
+    type: number
+    options: null
+    pr_id: PR-17
+    status: shipped
+    write_owner_module: workflows.daily_check.run_end_summary
+
+  - object: daily_run
+    slug: due_dm1_count
+    type: number
+    options: null
+    pr_id: PR-17
+    status: shipped
+    write_owner_module: workflows.daily_check.run_end_summary
+
+  - object: daily_run
+    slug: due_dm2_count
+    type: number
+    options: null
+    pr_id: PR-17
+    status: shipped
+    write_owner_module: workflows.daily_check.run_end_summary
+
+  - object: daily_run
+    slug: due_dm3_count
+    type: number
+    options: null
+    pr_id: PR-17
+    status: shipped
+    write_owner_module: workflows.daily_check.run_end_summary
+
+  - object: daily_run
+    slug: degree_unknown_count
+    type: number
+    options: null
+    pr_id: PR-17
+    status: shipped
+    write_owner_module: workflows.daily_check.run_end_summary
+    note: "Populated from PR-15's per-prospect degree_unknown queue counts."
+
+  - object: daily_run
+    slug: reply_detection_status
+    type: select
+    options: [ok, no_csv, partial, halted, failed]
+    pr_id: PR-19
+    status: shipped
+    write_owner_module: workflows.daily_run.DailyRun.set_reply_detection_status
+    note: "PR-19 B-SD-005: written mid-flight by detect_responses() — 'failed' on the no-CSV halt path (before SystemExit(2)), 'ok' on success. Part-B (run_dm_sequencing) reads via daily_run.get_reply_detection_status to short-circuit on failure. Added 'failed' option to the select alphabet."
+
+  - object: daily_run
+    slug: starvation_signal
+    type: select
+    options: [healthy, low_dm1, low_dm2, low_dm3, multi_low]
+    pr_id: PR-17
+    status: shipped
+    write_owner_module: workflows.daily_check.run_end_summary
+
+  - object: daily_run
+    slug: nurture_silent_skipped_count
+    type: number
+    options: null
+    pr_id: PR-39
+    status: planned
+    write_owner_module: workflows.daily_check.run_nurture_re_engagement
+    note: "Per-daily_run counter for §3.18 silent-skip metric. STAYS planned: PR-39 ships the cadence module + backfill; the run_nurture_re_engagement writer-site (the only writer for this slug) lands in a follow-up cadence-execution PR. Flipping to shipped now would advertise a counter with no writer."
+
+  # ---------- Experiment: core metadata (F-PR-6) ----------
+  - object: experiment
+    slug: experiment_id
+    type: text
+    options: null
+    pr_id: F-PR-6
+    status: descoped
+    write_owner_module: scripts.migrate_experiments_tsv_to_attio
+    note: "Stable identifier (e.g., 'baseline-v0', 'exp-20260511-dm1-soften-all'). Unique constraint via idempotent upsert in the migration script + future writers."
+
+  - object: experiment
+    slug: status
+    type: select
+    options: [running, won, lost, rejected, rejected_null, rejected_defensive, superseded, insufficient_data]
+    pr_id: F-PR-6
+    status: descoped
+    write_owner_module: [scripts.migrate_experiments_tsv_to_attio, workflows.learn.apply_verdict]
+    note: "Status taxonomy. Includes legacy `rejected` (existing TSV) + the §3.2 spec values. PR-31 wires workflows.learn.apply_verdict as a co-writer for the weekly all-4-verdict persistence path; REJECTED_DEFENSIVE additionally opens variant_paused_defensive operator queue."
+
+  - object: experiment
+    slug: started
+    type: date
+    options: null
+    pr_id: F-PR-6
+    status: descoped
+    write_owner_module: scripts.migrate_experiments_tsv_to_attio
+
+  - object: experiment
+    slug: completed
+    type: date
+    options: null
+    pr_id: F-PR-6
+    status: descoped
+    write_owner_module: scripts.migrate_experiments_tsv_to_attio
+    note: "Nullable. NULL means the experiment is still running."
+
+  - object: experiment
+    slug: variable
+    type: text
+    options: null
+    pr_id: F-PR-6
+    status: descoped
+    write_owner_module: scripts.migrate_experiments_tsv_to_attio
+    note: "Variable being tested, e.g., 'messages.json:dm1:operations_leaders:es'. Format: '<file>:<step>:<persona>:<lang>' OR '<file>:<step>:all'."
+
+  - object: experiment
+    slug: description
+    type: long_text
+    options: null
+    pr_id: F-PR-6
+    status: descoped
+    write_owner_module: scripts.migrate_experiments_tsv_to_attio
+
+  - object: experiment
+    slug: state_history
+    type: long_text
+    options: null
+    pr_id: F-PR-6
+    status: descoped
+    write_owner_module: [scripts.migrate_experiments_tsv_to_attio, scripts.recompute_baseline_v0]
+    note: "Append-only JSONL of {timestamp, status, reason} events. Consumed by §3.17 supersedence rule. PR-33 + sales_approve append additional events. PR-11: recompute_baseline_v0 appends `superseded` events when recomputing baseline-v0 rates from Attio cohort data."
+
+  - object: experiment
+    slug: cohort_size
+    type: number
+    options: null
+    pr_id: F-PR-6
+    status: descoped
+    write_owner_module: scripts.migrate_experiments_tsv_to_attio
+    note: "Cached aggregate count. Re-computable from linkedin_outreach entries filtered by experiment_id; stored on Experiment for fast read in load_experiments()."
+
+  - object: experiment
+    slug: dm_response_rate
+    type: number
+    options: null
+    pr_id: F-PR-6
+    status: descoped
+    write_owner_module: scripts.migrate_experiments_tsv_to_attio
+    note: "Cached aggregate rate. Re-computable from cohort + LinkedIn Outreach response state."
+
+  - object: experiment
+    slug: dm1_response_rate
+    type: number
+    options: null
+    pr_id: F-PR-6
+    status: descoped
+    write_owner_module: [scripts.migrate_experiments_tsv_to_attio, scripts.recompute_baseline_v0]
+    note: "Per-step rate, nullable for legacy rows. PR-11: recompute_baseline_v0 overwrites this on baseline-v0 only when recomputing from Attio cohort data."
+
+  - object: experiment
+    slug: dm2_response_rate
+    type: number
+    options: null
+    pr_id: F-PR-6
+    status: descoped
+    write_owner_module: [scripts.migrate_experiments_tsv_to_attio, scripts.recompute_baseline_v0]
+    note: "Per-step rate, nullable for legacy rows. PR-11: recompute_baseline_v0 overwrites this on baseline-v0 only."
+
+  - object: experiment
+    slug: dm3_response_rate
+    type: number
+    options: null
+    pr_id: F-PR-6
+    status: descoped
+    write_owner_module: [scripts.migrate_experiments_tsv_to_attio, scripts.recompute_baseline_v0]
+    note: "Per-step rate, nullable for legacy rows. PR-11: recompute_baseline_v0 overwrites this on baseline-v0 only."
+
+  - object: experiment
+    slug: baseline_rate
+    type: number
+    options: null
+    pr_id: F-PR-6
+    status: descoped
+    write_owner_module: scripts.migrate_experiments_tsv_to_attio
+    note: "The dm_response_rate of the prior won experiment at the time this experiment started. Snapshot, not live-recomputed."
+
+  # ---------- Experiment: per-cohort verdict (PR-33) ----------
+  - object: experiment
+    slug: verdict_v1
+    type: select
+    options: [win, loss, inconclusive]
+    pr_id: PR-33
+    status: descoped
+    write_owner_module: workflows.weekly_brain.apply_dm3_revisit_verdict
+
+  - object: experiment
+    slug: verdict_v2
+    type: select
+    options: [win, loss, inconclusive]
+    pr_id: PR-33
+    status: descoped
+    write_owner_module: workflows.weekly_brain.apply_dm3_revisit_verdict
+
+  - object: experiment
+    slug: dm3_window_settles_at
+    type: date
+    options: null
+    pr_id: PR-33
+    status: descoped
+    write_owner_module: workflows.weekly_brain.apply_dm3_revisit_verdict
+
+  # ---------- LLM Budget Ledger (PR-35) ----------
+  - object: llm_budget_ledger
+    slug: step
+    type: select
+    options:
+      - quality_gate_haiku
+      - response_classification
+      - industry_classification
+      - borderline_verdict
+      - synthetic_prescreen
+      - weekly_brain_critique
+      - company_hq_classifier
+      - synth_holdout
+      - diagnostic_critique
+    pr_id: PR-35
+    status: shipped
+    write_owner_module: workflows.llm_budget.LLMBudgetLedger.try_reserve
+    note: "Must match STEP_WEEKLY_CAP_USD keys in workflows/llm_budget.py — Attio's select validation will reject CREATE with unknown step values."
+
+  - object: llm_budget_ledger
+    slug: week_starting
+    type: date
+    options: null
+    pr_id: PR-35
+    status: shipped
+    write_owner_module: workflows.llm_budget.LLMBudgetLedger.try_reserve
+
+  - object: llm_budget_ledger
+    slug: cap_remaining_this_week
+    type: currency
+    options: null
+    pr_id: PR-35
+    status: shipped
+    write_owner_module: workflows.llm_budget.LLMBudgetLedger.try_reserve
+
+  - object: llm_budget_ledger
+    slug: cost_usd_actual
+    type: currency
+    options: null
+    pr_id: PR-35
+    status: shipped
+    write_owner_module: workflows.llm_budget.LLMBudgetLedger.try_reserve
+
+  - object: llm_budget_ledger
+    slug: consumed
+    type: currency
+    options: null
+    pr_id: PR-35
+    status: shipped
+    write_owner_module: workflows.llm_budget.LLMBudgetLedger.try_reserve
+
+  # ---------- Weekly KPI Snapshot (PR-30) ----------
+  # Per-run agent-readable sidecar for the weekly KPI report. The HTML
+  # email is a derived view of this object — subagents query historical
+  # reports by filtering on week_starting.
+  - object: weekly_kpi_snapshot
+    slug: week_starting
+    type: date
+    options: null
+    pr_id: PR-30
+    status: descoped
+    write_owner_module: workflows.weekly_report.run_weekly_report
+    note: "Monday of the report week. Idempotency anchor for the snapshot upsert."
+
+  - object: weekly_kpi_snapshot
+    slug: kpi_snapshot_json
+    type: long_text
+    options: null
+    pr_id: PR-30
+    status: descoped
+    write_owner_module: workflows.weekly_report.run_weekly_report
+    note: "Full KPISnapshot TypedDict serialized to JSON: window, measurement_basis, prior_period_compare, totals, stage_counts, persona breakdowns, deal totals, notes."
+
+  - object: weekly_kpi_snapshot
+    slug: persona_funnels_json
+    type: long_text
+    options: null
+    pr_id: PR-30
+    status: descoped
+    write_owner_module: workflows.weekly_report.run_weekly_report
+    note: "PersonaFunnel[] table top-of-fold in the HTML email. JSON-serialized for subagent read."
+
+  - object: weekly_kpi_snapshot
+    slug: active_deals_json
+    type: long_text
+    options: null
+    pr_id: PR-30
+    status: descoped
+    write_owner_module: workflows.weekly_report.run_weekly_report
+    note: "compute_active_deals() output incl. DealStalenessRule status per deal."
+
+  - object: weekly_kpi_snapshot
+    slug: measurement_basis
+    type: text
+    options: null
+    pr_id: PR-30
+    status: descoped
+    write_owner_module: workflows.weekly_report.run_weekly_report
+    note: "Describes what the metrics are measuring (e.g. '7d_window_2026-05-12_to_2026-05-18'). Defaults to the 7-day window today minus 6d. Future cohort math (Wave 1D) can extend this string."
+
+  - object: weekly_kpi_snapshot
+    slug: report_email_sent_to
+    type: text
+    options: null
+    pr_id: PR-30
+    status: descoped
+    write_owner_module: workflows.weekly_report.run_weekly_report
+    note: "Email address the HTML report was sent to (empty when --dry-run)."
+
+  - object: weekly_kpi_snapshot
+    slug: report_resend_message_id
+    type: text
+    options: null
+    pr_id: PR-30
+    status: descoped
+    write_owner_module: workflows.weekly_report.run_weekly_report
+    note: "Resend's message id when the email was sent (empty when --dry-run or send failed)."
+
+  # ---------- Data Quality Report (PR-43.5) ----------
+  # All written by scripts.data_quality_report.write_report — one row per
+  # weekly run. Slug values intentionally short to keep Attio long_text
+  # render readable.
+  - object: data_quality_report
+    slug: run_id
+    type: text
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+
+  - object: data_quality_report
+    slug: generated_at
+    type: datetime
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+
+  - object: data_quality_report
+    slug: period_start
+    type: date
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+
+  - object: data_quality_report
+    slug: period_end
+    type: date
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+
+  - object: data_quality_report
+    slug: cohort_tagging_regression_count
+    type: number
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+    note: "P0 alarm count. Open Operator Review Queue rows of this type."
+
+  - object: data_quality_report
+    slug: write_owner_invariant_violated_count
+    type: number
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+    note: "P0 alarm count."
+
+  - object: data_quality_report
+    slug: migration_idempotency_regression_count
+    type: number
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+    note: "P0 alarm count."
+
+  - object: data_quality_report
+    slug: manual_reply_classification_gap_count
+    type: number
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+    note: "P1 alarm count. Threshold synced with §10 halt (M7)."
+
+  - object: data_quality_report
+    slug: nurture_silent_skipped_count_7d
+    type: number
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+    note: "Observability only. Sum from Daily Run rows in the report window."
+
+  - object: data_quality_report
+    slug: nurture_count_parse_errors_7d
+    type: number
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+    note: "Daily Run rows whose nurture_silent_skipped_count failed int() parse. Separate from the sum so an operator can tell '0 skips' from 'couldn't parse'."
+
+  - object: data_quality_report
+    slug: pipeline_starvation_open_count
+    type: number
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+    note: "Observability only. Open queue rows of type='pipeline_starvation' (PR-43)."
+
+  - object: data_quality_report
+    slug: back_pointer_failures_count_7d
+    type: number
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+    note: "Observability only. Count of Migration Run rows whose failure_details_pointer mentions back-pointer failures (§3.13 forensics gap)."
+
+  - object: data_quality_report
+    slug: legacy_archaeology_pool_count
+    type: number
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+    note: "Observability only. LinkedIn Outreach entries whose experiment_id_frozen_at is a legacy_* sentinel (§3.10)."
+
+  - object: data_quality_report
+    slug: p0_alarms_fired
+    type: text
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+    note: "Comma-joined slugs of the P0 alarms that fired in this run."
+
+  - object: data_quality_report
+    slug: p1_alarms_fired
+    type: text
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+
+  - object: data_quality_report
+    slug: report_text
+    type: long_text
+    options: null
+    pr_id: PR-43.5
+    status: shipped
+    write_owner_module: scripts.data_quality_report.write_report
+    note: "Pre-rendered human-readable report. Operator reads this in the Attio row UI without running the script."

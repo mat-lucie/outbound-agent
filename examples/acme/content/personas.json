@@ -1,0 +1,159 @@
+{
+  "digitalization_champions": {
+    "label": "Digitalization Champions",
+    "target_titles": [
+      "Dir. Digitalización",
+      "VP Innovation",
+      "Industry 4.0 Lead",
+      "Digital Transformation Manager"
+    ],
+    "volume_per_month": "20-30",
+    "hook_angle": "Reference hook angle for the Acme example operator.",
+    "enterprise_mode": true,
+    "icp_notes": "Synthetic reference ICP notes for the Acme example operator — replace with your own segment definition.",
+    "search_queries": {
+      "content_keywords": [
+        "operations",
+        "production",
+        "scheduling"
+      ],
+      "sn_search_urls": [
+        "https://www.linkedin.com/sales/search/people?example=acme"
+      ]
+    }
+  },
+  "operations_leaders": {
+    "label": "Operations Leaders",
+    "target_titles": [
+      "VP Operaciones",
+      "Dir. Manufactura",
+      "Plant Manager",
+      "Dir. Producción"
+    ],
+    "volume_per_month": "20-30",
+    "hook_angle": "Reference hook angle for the Acme example operator.",
+    "enterprise_mode": true,
+    "icp_notes": "Synthetic reference ICP notes for the Acme example operator — replace with your own segment definition.",
+    "search_queries": {
+      "content_keywords": [
+        "operations",
+        "production",
+        "scheduling"
+      ],
+      "sn_search_urls": [
+        "https://www.linkedin.com/sales/search/people?example=acme"
+      ]
+    }
+  },
+  "executive_sponsors": {
+    "label": "Executive Sponsors",
+    "target_titles": [
+      "CFO",
+      "COO",
+      "VP Supply Chain",
+      "Manufacturing Director"
+    ],
+    "volume_per_month": "10-20",
+    "hook_angle": "Reference hook angle for the Acme example operator.",
+    "enterprise_mode": true,
+    "icp_notes": "Synthetic reference ICP notes for the Acme example operator — replace with your own segment definition.",
+    "search_queries": {
+      "content_keywords": [
+        "operations",
+        "production",
+        "scheduling"
+      ],
+      "sn_search_urls": [
+        "https://www.linkedin.com/sales/search/people?example=acme"
+      ]
+    }
+  },
+  "mx_midmarket_manufacturing": {
+    "label": "MX Mid-Market Manufacturing",
+    "target_titles": [
+      "Director de Operaciones",
+      "Gerente de Planta",
+      "Director de Manufactura",
+      "Director de Producción",
+      "Dueño",
+      "Director General",
+      "Gerente de Producción",
+      "Jefe de Planta",
+      "Director de Planta"
+    ],
+    "volume_per_month": "15-25",
+    "hook_angle": "Reference hook angle for the Acme example operator.",
+    "target_company_mode": true,
+    "target_company_list": "mx-midmarket",
+    "icp_notes": "Synthetic reference ICP notes for the Acme example operator — replace with your own segment definition.",
+    "search_queries": {
+      "content_keywords": [
+        "operations",
+        "production",
+        "scheduling"
+      ],
+      "sn_search_urls": [
+        "https://www.linkedin.com/sales/search/people?example=acme"
+      ]
+    }
+  },
+  "co_midmarket_manufacturing": {
+    "label": "CO Mid-Market Manufacturing",
+    "target_titles": [
+      "Director de Operaciones",
+      "Gerente de Planta",
+      "Director de Manufactura",
+      "Director de Producción",
+      "Dueño",
+      "Director General",
+      "Gerente de Producción",
+      "Jefe de Planta",
+      "Director Industrial"
+    ],
+    "volume_per_month": "15-25",
+    "hook_angle": "Reference hook angle for the Acme example operator.",
+    "target_company_mode": true,
+    "target_company_list": "co-midmarket",
+    "icp_notes": "Synthetic reference ICP notes for the Acme example operator — replace with your own segment definition.",
+    "search_queries": {
+      "content_keywords": [
+        "operations",
+        "production",
+        "scheduling"
+      ],
+      "sn_search_urls": [
+        "https://www.linkedin.com/sales/search/people?example=acme"
+      ]
+    }
+  },
+  "cl_midmarket_manufacturing": {
+    "label": "CL Mid-Market Manufacturing",
+    "target_titles": [
+      "Director de Operaciones",
+      "Gerente de Planta",
+      "Director de Manufactura",
+      "Director de Producción",
+      "Dueño",
+      "Director General",
+      "Gerente de Producción",
+      "Jefe de Planta",
+      "Director Industrial",
+      "Enólogo Jefe"
+    ],
+    "volume_per_month": "10-20",
+    "hook_angle": "Reference hook angle for the Acme example operator.",
+    "target_company_mode": true,
+    "target_company_list": "cl-midmarket",
+    "icp_notes": "Synthetic reference ICP notes for the Acme example operator — replace with your own segment definition.",
+    "search_queries": {
+      "content_keywords": [
+        "operations",
+        "production",
+        "scheduling"
+      ],
+      "sn_search_urls": [
+        "https://www.linkedin.com/sales/search/people?example=acme"
+      ]
+    }
+  }
+}

@@ -1,0 +1,544 @@
+{
+  "companies": [
+    {
+      "id": 1,
+      "name": "Globex",
+      "country": "United States",
+      "sector": "Software",
+      "estimated_revenue_usd": "500M",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 2,
+      "name": "Initech",
+      "country": "Canada",
+      "sector": "Technology",
+      "estimated_revenue_usd": "1B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 2
+    },
+    {
+      "id": 3,
+      "name": "Umbrella Industrial",
+      "country": "United Kingdom",
+      "sector": "Manufacturing",
+      "estimated_revenue_usd": "2B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 1
+    },
+    {
+      "id": 4,
+      "name": "Hooli",
+      "country": "Germany",
+      "sector": "Retail",
+      "estimated_revenue_usd": "5B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 5,
+      "name": "Vehement Manufacturing",
+      "country": "Australia",
+      "sector": "Healthcare",
+      "estimated_revenue_usd": "10B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 2
+    },
+    {
+      "id": 6,
+      "name": "Stark Industrial",
+      "country": "United States",
+      "sector": "Financial Services",
+      "estimated_revenue_usd": "500M",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 7,
+      "name": "Wayne Manufacturing",
+      "country": "Canada",
+      "sector": "Logistics",
+      "estimated_revenue_usd": "1B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 1
+    },
+    {
+      "id": 8,
+      "name": "Soylent Foods",
+      "country": "United Kingdom",
+      "sector": "Software",
+      "estimated_revenue_usd": "2B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 1
+    },
+    {
+      "id": 9,
+      "name": "Cyberdyne Systems",
+      "country": "Germany",
+      "sector": "Technology",
+      "estimated_revenue_usd": "5B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 10,
+      "name": "Tyrell Manufacturing",
+      "country": "Australia",
+      "sector": "Manufacturing",
+      "estimated_revenue_usd": "10B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 11,
+      "name": "Massive Dynamic",
+      "country": "United States",
+      "sector": "Retail",
+      "estimated_revenue_usd": "500M",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 2
+    },
+    {
+      "id": 12,
+      "name": "Aperture Industrial",
+      "country": "Canada",
+      "sector": "Healthcare",
+      "estimated_revenue_usd": "1B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 13,
+      "name": "Vandelay Industries",
+      "country": "United Kingdom",
+      "sector": "Financial Services",
+      "estimated_revenue_usd": "2B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 1
+    },
+    {
+      "id": 14,
+      "name": "Pied Piper",
+      "country": "Germany",
+      "sector": "Logistics",
+      "estimated_revenue_usd": "5B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 2
+    },
+    {
+      "id": 15,
+      "name": "Gringotts Logistics",
+      "country": "Australia",
+      "sector": "Software",
+      "estimated_revenue_usd": "10B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 16,
+      "name": "Oscorp Industrial",
+      "country": "United States",
+      "sector": "Technology",
+      "estimated_revenue_usd": "500M",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 17,
+      "name": "Weyland Manufacturing",
+      "country": "Canada",
+      "sector": "Manufacturing",
+      "estimated_revenue_usd": "1B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 2
+    },
+    {
+      "id": 18,
+      "name": "Abstergo Industrial",
+      "country": "United Kingdom",
+      "sector": "Retail",
+      "estimated_revenue_usd": "2B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 19,
+      "name": "Virtucon",
+      "country": "Germany",
+      "sector": "Healthcare",
+      "estimated_revenue_usd": "5B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 20,
+      "name": "Bluth Manufacturing",
+      "country": "Australia",
+      "sector": "Financial Services",
+      "estimated_revenue_usd": "10B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 2
+    },
+    {
+      "id": 21,
+      "name": "Spacely Sprockets",
+      "country": "United States",
+      "sector": "Logistics",
+      "estimated_revenue_usd": "500M",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 22,
+      "name": "Cogswell Cogs",
+      "country": "Canada",
+      "sector": "Software",
+      "estimated_revenue_usd": "1B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 23,
+      "name": "Veridian Dynamics",
+      "country": "United Kingdom",
+      "sector": "Technology",
+      "estimated_revenue_usd": "2B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 2
+    },
+    {
+      "id": 24,
+      "name": "Buy-n-Large",
+      "country": "Germany",
+      "sector": "Manufacturing",
+      "estimated_revenue_usd": "5B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 1
+    },
+    {
+      "id": 25,
+      "name": "Strickland Manufacturing",
+      "country": "Australia",
+      "sector": "Retail",
+      "estimated_revenue_usd": "10B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 26,
+      "name": "Sirius Industrial",
+      "country": "United States",
+      "sector": "Healthcare",
+      "estimated_revenue_usd": "500M",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 1
+    },
+    {
+      "id": 27,
+      "name": "Encom Manufacturing",
+      "country": "Canada",
+      "sector": "Financial Services",
+      "estimated_revenue_usd": "1B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 28,
+      "name": "Rand Logistics",
+      "country": "United Kingdom",
+      "sector": "Logistics",
+      "estimated_revenue_usd": "2B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 29,
+      "name": "Hanso Industrial",
+      "country": "Germany",
+      "sector": "Software",
+      "estimated_revenue_usd": "5B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 2
+    },
+    {
+      "id": 30,
+      "name": "Primatech",
+      "country": "Australia",
+      "sector": "Technology",
+      "estimated_revenue_usd": "10B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 31,
+      "name": "Zorin Manufacturing",
+      "country": "United States",
+      "sector": "Manufacturing",
+      "estimated_revenue_usd": "500M",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 1
+    },
+    {
+      "id": 32,
+      "name": "Omni Consumer Products",
+      "country": "Canada",
+      "sector": "Retail",
+      "estimated_revenue_usd": "1B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 2
+    },
+    {
+      "id": 33,
+      "name": "Bishop Industrial",
+      "country": "United Kingdom",
+      "sector": "Healthcare",
+      "estimated_revenue_usd": "2B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 34,
+      "name": "Wallace Manufacturing",
+      "country": "Germany",
+      "sector": "Financial Services",
+      "estimated_revenue_usd": "5B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 35,
+      "name": "Sevrin Logistics",
+      "country": "Australia",
+      "sector": "Logistics",
+      "estimated_revenue_usd": "10B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 2
+    },
+    {
+      "id": 36,
+      "name": "Nakatomi Manufacturing",
+      "country": "United States",
+      "sector": "Software",
+      "estimated_revenue_usd": "500M",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 37,
+      "name": "Genco Foods",
+      "country": "Canada",
+      "sector": "Technology",
+      "estimated_revenue_usd": "1B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 38,
+      "name": "Prestige Worldwide",
+      "country": "United Kingdom",
+      "sector": "Manufacturing",
+      "estimated_revenue_usd": "2B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 1
+    },
+    {
+      "id": 39,
+      "name": "Dunder Manufacturing",
+      "country": "Germany",
+      "sector": "Retail",
+      "estimated_revenue_usd": "5B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 40,
+      "name": "Wernham Manufacturing",
+      "country": "Australia",
+      "sector": "Healthcare",
+      "estimated_revenue_usd": "10B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 41,
+      "name": "Monsters Industrial",
+      "country": "United States",
+      "sector": "Financial Services",
+      "estimated_revenue_usd": "500M",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 2
+    },
+    {
+      "id": 42,
+      "name": "Clampett Energy",
+      "country": "Canada",
+      "sector": "Logistics",
+      "estimated_revenue_usd": "1B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 43,
+      "name": "Gekko Manufacturing",
+      "country": "United Kingdom",
+      "sector": "Software",
+      "estimated_revenue_usd": "2B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 44,
+      "name": "Paper Street Industrial",
+      "country": "Germany",
+      "sector": "Technology",
+      "estimated_revenue_usd": "5B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 2
+    },
+    {
+      "id": 45,
+      "name": "Queen Consolidated",
+      "country": "Australia",
+      "sector": "Manufacturing",
+      "estimated_revenue_usd": "10B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 46,
+      "name": "LexCorp Industrial",
+      "country": "United States",
+      "sector": "Retail",
+      "estimated_revenue_usd": "500M",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 47,
+      "name": "Aviato Logistics",
+      "country": "Canada",
+      "sector": "Healthcare",
+      "estimated_revenue_usd": "1B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 1
+    },
+    {
+      "id": 48,
+      "name": "Tessier Manufacturing",
+      "country": "United Kingdom",
+      "sector": "Financial Services",
+      "estimated_revenue_usd": "2B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 49,
+      "name": "Nostromo Freight",
+      "country": "Germany",
+      "sector": "Logistics",
+      "estimated_revenue_usd": "5B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 50,
+      "name": "Wonka Foods",
+      "country": "Australia",
+      "sector": "Software",
+      "estimated_revenue_usd": "10B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 1
+    },
+    {
+      "id": 51,
+      "name": "Black Mesa Industrial",
+      "country": "United States",
+      "sector": "Technology",
+      "estimated_revenue_usd": "500M",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    },
+    {
+      "id": 52,
+      "name": "Cortical Manufacturing",
+      "country": "Canada",
+      "sector": "Manufacturing",
+      "estimated_revenue_usd": "1B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "north america",
+      "tier": 2
+    },
+    {
+      "id": 53,
+      "name": "Delos Industrial",
+      "country": "United Kingdom",
+      "sector": "Retail",
+      "estimated_revenue_usd": "2B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "europe",
+      "tier": 2
+    },
+    {
+      "id": 54,
+      "name": "Kerberos Logistics",
+      "country": "Germany",
+      "sector": "Healthcare",
+      "estimated_revenue_usd": "5B",
+      "digital_rationale": "Synthetic reference target for the Acme example operator.",
+      "region": "asia",
+      "tier": 2
+    }
+  ]
+}

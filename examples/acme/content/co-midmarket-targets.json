@@ -1,0 +1,21 @@
+{
+  "_meta": {
+    "icp": "Synthetic reference midmarket ICP for the Acme example operator.",
+    "geography": "Reference region (replace with your market).",
+    "persona": "co_midmarket_manufacturing",
+    "verification_status": "synthetic-reference",
+    "note": "Fabricated example data — replace with your own target list."
+  },
+  "tier_1_high_conviction": [
+    {
+      "name": "Synthetic Midmarket Co CO-1",
+      "subsegment": "Reference manufacturing",
+      "size": "200-2000 employees",
+      "why_fit": "Reference-only entry.",
+      "source": "synthetic"
+    }
+  ],
+  "summary_counts": {
+    "tier_1_high_conviction": 1
+  }
+}

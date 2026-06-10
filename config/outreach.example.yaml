@@ -1,0 +1,52 @@
+# Outreach operational knobs — how much / how often / which-first.
+#
+# This file ships with the engine as the neutral default template. Copy it to
+# config/outreach.yaml and tune for your sending reputation and list size; the
+# live config/outreach.yaml is gitignored. If it's absent, the engine falls back
+# to THIS file. A worked reference (the synthetic Acme example operator)
+# lives at examples/acme/config/outreach.yaml.
+#
+# Validation (fail-loud): all integers must be >= 1 (lane ranks may be 0);
+# caps.invite_batch_size must be <= caps.invites_per_day; schedule.send_days must
+# be a non-empty list of day names (mon..sun).
+
+caps:
+  invites_per_day: 25          # max LinkedIn connection invites per day
+  dms_per_day: 30              # max DMs per day
+  visits_per_day: 50           # max profile visits (CONNECTION_SENT re-checks) per day
+  invite_batch_size: 25        # target invites filled per daily run by scanning past throttled/duplicate-company rows (<= invites_per_day)
+
+cadence:                       # calendar days from the prior milestone until a step is eligible
+  connect_to_dm1_days: 1       # days after a connection is accepted until DM1 may fire
+  dm1_to_dm2_days: 5           # days after DM1 until DM2 may fire
+  dm2_to_dm3_days: 10          # days after DM2 until DM3 may fire
+  nurture_business_days:       # post-DM3 re-engagement window (business days), by lane
+    enterprise: 90             # high-value, low-pressure
+    target: 60                 # target lane
+    legacy: 45                 # legacy / default lane (tighter loop)
+
+lanes:
+  rank:                        # invite-queue priority; lower rank = invited first.
+    enterprise_mode: 0         # keys MUST match the scoring_lane values written to your CRM
+    target_company_mode: 1
+    legacy: 2
+
+schedule:
+  send_days: [mon, tue, wed, thu, fri]  # days outreach may fire. Timezone = OUTBOUND_TZ env var.
+
+throttle:
+  company_window_days: 14      # no further outreach to a company for N days after a contact
+
+staleness:
+  stale_run_takeover_hours: 3  # a same-machine status=running daily_run row older than this
+                                # is marked abandoned and its lock freed so a new run can open.
+                                # cross-machine stale rows always raise ConcurrentRunInAttio.
+
+sweep:
+  window_days: 3                # end-of-run consistency sweep looks back this many days for
+                                # company tally stamps to verify against their person entries.
+                                # Must stay <= throttle.company_window_days so a stamp can't be
+                                # overwritten before the sweep sees it.
+  repair_circuit_threshold: 3   # after this many CONSECUTIVE repair-write failures the sweep
+                                # stops attempting repairs and escalates the rest (each failed
+                                # write can burn the full AttioWriter retry budget).

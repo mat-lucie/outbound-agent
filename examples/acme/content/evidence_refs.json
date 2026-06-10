@@ -1,0 +1,20 @@
+{
+  "otif +5-8 punt": {
+    "source": "Acme internal benchmark (executive_sponsors dm2_v1 ES)",
+    "verified_by": "alex@acme.example.com",
+    "verified_at": "2026-05-22",
+    "note": "Directional point-range claim, not a specific case study citation. Operator-acknowledged framing for executive prospects. Replace with a specific customer case study when one ships."
+  },
+  "otif up 5-8 points": {
+    "source": "Acme internal benchmark (executive_sponsors dm2_v1 EN)",
+    "verified_by": "alex@acme.example.com",
+    "verified_at": "2026-05-22",
+    "note": "Same directional claim as the ES variant; EN copy."
+  },
+  "otif +5-8 pont": {
+    "source": "Acme internal benchmark (executive_sponsors dm2_v1 PT)",
+    "verified_by": "alex@acme.example.com",
+    "verified_at": "2026-05-22",
+    "note": "Same directional claim as the ES variant; PT copy."
+  }
+}

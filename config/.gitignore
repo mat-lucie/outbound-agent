@@ -1,0 +1,3 @@
+# Live operator config is local-only; only *.example.yaml templates are tracked.
+*.yaml
+!*.example.yaml

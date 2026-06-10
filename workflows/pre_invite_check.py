@@ -1,0 +1,1236 @@
+"""Pre-invite LinkedIn-degree check.
+
+Scrapes LinkedIn degree for each PROSPECT before inviting; partitions
+already-connected (1st-degree) prospects out of the invite queue and
+flips them to ACCEPTED in Attio. Catches Pattern A (re-prospected after
+dedup) and Pattern B (the operator connected externally) before LinkedIn no-ops
+the invite.
+
+A second-layer `is_invite_eligible` quarantine gate (defense-in-depth)
+runs before any invite candidate is scraped — the daily_check caller
+already filtered, but this re-verifies so a future refactor of either
+side can't silently regress the §3.1 contract.
+
+# PR-15 (B-SD-010)
+
+Three pieces shipped together:
+
+  1. **STRICT mode env gate** — `STRICT_PRE_INVITE_DEGREE_CHECK`
+     (default true) raises `ConfigError` when the send-path lacks a
+     `profile_scraper_id`. The pre-PR-15 silent-bypass (a click.echo
+     warning) was a §0 #9 violation: invites would ship without
+     degree verification, risking re-invites of already-1st-degree
+     connections.
+
+  2. **Pattern-A flip codepath carve-out** — STRICT applies ONLY to
+     the send_invite path. The cache_hit_flip path (cache reports a
+     1st-degree connection; we record it as ACCEPTED without
+     scraping) does NOT need a scraper-id by definition — it's a
+     read-then-record path that never issues a new invite. The
+     codepath is set explicitly before the STRICT gate so the
+     carve-out is readable in the diff.
+
+  3. **Atomic Pattern-A flip via AttioWriter.apply(WriteIntent)** —
+     B-SD-010's load-bearing §3.1 protection. The flip writes
+     `stage=ACCEPTED + last_contact_date` as a single multi-attribute
+     PATCH through F-PR-4's contract. A torn write (stage flips but
+     last_contact_date doesn't, or vice versa) would let a retry
+     re-invite an already-1st-degree connection. F-PR-4 guarantees
+     single-PATCH atomicity for `WriteIntent(updates=[...])`.
+
+# Partial-CSV signal
+
+When the pre-invite scrape CSV returns fewer rows than were requested
+(scrape attempted N profiles, CSV reported M < N), PR-15 emits ONE
+`degree_unknown` Operator Review Queue row PER MISSING PROSPECT with
+payload `{record_id, last_known_degree, scrape_attempt_id, requested_at,
+csv_row_count_observed, csv_row_count_expected}`. Aggregated/summary
+writes are forbidden — operator triages per-prospect. The aggregated
+`degree_unknown_count` attribute is PR-17's responsibility (run-end
+summary).
+
+# PR-21 experiment_id inheritance (Pattern-A + Pattern-B flip)
+
+When a 1st-degree match flips a row from PROSPECT (or CONNECTION_SENT) →
+ACCEPTED, the flip ALSO stamps `experiment_id_frozen_at="accepted"` while
+preserving the existing `experiment_id`. This ensures cohort-attribution is
+correct regardless of which phase catches the acceptance first.
+
+Immutability guard (`_IMMUTABLE_FROZEN_AT_VALUES`): once a row reaches a
+terminal frozen_at value, it cannot be overwritten. The guard raises
+`ExperimentIdImmutableError(RuntimeError)` on violation — subclass of
+RuntimeError to avoid silent swallow by `except ValueError:` blocks.
+
+Carve-out: `prospect → accepted` is EXPLICITLY ALLOWED — this is the
+Pattern-B case (the operator connected externally on a never-invited prospect). The
+`connection_sent` → `accepted` path is the normal Pattern-A path. Both are
+valid. The immutability guard only blocks overwriting already-terminal values
+(accepted, connection_sent, legacy_*).
+
+to_send_data row CONTRACT (PR-21): every row MUST carry `experiment_id` and
+`experiment_id_frozen_at` keys (populated by `run_connection_requests` from
+Attio-read attrs). Missing keys → `KeyError` propagates as a caller bug.
+"""
+from __future__ import annotations
+
+import csv
+import hashlib
+import io
+import json
+import os
+from datetime import UTC, date, datetime
+from typing import TYPE_CHECKING
+
+import click
+import httpx
+
+from clients.attio_writer import (
+    AttioError,
+    AttioWriter,
+    WriteIntent,
+)
+from clients.attio_writer_registry import UnauthorizedAttioWriteError
+from clients.pb_envelope import PBRunFailed, PBRunTimeout, has_scraper_dedup_marker
+from models.business_calendar import operator_today
+from models.experiment import ExperimentIdImmutableError, FrozenAtState
+from models.pipeline import PipelineStage, is_invite_eligible
+from workflows import recheck_cache
+from workflows.daily_check_helpers import (
+    _normalize_linkedin_url,
+    _resolve_degree_check_backend,
+)
+from workflows.escalation import escalate
+
+if TYPE_CHECKING:
+    from clients.attio import AttioClient
+    from clients.phantombuster import PhantomBusterClient
+
+
+# ---------------------------------------------------------------------------
+# PR-21 experiment_id immutability guard
+# ---------------------------------------------------------------------------
+
+# Frozen-at values that are TERMINAL — once a row carries one of these,
+# experiment_id + experiment_id_frozen_at must not be overwritten.
+# "prospect" and None are NOT in this set — both are valid source states
+# that can transition to "accepted" or "connection_sent".
+# "no_active_experiment" is NOT here and MUST NOT be added — it is not
+# a valid Attio select option (Lesson 1).
+_IMMUTABLE_FROZEN_AT_VALUES: frozenset[FrozenAtState] = frozenset({
+    "connection_sent",
+    "accepted",
+    "legacy_pre_tsv_era",
+    "legacy_inferred_by_archaeology",
+    "legacy_pure_unknown",
+})
+
+
+def _check_experiment_id_immutability(
+    *,
+    record_id: str,
+    entry_id: str | None,
+    prior_frozen_at: str | None,
+    new_frozen_at: str,
+    prior_experiment_id: str | None,
+    new_experiment_id: str | None,
+) -> None:
+    """Guard against overwriting a terminal experiment_id_frozen_at value.
+
+    Raises `ExperimentIdImmutableError` when `prior_frozen_at` is in
+    `_IMMUTABLE_FROZEN_AT_VALUES` AND we're not keeping the same value.
+
+    Carve-outs (both are valid, explicitly documented):
+    - `prospect → accepted`: Pattern-B case — the operator connected externally on
+      a never-invited prospect. The row went PROSPECT → ACCEPTED without
+      passing through CONNECTION_SENT. This is NOT a violation; the guard
+      explicitly allows it.
+    - `None → accepted` or `None → connection_sent`: Row has no prior
+      frozen_at (pre-PR-21 row). Stamping from NULL is always allowed.
+
+    The guard is NOT raised when:
+    - prior_frozen_at is None (NULL → any value is fine)
+    - prior_frozen_at == "prospect" (prospect → accepted is Pattern-B)
+    - prior_frozen_at == new_frozen_at (idempotent write is fine)
+    """
+    if prior_frozen_at is None:
+        # Null → anything: allowed (pre-PR-21 row).
+        return
+    if prior_frozen_at == new_frozen_at:
+        # Idempotent write: allowed.
+        return
+    if prior_frozen_at not in _IMMUTABLE_FROZEN_AT_VALUES:
+        # Source state is "prospect" or another non-terminal value:
+        # the transition is allowed (prospect → accepted is Pattern-B).
+        return
+    # prior_frozen_at is a terminal value AND we're trying to overwrite it.
+    raise ExperimentIdImmutableError(
+        record_id=record_id,
+        entry_id=entry_id,
+        field="experiment_id_frozen_at",
+        old_value=prior_frozen_at,
+        new_value=new_frozen_at,
+    )
+
+
+# ---------------------------------------------------------------------------
+# STRICT mode
+# ---------------------------------------------------------------------------
+
+STRICT_PRE_INVITE_DEGREE_CHECK_ENV = "STRICT_PRE_INVITE_DEGREE_CHECK"
+
+
+class ConfigError(RuntimeError):
+    """Pre-invite degree check is missing a required configuration value
+    AND the STRICT env gate is enabled.
+
+    Raised exclusively from the send_invite codepath in
+    `_pre_invite_degree_check` — the cache_hit_flip path is exempt
+    because it never issues a new invite.
+
+    Caller contract: this is a fatal config error that must NOT be
+    caught and silently bypassed. The pre-PR-15 behavior of warning
+    and proceeding was the §0 #9 violation B-SD-010 closes.
+    """
+
+
+def _strict_mode_enabled() -> bool:
+    """Read `STRICT_PRE_INVITE_DEGREE_CHECK` from env.
+
+    Defaults to True — the SAFE default per §3.1 (never silently skip
+    degree verification on the send path). Operators can opt out with
+    `STRICT_PRE_INVITE_DEGREE_CHECK=false` for debugging only.
+    """
+    return os.environ.get(STRICT_PRE_INVITE_DEGREE_CHECK_ENV, "true").lower() != "false"
+
+
+# ---------------------------------------------------------------------------
+# Sales Nav CSV column constants (PR-B.4)
+# ---------------------------------------------------------------------------
+#
+# Verified against PB phantom 602790655114603 on 2026-05-25 — see migration
+# memory at ~/.claude/projects/.../project_sales_nav_migration.md. These
+# column names match the legacy regular Profile Scraper output (by design;
+# both PB phantoms emit the same schema), so the parser can reuse a single
+# resolver helper across both backends — see _resolve_csv_columns below.
+
+SALES_NAV_DEGREE_COL = "connectionDegree"
+SALES_NAV_LINKEDIN_URL_COL = "linkedinProfileUrl"
+SALES_NAV_QUERY_COL = "query"  # echo of the input URL exactly as passed
+SALES_NAV_FULL_NAME_COL = "fullName"
+SALES_NAV_HAS_PENDING_INVITATION_COL = "hasPendingInvitation"  # "true" | "false"
+
+# Legacy regular-scraper columns we still match for the regular backend path.
+LEGACY_DEGREE_COLS = ("connectionDegree",)
+LEGACY_URL_COLS = ("linkedin_url", "linkedinProfileUrl", "profileUrl", "query")
+
+
+# ---------------------------------------------------------------------------
+# Pre-invite §3.1 failure_reason constants (PR-B.8)
+# ---------------------------------------------------------------------------
+#
+# Distinct strings per failure mode so the operator-review queue UI can
+# triage `degree_unknown` escalations by category. Closes adversarial
+# finding F10 (operator confusion from a single opaque "scrape returned no
+# row" string masking three distinct conditions).
+
+REASON_LEGACY_CSV_MISS = "regular_scrape_missing_row"
+REASON_LEGACY_DEGREE_BLANK = "regular_scrape_empty_degree"
+
+REASON_SALES_NAV_CSV_MISS = "sales_nav_scrape_missing_row"
+REASON_SALES_NAV_DEGREE_BLANK = "sales_nav_scrape_empty_degree"
+REASON_SALES_NAV_DEGREE_UNKNOWN = "sales_nav_scrape_unknown_degree_value"
+# §3.1 stronger gate (NEW from CSV finding 2026-05-25): the Sales Nav CSV
+# includes hasPendingInvitation="true|false". If true, we already invited
+# this prospect — NEVER re-invite regardless of degree.
+REASON_SALES_NAV_PENDING_INVITATION = "sales_nav_has_pending_invitation"
+
+
+# ---------------------------------------------------------------------------
+# Sales Nav launch + escalation helpers (PR-B.5)
+# ---------------------------------------------------------------------------
+
+
+def _launch_sales_nav_scrape(
+    pb: PhantomBusterClient,
+    scraper_id: str,
+    urls: list[str],
+    *,
+    max_wait: int = 300,
+    retry_on_timeout: bool = True,
+) -> tuple[str, dict[str, str], dict[str, dict]]:
+    """Run the Sales Nav Profile Scraper against the given LinkedIn URLs.
+
+    Returns (container_id, degree_by_normalized_url, extras_by_normalized_url).
+    ``extras`` carries the per-prospect signals beyond degree —
+    currently just ``hasPendingInvitation`` ("true"/"false") so the
+    PR-B.5 partition can apply the stronger §3.1 gate.
+
+    The Sales Nav Profile Scraper rejects partial argument objects with
+    "Your Phantom Argument Isn't Valid" (verified 2026-05-25 against
+    phantom 602790655114603). Always pass the FULL saved argument shape,
+    overriding only the fields we need:
+
+    - ``identities[0].sessionCookie`` ← fresh value from
+      :envvar:`PB_LI_SALES_NAV_SESSION_COOKIE`
+    - ``identities[0].userAgent`` ← :envvar:`PB_LI_USER_AGENT`
+    - ``spreadsheetUrl`` ← single ``linkedin.com/in/<slug>`` URL OR a real
+      Google Sheets URL. The phantom auto-converts ``/in/`` URLs to
+      ``/sales/lead/<id>,<auth>`` internally — no separate URL Converter
+      phantom needed (see project_sales_nav_migration memory).
+    - ``numberOfProfilesPerLaunch`` ← tight cap matching the input batch
+
+    For multi-URL launches we still use a Google Sheets URL via
+    :func:`workflows.daily_check.write_prospects_to_sheet`; for single
+    URLs we can pass the URL string directly in ``spreadsheetUrl`` (the
+    phantom accepts both forms).
+
+    On ``PBRunTimeout``, retries ONCE with the same args before giving up
+    (closes L3 review must-fix #2 — Sales Nav is faster than the legacy
+    scraper but PB queue depth can still spike; one retry catches the
+    queue-saturation case without doubling cost on a real failure).
+
+    Returns empty dicts (not None) on ``PBRunFailed`` or empty CSV — the
+    caller's batch-level fail-safe (drop the whole batch rather than
+    risk re-inviting connected people) lives one level up.
+    """
+    import workflows.daily_check as _dc
+
+    # Build sheet input. For a single URL, pass it directly; for >1, build
+    # a Google Sheets URL via the existing helper.
+    if len(urls) == 1:
+        sheet_url = urls[0]
+    else:
+        sheet_rows = [{"profileUrl": u} for u in urls]
+        sheet_url = _dc.write_prospects_to_sheet(
+            sheet_rows, columns=["profileUrl"]
+        )
+
+    # Read saved phantom args so we get identities[] and other required fields.
+    agent = pb.get_agent(scraper_id)
+    raw_arg = agent.get("argument") or "{}"
+    saved = json.loads(raw_arg) if isinstance(raw_arg, str) else raw_arg
+
+    # Inject fresh Sales Nav cookie into identities[0]. Helper raises
+    # SalesNavConfigError if cookie env var is missing.
+    import workflows.daily_check_helpers as _dch
+    session = _dch._pb_sales_nav_session_args()
+    identities = saved.get("identities") or [{}]
+    identities[0].update(session)
+
+    launch_args = {
+        **saved,
+        "identities": identities,
+        "spreadsheetUrl": sheet_url,
+        "numberOfProfilesPerLaunch": len(urls),
+        # csvName is generated PER ATTEMPT inside _do_launch_and_fetch (see
+        # below) — a timed-out first container can still finish asynchronously
+        # (PB is async — see pb_send_recovery) and register the batch in its
+        # file's dedup DB; reusing the same name on retry would make the retry
+        # refuse to re-scrape and defeat the fresh-name dedup-bust.
+    }
+
+    def _do_launch_and_fetch() -> tuple[str, str]:
+        # Fresh csvName PER ATTEMPT: a timed-out first container can still
+        # finish asynchronously (PB is async — see pb_send_recovery) and
+        # register the batch in its file's dedup DB; reusing the name would
+        # make the retry refuse to re-scrape and defeat itself.
+        csv_name = _dch._fresh_csv_name("deg")
+        attempt_args = {**launch_args, "csvName": csv_name}
+        launch = pb.launch_agent(scraper_id, attempt_args)
+        completion = pb.wait_for_completion(launch, poll_interval=10, max_wait=max_wait)
+        if has_scraper_dedup_marker(getattr(completion, "log_output", "")):
+            click.echo(
+                f"  ⚠ SN scraper container {launch.container_id} reported a "
+                "dedup refusal ('already scraped') DESPITE per-launch csvName "
+                f"{csv_name!r} — PB may have ignored the argument. Degrees from "
+                "this container are NOT fresh.",
+                err=True,
+            )
+        # Defensive str() cast: real PB always returns a string container_id,
+        # but escalate() downstream validates against TypedDict-typed payloads
+        # and MagicMock-shaped test fixtures or hypothetical PB API changes
+        # could surface as `EscalationSchemaError: expected str`. Cast at the
+        # boundary so the helper's caller never has to.
+        return str(launch.container_id or ""), (pb.download_result_csv(launch, csv_name=csv_name) or "")
+
+    try:
+        container_id, csv_text = _do_launch_and_fetch()
+    except PBRunTimeout:
+        if not retry_on_timeout:
+            raise
+        click.echo(
+            f"  ⚠ Sales Nav scrape timed out at {max_wait}s — retrying once before "
+            "dropping the batch.",
+            err=True,
+        )
+        try:
+            container_id, csv_text = _do_launch_and_fetch()
+        except PBRunTimeout:
+            click.echo(
+                "  ⚠ Sales Nav scrape timed out a second time — DROPPING invite batch.",
+                err=True,
+            )
+            return "", {}, {}
+    except PBRunFailed as exc:
+        click.echo(
+            f"  ⚠ Sales Nav scrape failed: {exc} — DROPPING invite batch.",
+            err=True,
+        )
+        return "", {}, {}
+
+    if not csv_text:
+        return container_id, {}, {}
+
+    our_urls = {_normalize_linkedin_url(u) for u in urls}
+    degree_lookup: dict[str, str] = {}
+    extras: dict[str, dict] = {}
+    for row in csv.DictReader(io.StringIO(csv_text)):
+        # The phantom echoes the input URL exactly as passed under `query`,
+        # plus the canonical form under `linkedinProfileUrl`. Try both for
+        # match-back robustness.
+        url = (
+            row.get(SALES_NAV_LINKEDIN_URL_COL, "")
+            or row.get(SALES_NAV_QUERY_COL, "")
+        )
+        if not url:
+            continue
+        norm = _normalize_linkedin_url(url)
+        if norm not in our_urls:
+            continue
+        degree = (row.get(SALES_NAV_DEGREE_COL) or "").strip()
+        if degree:
+            degree_lookup[norm] = degree
+        extras[norm] = {
+            "hasPendingInvitation": (
+                row.get(SALES_NAV_HAS_PENDING_INVITATION_COL) or ""
+            ).strip().lower(),
+            "fullName": (row.get(SALES_NAV_FULL_NAME_COL) or "").strip(),
+        }
+    return container_id, degree_lookup, extras
+
+
+def _emit_degree_unknown(
+    row: dict,
+    *,
+    attio: AttioClient,
+    today_iso: str,
+    failure_reason: str,
+    last_known_degree: str = "",
+    scrape_attempt_id: str = "",
+    csv_row_count_observed: int = 0,
+    csv_row_count_expected: int = 0,
+) -> None:
+    """Open a ``degree_unknown`` operator-review row for one prospect.
+
+    `failure_reason` (NEW field in PR-B.8) classifies the miss for
+    operator triage: ``regular_scrape_missing_row``, ``sales_nav_scrape_*``,
+    ``sales_nav_has_pending_invitation``, etc.
+
+    Asserts ``row['record_id']`` is non-empty so the idempotency key stays
+    stable per prospect (URL-only keys collide on the rare same-URL-two-
+    records case). Caller MUST populate ``record_id`` upstream.
+    """
+    if not row.get("record_id"):
+        raise RuntimeError(
+            f"degree_unknown emit requires record_id; got {row!r}. "
+            "Caller must populate `record_id` on every row."
+        )
+    escalate(
+        type="degree_unknown",
+        idempotency_key=(
+            f"degree-unknown|{row['record_id']}"
+            f"|{failure_reason}"
+            f"|{scrape_attempt_id or today_iso[:10]}"
+        ),
+        payload={
+            "record_id": str(row["record_id"]),
+            "linkedin_url": row["linkedInUrl"],
+            "failure_reason": failure_reason,
+            "last_known_degree": last_known_degree,
+            "scrape_attempt_id": scrape_attempt_id,
+            "requested_at": datetime.now(UTC).isoformat(),
+            "csv_row_count_observed": csv_row_count_observed,
+            "csv_row_count_expected": csv_row_count_expected,
+        },
+        attio=attio,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pre-invite degree check
+# ---------------------------------------------------------------------------
+
+def _pre_invite_degree_check(
+    to_send_data: list[dict],
+    pb: PhantomBusterClient,
+    profile_scraper_id: str | None,
+    attio: AttioClient,
+    list_id: str,
+    *,
+    sales_nav_profile_scraper_id: str | None = None,
+    today: date | None = None,
+    dry_run: bool = False,
+) -> tuple[list[dict], list[dict]]:
+    """Scrape LinkedIn degree for each PROSPECT before inviting.
+
+    Partitions `to_send_data` into:
+    - already_connected: degree=1st profiles. These are flipped to ACCEPTED in
+      Attio immediately via a single-PATCH AttioWriter call (PR-15 atomicity);
+      they shouldn't get a phantom invite (LinkedIn no-ops it) nor a "thanks
+      for accepting" DM later.
+    - still_to_invite: degree=2nd/3rd or unknown — proceed to invite.
+
+    On PB failure or empty CSV, returns (still_to_invite=[], already_connected=[])
+    — fail-safe: drop the whole batch rather than risk re-inviting already-
+    connected people. Better to lose a day's invites than re-burn relationships.
+
+    # Wave-1.6 FIX-1 — dry_run honesty
+
+    When `dry_run=True`, the function is fully side-effect free:
+      - No PB Profile Scraper container launches
+      - No `write_prospects_to_sheet(...)` GSheet writes
+      - No AttioWriter Pattern-A flips
+      - No `recheck_cache` writes
+      - No `escalate(...)` queue rows
+
+    Returns `(to_send_data, [])` unchanged so the caller's downstream
+    dry-run preview prints every requested URL. The 2026-05-25 incident
+    leaked 20 LinkedIn URLs into a real Google Sheet because this gate
+    was missing (internal QA finding).
+
+    # PR-15 codepath split
+
+    The function detects two codepaths up front:
+
+      - `send_invite` — there are stale URLs that need PB scraping to
+        determine degree. STRICT mode applies: a missing
+        `profile_scraper_id` raises `ConfigError`.
+      - `cache_hit_flip` — all URLs already have a cached degree
+        result, so no scraping is needed. STRICT mode is EXEMPT
+        because the flip path never issues a new invite.
+
+    Catches both Pattern A leftovers (re-prospected after dedup) and Pattern B
+    (the operator connected externally without the system knowing).
+
+    NOTE: write_prospects_to_sheet and _pb_session_args are imported via
+    `workflows.daily_check` as a module reference inside the function so that:
+    (1) test patches targeting workflows.daily_check.<attr> resolve at call
+        time and take effect, and
+    (2) this module stays import-order-agnostic — a top-level module-as-namespace
+        import works in production (daily_check is loaded first by cli.py) but
+        fails fresh imports like `python3 -c 'import workflows.pre_invite_check'`
+        because daily_check then tries to from-import _pre_invite_degree_check
+        from a partially-loaded pre_invite_check. The in-function import sees a
+        fully-loaded daily_check whenever this code path runs.
+    """
+    # In-function module-as-namespace import — see docstring for rationale.
+    import workflows.daily_check as _dc
+
+    if not to_send_data:
+        return [], []
+
+    # Wave-1.6 FIX-1: dry-run short-circuit. Run BEFORE the quarantine
+    # filter so the operator sees the full requested batch in the preview
+    # (the upstream dry-run path doesn't actually invite, so quarantine
+    # status is informational, not load-bearing here).
+    if dry_run:
+        click.echo(
+            f"  [DRY RUN] Pre-invite degree check would scrape/inspect "
+            f"{len(to_send_data)} profile(s); skipping live PB launch, "
+            f"GSheet write, AttioWriter flip, and recheck-cache mutation."
+        )
+        for row in to_send_data:
+            click.echo(f"    [DRY RUN] would scrape: {row.get('linkedInUrl', '?')}")
+        return to_send_data, []
+
+    # §3.1 defense-in-depth: re-verify quarantine. The daily_check caller
+    # already filtered on `is_invite_eligible`, but rows reach us via a
+    # separate code path (the `to_send_data` shape) and a future caller
+    # could forget the upstream filter. The CI grep guard
+    # `tests/test_invite_eligible_guard.py` asserts this call stays here.
+    today_op = today if today is not None else operator_today()
+    quarantined = [r for r in to_send_data if not is_invite_eligible(r, today_op)]
+    if quarantined:
+        click.echo(
+            f"  ⚠ Pre-invite quarantine guard dropped {len(quarantined)} row(s) "
+            f"whose invite_eligible_after has not yet elapsed (defense-in-depth).",
+            err=True,
+        )
+        to_send_data = [r for r in to_send_data if is_invite_eligible(r, today_op)]
+        if not to_send_data:
+            return [], []
+
+    # Consult recheck cache to skip URLs scraped within the TTL. Cached "1st"
+    # short-circuits to ACCEPTED; cached "2nd"/"3rd" short-circuits to invite
+    # queue. Only stale/unknown URLs get scraped via PB.
+    cached_results: dict[str, str] = {}
+    urls_in = [p["linkedInUrl"] for p in to_send_data]
+    fresh_cache, stale_urls = recheck_cache.partition(urls_in)
+    stale_set = set(stale_urls)
+    for url, entry in fresh_cache.items():
+        deg = (entry.get("degree") or "").strip()
+        if deg:
+            cached_results[_normalize_linkedin_url(url)] = deg
+        else:
+            # Cached without degree (e.g., a prior NB-only visit). Re-scrape.
+            stale_set.add(url)
+
+    to_send_stale = [p for p in to_send_data if p["linkedInUrl"] in stale_set]
+    cache_hit_count = len(to_send_data) - len(to_send_stale)
+    if cache_hit_count:
+        click.echo(
+            f"  Cache hit: skipping degree scrape for {cache_hit_count} profiles "
+            f"(within {recheck_cache.RECHECK_TTL_DAYS} days)."
+        )
+
+    # PR-B.5: resolve backend (regular | sales_nav) per-invocation so the
+    # flag is hot-reloadable on a fresh process. Centralizes the cross-wire
+    # + missing-cookie guards (closes adversarial F5). Raises
+    # SalesNavConfigError on invalid config — fail-loud at the top of the
+    # function so callers don't waste a PB launch on a bad env.
+    backend = _resolve_degree_check_backend()
+    scraper_id_for_strict = (
+        sales_nav_profile_scraper_id if backend == "sales_nav"
+        else profile_scraper_id
+    )
+    scraper_arg_name = (
+        "sales_nav_profile_scraper_id" if backend == "sales_nav"
+        else "profile_scraper_id"
+    )
+
+    # PR-15 codepath split — Pattern-A flip carve-out from STRICT.
+    # If there are no stale URLs to scrape, ALL operations from here on
+    # are cache_hit_flip work — no scraper-id is needed. If there ARE
+    # stale URLs, we're on the send_invite path and STRICT applies.
+    codepath = "send_invite" if to_send_stale else "cache_hit_flip"
+    if codepath == "send_invite" and not scraper_id_for_strict:
+        if _strict_mode_enabled():
+            raise ConfigError(
+                f"{scraper_arg_name} is required when "
+                f"{STRICT_PRE_INVITE_DEGREE_CHECK_ENV}=true (default) and the "
+                f"send_invite codepath needs to scrape {len(to_send_stale)} "
+                f"profile(s) via backend={backend!r}. Set the env var to "
+                f"'false' to bypass for debugging only — silent bypass risks "
+                f"re-inviting already-1st-degree connections (§3.1)."
+            )
+        # PR-15 fold-in (salesman-daily-QA-build15 BLOCKING B1):
+        # STRICT=false MUST still be loud. The pre-PR-15 code echoed a
+        # ⚠ warning at the daily_check.py call site; PR-15 deleted that
+        # warning when it moved the gate into pre_invite_check. Restore
+        # operator-visible signal here so the silent-bypass §0 #9
+        # violation doesn't re-emerge behind the STRICT=false escape
+        # hatch. Loud-by-design even in debug mode.
+        click.echo(
+            f"  ⚠ STRICT_PRE_INVITE_DEGREE_CHECK=false + no {scraper_arg_name} "
+            f"+ {len(to_send_stale)} stale URL(s) → DEGREE CHECK SKIPPED. "
+            f"Risk of re-inviting already-1st-degree connections (§3.1).",
+            err=True,
+        )
+
+    # PR-B.10: scraper-mode audit log line. Self-describing daily-run logs
+    # during the regular → sales_nav rollout; sha-prefix the scraper-id so
+    # operators can sanity-check without leaking the full ID into logs.
+    if scraper_id_for_strict:
+        sid_prefix = hashlib.sha256(
+            scraper_id_for_strict.encode()
+        ).hexdigest()[:8]
+        click.echo(
+            f"  pre-invite backend: {backend} "
+            f"(scraper_id_prefix={sid_prefix})"
+        )
+
+    degree_lookup: dict[str, str] = dict(cached_results)
+    extras: dict[str, dict] = {}
+    scrape_container_id: str = ""
+    # PR-B.9 fold-in: see comment block at the scrape-time emit site below
+    # for why this lives at function scope (must be visible to the
+    # partition loop even when to_send_stale is empty).
+    csv_miss_emitted_for_record_ids: set[str] = set()
+
+    if to_send_stale and scraper_id_for_strict:
+        our_urls = {_normalize_linkedin_url(p["linkedInUrl"]) for p in to_send_stale}
+
+        if backend == "sales_nav":
+            # PR-B.5: Sales Nav launch via helper that handles the
+            # saved-args + identities-inject contract (verified
+            # 2026-05-25). Returns extras dict with hasPendingInvitation
+            # per prospect so the §3.1-hardened partition can apply the
+            # stronger gate.
+            container_id, scraped_lookup, extras = _launch_sales_nav_scrape(
+                pb,
+                scraper_id_for_strict,
+                [p["linkedInUrl"] for p in to_send_stale],
+            )
+            scrape_container_id = container_id
+            if not scraped_lookup and not container_id:
+                # Both empty => PB failure path (helper already logged).
+                # Drop the whole batch — fail-safe.
+                return [], []
+        else:
+            # Legacy regular Profile Scraper path — UNCHANGED for rollback
+            # parity (per plan PR-B subtask 5: backend=regular is preserved
+            # as the legacy path so flipping the flag back is a clean
+            # restoration of prior behavior).
+            sheet_rows = [{"profileUrl": p["linkedInUrl"]} for p in to_send_stale]
+            sheet_url = _dc.write_prospects_to_sheet(sheet_rows, columns=["profileUrl"])
+            launch = pb.launch_agent(scraper_id_for_strict, {
+                "spreadsheetUrl": sheet_url,
+                **_dc._pb_session_args(),
+            })
+            pb.wait_for_completion(launch, poll_interval=10, max_wait=600)
+            scrape_container_id = str(getattr(launch, "container_id", "") or "")
+
+            # F-PR-5: CSV keyed to launch.container_id, not "latest".
+            result_csv = pb.download_result_csv(launch)
+            if not result_csv:
+                click.echo(
+                    "  ⚠ Pre-invite degree check returned no CSV — DROPPING invite batch "
+                    "to avoid re-inviting already-connected people. Will retry tomorrow.",
+                    err=True,
+                )
+                return [], []
+
+            scraped_lookup = {}
+            for row in csv.DictReader(io.StringIO(result_csv)):
+                url = (
+                    row.get("linkedin_url", "")
+                    or row.get("linkedinProfileUrl", "")
+                    or row.get("profileUrl", "")
+                    or row.get("query", "")
+                )
+                degree = (row.get("connectionDegree") or "").strip()
+                if not url or not degree:
+                    continue
+                norm = _normalize_linkedin_url(url)
+                if norm in our_urls:
+                    scraped_lookup[norm] = degree
+        degree_lookup.update(scraped_lookup)
+
+        # PR-15: partial-CSV signal. When the scrape returned fewer
+        # rows than requested, open ONE `degree_unknown` queue row
+        # PER MISSING PROSPECT so the operator can triage per-row.
+        # Aggregated/summary writes are forbidden — PR-17's run-end
+        # summary writes the `degree_unknown_count` attribute (the
+        # producer-consumer pair per Round-4 D12).
+        #
+        # PR-B.5: backend-aware failure_reason — closes adversarial F10
+        # (operator confusion when distinct miss types share an opaque
+        # reason string). `_emit_degree_unknown` helper (above) bundles
+        # the contract including the new `failure_reason` field.
+        # PR-B.9 fold-in: track record_ids that emitted a scrape-time
+        # CSV_MISS so the partition-time BLANK-degree arm below can
+        # suppress its redundant emit. Function-local set declared at
+        # function scope above (must be visible when to_send_stale is
+        # empty). DO NOT promote to module/class state — cross-run
+        # pollution would silently suppress real escalations and
+        # re-introduce §3.1 risk (adversarial review concern on the (a)
+        # fix design). Suppression is consulted ONLY in the sales_nav
+        # BLANK-degree path of the partition loop — Pattern-A flip-fail
+        # (degree=="1st" arm) is unaffected because it never reads this
+        # set.
+        if len(scraped_lookup) < len(to_send_stale):
+            today_iso_for_miss = (today_op or date.today()).isoformat()
+            miss_reason = (
+                REASON_SALES_NAV_CSV_MISS if backend == "sales_nav"
+                else REASON_LEGACY_CSV_MISS
+            )
+            for p in to_send_stale:
+                norm = _normalize_linkedin_url(p["linkedInUrl"])
+                if norm in scraped_lookup:
+                    continue
+                _emit_degree_unknown(
+                    p,
+                    attio=attio,
+                    today_iso=today_iso_for_miss,
+                    failure_reason=miss_reason,
+                    scrape_attempt_id=scrape_container_id,
+                    csv_row_count_observed=len(scraped_lookup),
+                    csv_row_count_expected=len(to_send_stale),
+                )
+                # Only used to suppress the sales_nav BLANK-degree partition
+                # arm. Legacy backend does NOT consult this set (legacy keeps
+                # its bit-for-bit pre-PR-B behaviour for rollback parity).
+                if backend == "sales_nav" and p.get("record_id"):
+                    csv_miss_emitted_for_record_ids.add(str(p["record_id"]))
+
+        # Record fresh scrape results in the cache, keyed by original URL.
+        recheck_cache.record_many({
+            p["linkedInUrl"]: scraped_lookup.get(_normalize_linkedin_url(p["linkedInUrl"]))
+            for p in to_send_stale
+            if scraped_lookup.get(_normalize_linkedin_url(p["linkedInUrl"]))
+        })
+
+    still_to_invite: list[dict] = []
+    already_connected: list[dict] = []
+    failed_to_flip: list[dict] = []
+    # Wave-1.6.2 FIX-B (adversarial EXT-SB-3 IMPORTANT): tally failed
+    # `experiment_id_immutability_violation` escalate() calls so the
+    # end-of-function summary surfaces them. Mirrors FIX-A at
+    # daily_check.py.
+    escalate_failed_count = 0
+    # Wave-1.6.3 (adversarial follow-up to FIX-B): tally failed
+    # `degree_unknown` escalate() calls in the Pattern-A flip-fail
+    # branch. Separate from the immutability tally above so the
+    # end-of-function summary names the right escalate type for the
+    # operator. See the try/except at the escalate site for the
+    # orphan-prevention rationale.
+    flip_fail_escalate_failed_count = 0
+    today_iso = (today_op or date.today()).isoformat()
+    writer = AttioWriter(attio=attio)
+    for row in to_send_data:
+        norm = _normalize_linkedin_url(row["linkedInUrl"])
+        degree = degree_lookup.get(norm, "")
+        if degree == "1st":
+            # PR-21 (Lesson 6): use direct key access — KeyError propagates
+            # as a caller bug. `run_connection_requests` MUST populate both
+            # keys on every `to_send_data` row. See module docstring contract.
+            prior_experiment_id = row["experiment_id"]
+            prior_frozen_at = row["experiment_id_frozen_at"]
+
+            # PR-21 immutability guard. "prospect" → "accepted" is the
+            # Pattern-B case (the operator connected externally on a never-invited
+            # row) — explicitly allowed. See `_check_experiment_id_immutability`
+            # docstring for the full carve-out rationale.
+            #
+            # Wave-1.6.2 FIX-B (adversarial EXT-SB-3 IMPORTANT): the
+            # pre-Wave-1.6.2 raise here was the same orphan-risk pattern
+            # FIX-A closed in daily_check.py. If the guard raises
+            # `ExperimentIdImmutableError` for one 1st-degree row, the
+            # surrounding `for row in to_send_data:` loop terminates and
+            # OTHER 1st-degree rows after this offender never get their
+            # Pattern-A flip to ACCEPTED — they stay at PROSPECT and
+            # become eligible to re-invite tomorrow (§3.1 violation).
+            #
+            # Behavior now: preserve prior cohort tag (it's already what
+            # we pass as `new_experiment_id`, so the data layer is safe),
+            # open an `experiment_id_immutability_violation` queue row,
+            # AND still perform the Pattern-A flip below with the prior
+            # experiment_id preserved. Continue processing the batch.
+            try:
+                _check_experiment_id_immutability(
+                    record_id=row["record_id"],
+                    entry_id=row.get("entry_id"),
+                    prior_frozen_at=prior_frozen_at,
+                    new_frozen_at="accepted",
+                    prior_experiment_id=prior_experiment_id,
+                    new_experiment_id=prior_experiment_id,
+                )
+            except ExperimentIdImmutableError as imm_exc:
+                # The guard only raises when prior_frozen_at is in the
+                # terminal set AND new_frozen_at differs. Here new is
+                # always "accepted"; the only way to hit this is a row
+                # whose prior_frozen_at is "connection_sent" or another
+                # terminal state we'd be overwriting. Escalate-and-continue
+                # so other rows process; the Pattern-A flip below still
+                # fires with the prior experiment_id preserved.
+                try:
+                    escalate(
+                        type="experiment_id_immutability_violation",
+                        idempotency_key=(
+                            f"experiment-id-immutability-pattern-a"
+                            f"|{row.get('record_id') or ''}"
+                            f"|{prior_frozen_at}"
+                            f"|accepted"
+                        ),
+                        payload={
+                            "record_id": str(row.get("record_id") or ""),
+                            "entry_id": row.get("entry_id") or "",
+                            "prior_experiment_id": prior_experiment_id,
+                            "current_experiment_id": prior_experiment_id,
+                            "effective_experiment_id": prior_experiment_id,
+                            "context": (
+                                "pre_invite_check.Pattern-A flip: 1st-degree "
+                                f"row with prior_frozen_at={prior_frozen_at!r} "
+                                "tried to overwrite to 'accepted'. Preserving "
+                                "prior experiment_id; row still flips to "
+                                "ACCEPTED so it is not re-invited tomorrow."
+                            ),
+                        },
+                        attio=attio,
+                    )
+                except Exception as esc_exc:  # noqa: BLE001 — see FIX-A rationale
+                    escalate_failed_count += 1
+                    click.echo(
+                        f"  ⚠ escalate(experiment_id_immutability_violation) "
+                        f"failed for record_id={row.get('record_id')!r} "
+                        f"during Pattern-A flip "
+                        f"[{type(esc_exc).__name__}]: {esc_exc}. "
+                        f"Continuing batch — Pattern-A flip still fires.",
+                        err=True,
+                    )
+                click.echo(
+                    f"  ⚠ experiment_id immutability violation on Pattern-A "
+                    f"flip for record_id={row['record_id']!r} "
+                    f"(prior_frozen_at={prior_frozen_at!r} → 'accepted'): "
+                    f"{imm_exc}. Preserving prior experiment_id; flip still "
+                    f"fires.",
+                    err=True,
+                )
+
+            # Build updates dict. Only stamp experiment_id_frozen_at when
+            # we have a prior experiment_id to associate it with.
+            updates: dict = {
+                "stage": PipelineStage.ACCEPTED.value,
+                "last_contact_date": today_iso,
+            }
+            if prior_experiment_id is not None:
+                # Preserve existing experiment_id; stamp frozen_at="accepted".
+                updates["experiment_id_frozen_at"] = "accepted"
+            # If prior_experiment_id is None (row had no active experiment at
+            # PROSPECT-commit), leave frozen_at absent — don't stamp NULL or
+            # a spurious "accepted" with no associated experiment.
+
+            # PR-15 (B-SD-010) atomic Pattern-A flip. Single-PATCH
+            # multi-attribute write via F-PR-4's AttioWriter — stage,
+            # last_contact_date, and (when present) experiment_id_frozen_at
+            # all succeed or all fail. PR-21 widens the updates dict above.
+            try:
+                writer.apply(WriteIntent(
+                    object="linkedin_outreach",
+                    record_id=row["entry_id"],
+                    updates=updates,
+                    prior_values={
+                        # Pre-flip stage is the row's current stage from
+                        # the upstream filter (PROSPECT or CONNECTION_SENT
+                        # depending on caller). Pass the value the row
+                        # actually has so monotonicity check passes.
+                        "stage": str(row.get("current_stage", PipelineStage.PROSPECT.value)),
+                    },
+                    writer_module="workflows.pre_invite_check._pre_invite_degree_check",
+                    is_list_entry=True,
+                    list_id=list_id,
+                ))
+                click.echo(
+                    f"  [PR-21] Pattern-A flip: record_id={row['record_id']!r} "
+                    f"entry_id={row.get('entry_id')!r} url={row['linkedInUrl']} "
+                    f"experiment_id={prior_experiment_id!r} frozen_at: "
+                    f"{prior_frozen_at!r} → 'accepted'",
+                    err=True,
+                )
+                already_connected.append(row)
+            except (AttioError, UnauthorizedAttioWriteError,
+                    httpx.HTTPStatusError, httpx.RequestError,
+                    ConnectionError, TimeoutError) as exc:
+                # PR-21 (Lesson 5): narrow to Attio/transient exceptions.
+                # KeyError, AttributeError, TypeError propagate as code bugs.
+                # Transient failures go to `failed_to_flip` list (not silent drop).
+                # PR-15 fold-in (silent-failure-hunter BLOCKING B1):
+                # UnauthorizedAttioWriteError extends PermissionError not AttioError;
+                # widened catch keeps batch processing alive even on registry typos.
+                click.echo(
+                    f"  ⚠ Pattern-A flip failed for {row['linkedInUrl']} "
+                    f"(record_id={row['record_id']!r}, entry_id={row.get('entry_id')!r}) "
+                    f"({type(exc).__name__}): {exc}; skipping invite to be safe",
+                    err=True,
+                )
+                failed_to_flip.append(row)
+                # PR-15 fold-in (silent-failure-hunter IMPORTANT I1):
+                # Emit an Operator Review Queue row so operator can triage.
+                if row.get("record_id"):
+                    # Wave-1.6.3 (adversarial follow-up to FIX-B): if this
+                    # escalate raises (e.g. Attio degraded enough that the
+                    # queue write also fails after retries), the propagation
+                    # kills the outer `for row in to_send_data:` loop and
+                    # subsequent rows — including degree='2nd'/'3rd' rows in
+                    # the else branch — never get appended to still_to_invite.
+                    # NOT a §3.1 re-invite (those rows just go un-invited
+                    # this run), but a §3 #9 silent batch-truncation. Catch
+                    # is intentionally broad because the alternative is
+                    # silent truncation; tally for end-of-function summary.
+                    try:
+                        escalate(
+                            type="degree_unknown",
+                            idempotency_key=(
+                                f"pattern-a-flip-fail|{row['entry_id']}"
+                                f"|{(today_op or date.today()).isoformat()}"
+                            ),
+                            payload={
+                                "record_id": str(row["record_id"]),
+                                "linkedin_url": row["linkedInUrl"],
+                                "last_known_degree": "1st",
+                                "scrape_attempt_id": f"flip-fail-{type(exc).__name__}",
+                                "requested_at": datetime.now(UTC).isoformat(),
+                                "csv_row_count_observed": 0,
+                                "csv_row_count_expected": 1,
+                            },
+                            attio=attio,
+                        )
+                    except Exception as esc_exc:  # noqa: BLE001 — see comment above
+                        flip_fail_escalate_failed_count += 1
+                        click.echo(
+                            f"  ⚠ escalate(degree_unknown) for Pattern-A "
+                            f"flip-fail failed for "
+                            f"record_id={row['record_id']!r} "
+                            f"entry_id={row.get('entry_id')!r} "
+                            f"[{type(esc_exc).__name__}]: {esc_exc}. "
+                            f"Continuing batch — subsequent rows still "
+                            f"evaluated. End-of-function summary will "
+                            f"surface this failure.",
+                            err=True,
+                        )
+                # Don't fall back to inviting — that's the bug we're fixing.
+        else:
+            # PR-B.5 / PR-B.13 / PR-B.16 — §3.1 SAFETY
+            # ============================================================
+            # Do not change the default arm of this partition without
+            # reviewing the PR-B migration plan (internal; not shipped
+            # with this repo).
+            #
+            # The §3.1 contract: "zero re-sends, zero re-invites of
+            # already-1st-degree connections." Three adversarial review
+            # findings (F1, F2, F4) all collapsed to the same root cause:
+            # the pre-PR-B default arm sent any non-"1st" prospect to
+            # `still_to_invite` — including blank degrees, missing CSV
+            # rows, unknown values, and rows where LinkedIn ALREADY shows
+            # a pending invitation from us. PR-B's Sales Nav branch
+            # narrows the default arm to escalate-and-drop; ONLY explicit
+            # "2nd" or "3rd" routes to invite.
+            #
+            # PR-B.16 (NEW from CSV wet-probe 2026-05-25): Sales Nav CSV
+            # exposes `hasPendingInvitation="true|false"`. When true,
+            # LinkedIn already received an invite from us — re-inviting
+            # is the brand-event failure mode regardless of degree.
+            # ============================================================
+            if backend == "sales_nav":
+                row_extras = extras.get(norm, {})
+                has_pending = row_extras.get("hasPendingInvitation") == "true"
+                if has_pending:
+                    # Pattern-A (pending): LinkedIn already holds our invite.
+                    # The pre-PR-B.16 behavior only escalate-and-dropped, which
+                    # left the row at PROSPECT to re-queue forever (the invite
+                    # is re-prepared every run, PB dedups it, the advance gate
+                    # never frees it). FLIP it to CONNECTION_SENT so it leaves
+                    # the invite pool and Phase 0 watches for acceptance —
+                    # mirroring the 1st-degree→ACCEPTED Pattern-A flip above.
+                    pending_experiment_id = row.get("experiment_id")
+                    pending_prior_frozen_at = row.get("experiment_id_frozen_at")
+                    pending_updates: dict = {
+                        "stage": PipelineStage.CONNECTION_SENT.value,
+                        "last_contact_date": today_iso,
+                    }
+                    # Re-stamp connection_sent only when the row already carried
+                    # an experiment AND its prior frozen_at is not terminal —
+                    # re-stamping over accepted/legacy_* is an immutability
+                    # violation (AttioWriter enforces stage monotonicity but NOT
+                    # frozen_at immutability, so this is the guard).
+                    if (
+                        pending_experiment_id is not None
+                        and pending_prior_frozen_at not in _IMMUTABLE_FROZEN_AT_VALUES
+                    ):
+                        pending_updates["experiment_id_frozen_at"] = "connection_sent"
+                    try:
+                        writer.apply(WriteIntent(
+                            object="linkedin_outreach",
+                            record_id=row["entry_id"],
+                            updates=pending_updates,
+                            prior_values={
+                                "stage": str(
+                                    row.get("current_stage", PipelineStage.PROSPECT.value)
+                                ),
+                            },
+                            writer_module="workflows.pre_invite_check._pre_invite_degree_check",
+                            is_list_entry=True,
+                            list_id=list_id,
+                        ))
+                        click.echo(
+                            f"  [Pattern-A pending] flip PROSPECT→CONNECTION_SENT: "
+                            f"record_id={row['record_id']!r} "
+                            f"entry_id={row.get('entry_id')!r} "
+                            f"url={row['linkedInUrl']} (hasPendingInvitation)",
+                            err=True,
+                        )
+                    except (AttioError, UnauthorizedAttioWriteError,
+                            httpx.HTTPStatusError, httpx.RequestError,
+                            ConnectionError, TimeoutError) as exc:
+                        # Transient/registry failure: leave at PROSPECT (do NOT
+                        # invite — that's the brand-event failure mode) and
+                        # record for retry. Never fall through to still_to_invite.
+                        click.echo(
+                            f"  ⚠ pending-flip failed for {row['linkedInUrl']} "
+                            f"(record_id={row['record_id']!r}, "
+                            f"entry_id={row.get('entry_id')!r}) "
+                            f"({type(exc).__name__}): {exc}; leaving at PROSPECT "
+                            f"(will retry next run)",
+                            err=True,
+                        )
+                        failed_to_flip.append(row)
+                        # Durable operator-review row (mirrors the 1st-degree
+                        # flip-fail path) so the failure survives beyond the
+                        # ephemeral stderr line. Best-effort: a failed escalate
+                        # must not crash the batch (tallied for the summary).
+                        if row.get("record_id"):
+                            try:
+                                escalate(
+                                    type="degree_unknown",
+                                    idempotency_key=(
+                                        f"pending-flip-fail|{row['entry_id']}"
+                                        f"|{(today_op or date.today()).isoformat()}"
+                                    ),
+                                    payload={
+                                        "record_id": str(row["record_id"]),
+                                        "linkedin_url": row["linkedInUrl"],
+                                        "last_known_degree": degree,
+                                        "scrape_attempt_id":
+                                            f"pending-flip-fail-{type(exc).__name__}",
+                                        "requested_at": datetime.now(UTC).isoformat(),
+                                        "csv_row_count_observed": 0,
+                                        "csv_row_count_expected": 1,
+                                    },
+                                    attio=attio,
+                                )
+                            except Exception as esc_exc:  # noqa: BLE001
+                                flip_fail_escalate_failed_count += 1
+                                click.echo(
+                                    f"  ⚠ escalate(degree_unknown) for "
+                                    f"pending-flip-fail failed for "
+                                    f"record_id={row['record_id']!r} "
+                                    f"[{type(esc_exc).__name__}]: {esc_exc}.",
+                                    err=True,
+                                )
+                elif degree in ("2nd", "3rd"):
+                    still_to_invite.append(row)
+                elif not degree:
+                    # Missing CSV row OR cached as blank — no signal at all.
+                    # PR-B.9 fold-in: suppress this BLANK-degree emit if the
+                    # scrape-time CSV_MISS already fired for this record_id
+                    # in this run. The CSV_MISS carries the richer payload
+                    # (csv_row_count_observed/expected for fleet-vs-per-row
+                    # diagnostics); emitting BOTH gives the operator two
+                    # rows per missing prospect. Unanimous reviewer pick
+                    # (adversarial + L3 + GTM, 2026-05-25). Pattern-A
+                    # flip-fail path is unaffected — it lives in the
+                    # degree=="1st" arm, never reads this set.
+                    if (
+                        row.get("record_id")
+                        and str(row["record_id"]) in csv_miss_emitted_for_record_ids
+                    ):
+                        continue
+                    _emit_degree_unknown(
+                        row,
+                        attio=attio,
+                        today_iso=today_iso,
+                        failure_reason=REASON_SALES_NAV_DEGREE_BLANK,
+                        scrape_attempt_id=scrape_container_id,
+                    )
+                elif (
+                    "out of network" in degree.strip().lower()
+                    or degree.strip().lower() in ("oon", "out_of_network")
+                ):
+                    # Wave-2-A: a genuinely Out-of-Network target — LinkedIn
+                    # will not allow an invite from this account, ever. PR #150
+                    # stops NEW OON at intake; this arm parks any pre-#150
+                    # committed row (re-scraped here) or new slip-through at
+                    # UNREACHABLE so it LEAVES the invite pool instead of being
+                    # re-scraped + re-escalated every run (the wasted-scrape
+                    # loop). The OON test mirrors the canonical one in
+                    # weekly_prospect._connection_degree. Carved out of the
+                    # catch-all `else` below ON PURPOSE: only a confirmed-OON
+                    # degree is parked terminally; "You"/blank/garbage stay
+                    # escalate-and-drop (transient scrape noise, retried).
+                    # Still opens the degree_unknown queue row first for
+                    # operator visibility (last_known_degree carries the OON
+                    # value), then moves the stage.
+                    _emit_degree_unknown(
+                        row,
+                        attio=attio,
+                        today_iso=today_iso,
+                        failure_reason=REASON_SALES_NAV_DEGREE_UNKNOWN,
+                        last_known_degree=degree,
+                        scrape_attempt_id=scrape_container_id,
+                    )
+                    if row.get("entry_id"):
+                        try:
+                            writer.apply(WriteIntent(
+                                object="linkedin_outreach",
+                                record_id=row["entry_id"],
+                                updates={"stage": PipelineStage.UNREACHABLE.value},
+                                prior_values={
+                                    "stage": str(
+                                        row.get("current_stage", PipelineStage.PROSPECT.value)
+                                    ),
+                                },
+                                writer_module="workflows.pre_invite_check._pre_invite_degree_check",
+                                is_list_entry=True,
+                                list_id=list_id,
+                            ))
+                            click.echo(
+                                f"  [Wave-2-A] OON → UNREACHABLE: "
+                                f"record_id={row['record_id']!r} "
+                                f"entry_id={row.get('entry_id')!r} "
+                                f"url={row['linkedInUrl']} (degree={degree!r})",
+                                err=True,
+                            )
+                        except (AttioError, UnauthorizedAttioWriteError,
+                                httpx.HTTPStatusError, httpx.RequestError,
+                                ConnectionError, TimeoutError) as exc:
+                            # Park-fail: leave at PROSPECT (it simply won't be
+                            # invited — the OON degree never routes to
+                            # still_to_invite). The queue row above survives;
+                            # the park retries on the next scrape. Never fall
+                            # through to inviting an OON target.
+                            click.echo(
+                                f"  ⚠ OON→UNREACHABLE park failed for "
+                                f"{row['linkedInUrl']} "
+                                f"(record_id={row['record_id']!r}, "
+                                f"entry_id={row.get('entry_id')!r}) "
+                                f"({type(exc).__name__}): {exc}; leaving at "
+                                f"PROSPECT (will retry next scrape).",
+                                err=True,
+                            )
+                else:
+                    # "You", any value the partition doesn't explicitly accept
+                    # (and is not confirmed-OON above). Escalate, don't invite —
+                    # transient scrape noise, retried next run.
+                    _emit_degree_unknown(
+                        row,
+                        attio=attio,
+                        today_iso=today_iso,
+                        failure_reason=REASON_SALES_NAV_DEGREE_UNKNOWN,
+                        last_known_degree=degree,
+                        scrape_attempt_id=scrape_container_id,
+                    )
+            else:
+                # Legacy backend: UNCHANGED for rollback parity. The §3.1
+                # bug is real on the regular Profile Scraper path too, but
+                # per plan PR-B.5 we preserve legacy bit-for-bit so a flag
+                # flip back is a clean restoration of prior behavior. Once
+                # Sales Nav has soaked for 28 days, cleanup PR-C can apply
+                # the same §3.1-hardening to legacy or delete it entirely.
+                still_to_invite.append(row)
+
+    if failed_to_flip:
+        click.echo(
+            f"  ⚠ Pattern-A flip transient failures: {len(failed_to_flip)} row(s) "
+            f"could not be flipped to ACCEPTED — "
+            f"record_ids={[r['record_id'] for r in failed_to_flip]}",
+            err=True,
+        )
+
+    if escalate_failed_count > 0:
+        # Wave-1.6.2 FIX-B: surface swallowed escalate() failures so the
+        # operator knows the queue is missing rows. ERROR level for
+        # paging. See FIX-A in daily_check.py for the broader rationale.
+        click.echo(
+            f"  ❌ ERROR: {escalate_failed_count} "
+            f"experiment_id_immutability_violation escalate() call(s) "
+            f"failed during this Pattern-A batch. Flips still fired so "
+            f"rows will not re-invite tomorrow, but the operator review "
+            f"queue is missing those rows. See WARN log lines above.",
+            err=True,
+        )
+
+    if flip_fail_escalate_failed_count > 0:
+        # Wave-1.6.3: same calibration for the degree_unknown escalate in
+        # the Pattern-A flip-fail branch. Per-row WARN already named each
+        # failure; this is the paging-level rollup.
+        click.echo(
+            f"  ❌ ERROR: {flip_fail_escalate_failed_count} "
+            f"degree_unknown escalate() call(s) failed during Pattern-A "
+            f"flip-fail handling. The rows went into failed_to_flip (so "
+            f"no invite leaks out — §3.1 still holds), but the operator "
+            f"review queue is missing the per-row triage rows. See WARN "
+            f"log lines above.",
+            err=True,
+        )
+
+    return still_to_invite, already_connected

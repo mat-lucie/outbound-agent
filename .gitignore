@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+*.egg-info/
+exports/*.csv
+exports/*.jsonl
+exports/*.json
+exports/*.md
+exports/*.py
+exports/dedup-*/
+
+# Secrets — never commit (credentials/* held local-only)
+.env
+credentials/*.json
+credentials/*.json.bak
+
+# macOS
+.DS_Store
+
+# Git worktrees
+.worktrees/

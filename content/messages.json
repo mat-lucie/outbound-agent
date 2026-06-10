@@ -1,0 +1,206 @@
+{
+  "digitalization_champions": {
+    "connection_note": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu nota de conexión para [Company]. Reemplázala con tu propio mensaje.",
+      "en": "Hi [Name], REPLACE_THIS_TEMPLATE — your connection note to [Company] goes here. Replace this with your own message.",
+      "pt": "Olá [Name], REPLACE_THIS_TEMPLATE — sua nota de conexão para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm1": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "Hi [Name], REPLACE_THIS_TEMPLATE — your first DM to [Company] goes here. Replace it with your own message.",
+      "pt": "Olá [Name], REPLACE_THIS_TEMPLATE — seu primeiro DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm2": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — aquí va tu segundo DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "[Name], REPLACE_THIS_TEMPLATE — your second DM to [Company] goes here. Replace it with your own message.",
+      "pt": "[Name], REPLACE_THIS_TEMPLATE — seu segundo DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm3": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — este es tu último mensaje de la secuencia para [Company]. Reemplázalo con tu propio cierre.",
+      "en": "[Name], REPLACE_THIS_TEMPLATE — this is your last message in the sequence to [Company]. Replace it with your own soft close.",
+      "pt": "[Name], REPLACE_THIS_TEMPLATE — esta é sua última mensagem da sequência para [Company]. Substitua pelo seu próprio fechamento."
+    },
+    "dm1_v1": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "Hi [Name], REPLACE_THIS_TEMPLATE — your first DM to [Company] goes here. Replace it with your own message.",
+      "pt": "Olá [Name], REPLACE_THIS_TEMPLATE — seu primeiro DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm2_v1": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — aquí va tu segundo DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "[Name], REPLACE_THIS_TEMPLATE — your second DM to [Company] goes here. Replace it with your own message.",
+      "pt": "[Name], REPLACE_THIS_TEMPLATE — seu segundo DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm3_v1": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — este es tu último mensaje de la secuencia para [Company]. Reemplázalo con tu propio cierre.",
+      "en": "[Name], REPLACE_THIS_TEMPLATE — this is your last message in the sequence to [Company]. Replace it with your own soft close.",
+      "pt": "[Name], REPLACE_THIS_TEMPLATE — esta é sua última mensagem da sequência para [Company]. Substitua pelo seu próprio fechamento."
+    },
+    "dm1_v3": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "Hi [Name], REPLACE_THIS_TEMPLATE — your first DM to [Company] goes here. Replace it with your own message.",
+      "pt": "Olá [Name], REPLACE_THIS_TEMPLATE — seu primeiro DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    }
+  },
+  "operations_leaders": {
+    "connection_note": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu nota de conexión para [Company]. Reemplázala con tu propio mensaje.",
+      "en": "Hi [Name], REPLACE_THIS_TEMPLATE — your connection note to [Company] goes here. Replace this with your own message.",
+      "pt": "Olá [Name], REPLACE_THIS_TEMPLATE — sua nota de conexão para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm1": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "Hi [Name], REPLACE_THIS_TEMPLATE — your first DM to [Company] goes here. Replace it with your own message.",
+      "pt": "Olá [Name], REPLACE_THIS_TEMPLATE — seu primeiro DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm2": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — aquí va tu segundo DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "[Name], REPLACE_THIS_TEMPLATE — your second DM to [Company] goes here. Replace it with your own message.",
+      "pt": "[Name], REPLACE_THIS_TEMPLATE — seu segundo DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm3": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — este es tu último mensaje de la secuencia para [Company]. Reemplázalo con tu propio cierre.",
+      "en": "[Name], REPLACE_THIS_TEMPLATE — this is your last message in the sequence to [Company]. Replace it with your own soft close.",
+      "pt": "[Name], REPLACE_THIS_TEMPLATE — esta é sua última mensagem da sequência para [Company]. Substitua pelo seu próprio fechamento."
+    },
+    "dm1_v1": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "Hi [Name], REPLACE_THIS_TEMPLATE — your first DM to [Company] goes here. Replace it with your own message.",
+      "pt": "Olá [Name], REPLACE_THIS_TEMPLATE — seu primeiro DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm2_v1": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — aquí va tu segundo DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "[Name], REPLACE_THIS_TEMPLATE — your second DM to [Company] goes here. Replace it with your own message.",
+      "pt": "[Name], REPLACE_THIS_TEMPLATE — seu segundo DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm3_v1": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — este es tu último mensaje de la secuencia para [Company]. Reemplázalo con tu propio cierre.",
+      "en": "[Name], REPLACE_THIS_TEMPLATE — this is your last message in the sequence to [Company]. Replace it with your own soft close.",
+      "pt": "[Name], REPLACE_THIS_TEMPLATE — esta é sua última mensagem da sequência para [Company]. Substitua pelo seu próprio fechamento."
+    },
+    "dm1_v3": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "Hi [Name], REPLACE_THIS_TEMPLATE — your first DM to [Company] goes here. Replace it with your own message.",
+      "pt": "Olá [Name], REPLACE_THIS_TEMPLATE — seu primeiro DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    }
+  },
+  "executive_sponsors": {
+    "connection_note": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu nota de conexión para [Company]. Reemplázala con tu propio mensaje.",
+      "en": "Hi [Name], REPLACE_THIS_TEMPLATE — your connection note to [Company] goes here. Replace this with your own message.",
+      "pt": "Olá [Name], REPLACE_THIS_TEMPLATE — sua nota de conexão para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm1": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "Hi [Name], REPLACE_THIS_TEMPLATE — your first DM to [Company] goes here. Replace it with your own message.",
+      "pt": "Olá [Name], REPLACE_THIS_TEMPLATE — seu primeiro DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm2": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — aquí va tu segundo DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "[Name], REPLACE_THIS_TEMPLATE — your second DM to [Company] goes here. Replace it with your own message.",
+      "pt": "[Name], REPLACE_THIS_TEMPLATE — seu segundo DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm3": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — este es tu último mensaje de la secuencia para [Company]. Reemplázalo con tu propio cierre.",
+      "en": "[Name], REPLACE_THIS_TEMPLATE — this is your last message in the sequence to [Company]. Replace it with your own soft close.",
+      "pt": "[Name], REPLACE_THIS_TEMPLATE — esta é sua última mensagem da sequência para [Company]. Substitua pelo seu próprio fechamento."
+    },
+    "dm1_v1": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "Hi [Name], REPLACE_THIS_TEMPLATE — your first DM to [Company] goes here. Replace it with your own message.",
+      "pt": "Olá [Name], REPLACE_THIS_TEMPLATE — seu primeiro DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm2_v1": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — aquí va tu segundo DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "[Name], REPLACE_THIS_TEMPLATE — your second DM to [Company] goes here. Replace it with your own message.",
+      "pt": "[Name], REPLACE_THIS_TEMPLATE — seu segundo DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    },
+    "dm3_v1": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — este es tu último mensaje de la secuencia para [Company]. Reemplázalo con tu propio cierre.",
+      "en": "[Name], REPLACE_THIS_TEMPLATE — this is your last message in the sequence to [Company]. Replace it with your own soft close.",
+      "pt": "[Name], REPLACE_THIS_TEMPLATE — esta é sua última mensagem da sequência para [Company]. Substitua pelo seu próprio fechamento."
+    },
+    "dm1_v3": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje.",
+      "en": "Hi [Name], REPLACE_THIS_TEMPLATE — your first DM to [Company] goes here. Replace it with your own message.",
+      "pt": "Olá [Name], REPLACE_THIS_TEMPLATE — seu primeiro DM para [Company] vai aqui. Substitua por sua própria mensagem."
+    }
+  },
+  "mx_midmarket_manufacturing": {
+    "connection_note": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu nota de conexión para [Company]. Reemplázala con tu propio mensaje."
+    },
+    "dm1": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje."
+    },
+    "dm2": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — aquí va tu segundo DM para [Company]. Reemplázalo con tu propio mensaje."
+    },
+    "dm3": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — este es tu último mensaje de la secuencia para [Company]. Reemplázalo con tu propio cierre."
+    },
+    "dm1_v1": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje."
+    },
+    "dm2_v1": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — aquí va tu segundo DM para [Company]. Reemplázalo con tu propio mensaje."
+    },
+    "dm3_v1": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — este es tu último mensaje de la secuencia para [Company]. Reemplázalo con tu propio cierre."
+    },
+    "dm1_v3": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje."
+    }
+  },
+  "co_midmarket_manufacturing": {
+    "connection_note": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu nota de conexión para [Company]. Reemplázala con tu propio mensaje."
+    },
+    "dm1": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje."
+    },
+    "dm2": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — aquí va tu segundo DM para [Company]. Reemplázalo con tu propio mensaje."
+    },
+    "dm3": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — este es tu último mensaje de la secuencia para [Company]. Reemplázalo con tu propio cierre."
+    },
+    "dm1_v1": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje."
+    },
+    "dm2_v1": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — aquí va tu segundo DM para [Company]. Reemplázalo con tu propio mensaje."
+    },
+    "dm3_v1": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — este es tu último mensaje de la secuencia para [Company]. Reemplázalo con tu propio cierre."
+    },
+    "dm1_v3": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje."
+    }
+  },
+  "cl_midmarket_manufacturing": {
+    "connection_note": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu nota de conexión para [Company]. Reemplázala con tu propio mensaje."
+    },
+    "dm1": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje."
+    },
+    "dm2": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — aquí va tu segundo DM para [Company]. Reemplázalo con tu propio mensaje."
+    },
+    "dm3": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — este es tu último mensaje de la secuencia para [Company]. Reemplázalo con tu propio cierre."
+    },
+    "dm1_v1": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje."
+    },
+    "dm2_v1": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — aquí va tu segundo DM para [Company]. Reemplázalo con tu propio mensaje."
+    },
+    "dm3_v1": {
+      "es": "[Name], REPLACE_THIS_TEMPLATE — este es tu último mensaje de la secuencia para [Company]. Reemplázalo con tu propio cierre."
+    },
+    "dm1_v3": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE — aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje."
+    }
+  }
+}

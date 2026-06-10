@@ -1,0 +1,96 @@
+# PhantomBuster configuration — template.
+#
+# Copy this file to config/phantombuster.yaml and fill in your phantom IDs. The
+# live config/phantombuster.yaml is gitignored (see config/.gitignore); only
+# this *.example.yaml template is tracked.
+#
+# A MISSING config/phantombuster.yaml is fine — the loader
+# (clients/pb_config.py:load_pb_config) falls back to the PB_* environment
+# variables, so existing deployments keep working without a yaml. When the
+# yaml IS present, the values below win over the matching env var.
+#
+# Secrets NEVER live in this file. The `credentials` block names the
+# environment variables that hold the secrets; the actual values stay in your
+# .env (loaded at process entry by cli.py). See config/README.md and
+# clients/settings.py:resolve_env_ref for the convention.
+#
+# NOTE: this shipped template keeps placeholder IDs only; provide your real
+# phantom IDs in a gitignored config/phantombuster.yaml.
+
+# ---------------------------------------------------------------------------
+# Phantom (agent) IDs — NON-SECRET. Resolution: this yaml → env var → "".
+# ---------------------------------------------------------------------------
+# Each ID is the numeric agent ID PhantomBuster assigns when you create a
+# phantom. Find it in the PhantomBuster dashboard: open the phantom, the ID is
+# in the URL (.../phantoms/<ID>/...) and in Settings → "Phantom ID". A blank /
+# placeholder value here falls through to the matching PB_* env var.
+agents:
+  # Sales Navigator Search → CSV of profiles (weekly prospecting export).
+  # Env fallback: PB_SEARCH_EXPORT_ID
+  search_export: "REPLACE_WITH_SEARCH_EXPORT_PHANTOM_ID"
+
+  # LinkedIn Network Booster → sends connection invites (daily Part A).
+  # Env fallback: PB_NETWORK_BOOSTER_ID
+  network_booster: "REPLACE_WITH_NETWORK_BOOSTER_PHANTOM_ID"
+
+  # LinkedIn Message Sender → sends DMs to 1st-degree connections (daily Part B).
+  # Env fallback: PB_MESSAGE_SENDER_ID
+  message_sender: "REPLACE_WITH_MESSAGE_SENDER_PHANTOM_ID"
+
+  # LinkedIn Profile Scraper → connection-degree check, legacy backend.
+  # Used when pre_invite_degree_check_backend = regular.
+  # Env fallback: PB_PROFILE_SCRAPER_ID
+  profile_scraper: "REPLACE_WITH_PROFILE_SCRAPER_PHANTOM_ID"
+
+  # Sales Navigator Profile Scraper → connection-degree check, sales_nav backend.
+  # Required when pre_invite_degree_check_backend = sales_nav. MUST be a
+  # different phantom ID than profile_scraper (the two emit different CSV
+  # schemas; the loader's validation rejects an accidental duplicate).
+  # Env fallback: PB_SALES_NAV_PROFILE_SCRAPER_ID
+  sales_nav_profile_scraper: "REPLACE_WITH_SALES_NAV_PROFILE_SCRAPER_PHANTOM_ID"
+
+  # Sales Navigator URL Converter → NOT NEEDED for the current pipeline (the
+  # Sales Nav Profile Scraper auto-converts /in/ URLs). Kept as a placeholder
+  # for future enrichment workflows. Leave blank unless you wire one up.
+  # Env fallback: PB_SALES_NAV_URL_CONVERTER_ID
+  sales_nav_url_converter: ""
+
+  # Sales Navigator Inbox Scraper → detects message replies (daily Phase 0.5).
+  # Env fallback: PB_INBOX_SCRAPER_ID
+  inbox_scraper: "REPLACE_WITH_INBOX_SCRAPER_PHANTOM_ID"
+
+# ---------------------------------------------------------------------------
+# Pre-invite degree-check backend — NON-SECRET. Resolution: yaml → env → "regular".
+# ---------------------------------------------------------------------------
+# Which scraper the pre-invite degree check + Phase 0 accepted-connection
+# detection use. Valid values: regular | sales_nav. Default "regular" (legacy
+# LinkedIn Profile Scraper). Flip to "sales_nav" only after the Sales Nav
+# cookies are populated in .env AND scripts/validate_sales_nav_health.py
+# returns OK. See docs/onboarding/phantombuster-setup.md and
+# docs/runbooks/phantombuster-cookie-rotation.md.
+# Env fallback: PRE_INVITE_DEGREE_CHECK_BACKEND
+pre_invite_degree_check_backend: regular
+
+# ---------------------------------------------------------------------------
+# Credential env-var NAMES (not the secrets themselves).
+# ---------------------------------------------------------------------------
+# Documents WHICH env vars hold the PhantomBuster secrets. The loader reads
+# these secrets straight from the environment (it does NOT resolve this block —
+# the block is documentation, mirroring config/crm.example.yaml's pattern). The
+# actual values live in your .env. NEVER put a secret value here.
+credentials:
+  # PhantomBuster API key (PB dashboard → Settings → API). Required.
+  api_key_env: PHANTOMBUSTER_API_KEY
+
+  # Regular LinkedIn session cookie (li_at). Used by Search Export, Network
+  # Booster, Message Sender, Inbox Scraper, and the legacy Profile Scraper.
+  li_session_cookie_env: PB_LI_SESSION_COOKIE
+
+  # Browser User-Agent string matching the session above.
+  li_user_agent_env: PB_LI_USER_AGENT
+
+  # Sales Navigator session cookies (separate from the regular li_at so a
+  # rotation of one doesn't invalidate the other). Required only when
+  # pre_invite_degree_check_backend = sales_nav.
+  li_sales_nav_session_cookie_env: PB_LI_SALES_NAV_SESSION_COOKIE
+  li_sales_nav_li_a_cookie_env: PB_LI_SALES_NAV_LI_A_COOKIE

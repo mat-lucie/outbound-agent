@@ -1,0 +1,31 @@
+# Acme synthetic reference operator — outreach operational knobs.
+#
+# A fully worked example of the config/outreach.example.yaml schema. The test
+# suite resolves this file via the conftest OUTBOUND_CONFIG_DIR pin.
+
+caps:
+  invites_per_day: 25          # MAX_CONNECTIONS_PER_DAY
+  dms_per_day: 30              # MAX_MESSAGES_PER_DAY
+  visits_per_day: 50           # MAX_VISITS_PER_DAY (CONNECTION_SENT re-check budget)
+  invite_batch_size: 20        # daily --batch-size production default
+
+cadence:                       # calendar days from the prior milestone until a step is eligible
+  connect_to_dm1_days: 1       # ~1 day after accept until DM1
+  dm1_to_dm2_days: 5           # ~5 days after DM1 until DM2
+  dm2_to_dm3_days: 10          # ~10 days after DM2 until DM3
+  nurture_business_days:       # post-DM3 re-engagement window (business days), §3.18 cadence policy
+    enterprise: 90             # ICP 1 — high-value, low-pressure
+    target: 60                 # ICP 2 target_company_mode
+    legacy: 45                 # ICP 2 default — tighter feedback loop
+
+lanes:
+  rank:                        # invite-queue priority: enterprise (ICP 1) first, then target (ICP 2), then legacy
+    enterprise_mode: 0
+    target_company_mode: 1
+    legacy: 2
+
+schedule:
+  send_days: [mon, tue, wed, thu, fri]  # Mon–Fri outreach calendar; timezone = OUTBOUND_TZ (default America/Lima)
+
+throttle:
+  company_window_days: 14      # DEFAULT_THROTTLE_WINDOW_DAYS (2026-06-01: lowered 30 → 14 for throughput)

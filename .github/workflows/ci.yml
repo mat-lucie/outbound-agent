@@ -1,0 +1,41 @@
+name: CI
+
+# Gate every push and PR on the project's quality gates (see CONTRIBUTING.md).
+# Hard gates (job fails): ruff, mypy, secrets scan, pytest.
+on: [push, pull_request]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install (with dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      # ── Cheap hard gates first, so they fail fast ──────────────────────
+      - name: Ruff (lint)
+        run: ruff check
+
+      - name: Mypy (type check)
+        run: mypy clients models workflows content cli.py
+
+      - name: Secrets gate
+        run: python scripts/check_no_secrets.py
+
+      # ── Slow hard gate last ────────────────────────────────────────────
+      - name: Pytest
+        run: python -m pytest -q -p no:cacheprovider

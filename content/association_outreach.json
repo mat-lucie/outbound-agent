@@ -1,0 +1,8 @@
+{
+  "_meta": {
+    "purpose": "One-shot association outreach emails sent via /sales-email-daily. NOT a drip campaign — single email per recipient asking for member directory access or partnership intro.",
+    "tone_guidance": "Warm, professional, peer-to-peer. We are NOT pitching the product — we are asking for a relationship/intro. The product pitch comes AFTER they reply.",
+    "send_status_file": "~/.outbound-agent/association_outreach_sent.json"
+  },
+  "contacts": []
+}

@@ -1,0 +1,77 @@
+{
+  "digitalization_champions": {
+    "label": "Digitalization Champions",
+    "target_titles": ["VP Innovation", "Digital Transformation Manager", "Head of Industry 4.0"],
+    "volume_per_month": "20-30",
+    "hook_angle": "REPLACE_THIS_TEMPLATE — your one-line outreach hook for this segment",
+    "enterprise_mode": true,
+    "icp_notes": "Placeholder segment — replace with your ICP notes. Describe the firmographics, geography, and buyer level you target for digital-transformation champions.",
+    "search_queries": {
+      "content_keywords": {},
+      "sn_search_urls": {}
+    }
+  },
+  "operations_leaders": {
+    "label": "Operations Leaders",
+    "target_titles": ["VP Operations", "Plant Manager", "Director of Manufacturing"],
+    "volume_per_month": "20-30",
+    "hook_angle": "REPLACE_THIS_TEMPLATE — your one-line outreach hook for this segment",
+    "enterprise_mode": true,
+    "icp_notes": "Placeholder segment — replace with your ICP notes. Operations leaders at mid-to-large manufacturers; describe your real firmographics, geography, and buyer level.",
+    "search_queries": {
+      "content_keywords": {},
+      "sn_search_urls": {}
+    }
+  },
+  "executive_sponsors": {
+    "label": "Executive Sponsors",
+    "target_titles": ["COO", "CFO", "VP Supply Chain"],
+    "volume_per_month": "10-20",
+    "hook_angle": "REPLACE_THIS_TEMPLATE — your one-line outreach hook for this segment",
+    "enterprise_mode": true,
+    "icp_notes": "Placeholder segment — replace with your ICP notes. Executive sponsors who own the budget; describe your real firmographics, geography, and buyer level.",
+    "search_queries": {
+      "content_keywords": {},
+      "sn_search_urls": {}
+    }
+  },
+  "mx_midmarket_manufacturing": {
+    "label": "Mid-Market Manufacturing — Region A",
+    "target_titles": ["Director of Operations", "Plant Manager", "Production Manager", "Owner"],
+    "volume_per_month": "15-25",
+    "hook_angle": "REPLACE_THIS_TEMPLATE — your one-line outreach hook for this segment",
+    "target_company_mode": true,
+    "target_company_list": "mx-midmarket",
+    "icp_notes": "Placeholder segment — replace with your ICP notes. Mid-market manufacturers in your first target region; replace content/mx-midmarket-targets.json with your real target-company list.",
+    "search_queries": {
+      "content_keywords": {},
+      "sn_search_urls": {}
+    }
+  },
+  "co_midmarket_manufacturing": {
+    "label": "Mid-Market Manufacturing — Region B",
+    "target_titles": ["Director of Operations", "Plant Manager", "Production Manager", "Owner"],
+    "volume_per_month": "15-25",
+    "hook_angle": "REPLACE_THIS_TEMPLATE — your one-line outreach hook for this segment",
+    "target_company_mode": true,
+    "target_company_list": "co-midmarket",
+    "icp_notes": "Placeholder segment — replace with your ICP notes. Mid-market manufacturers in your second target region; replace content/co-midmarket-targets.json with your real target-company list.",
+    "search_queries": {
+      "content_keywords": {},
+      "sn_search_urls": {}
+    }
+  },
+  "cl_midmarket_manufacturing": {
+    "label": "Mid-Market Manufacturing — Region C",
+    "target_titles": ["Director of Operations", "Plant Manager", "Production Manager", "Owner"],
+    "volume_per_month": "10-20",
+    "hook_angle": "REPLACE_THIS_TEMPLATE — your one-line outreach hook for this segment",
+    "target_company_mode": true,
+    "target_company_list": "cl-midmarket",
+    "icp_notes": "Placeholder segment — replace with your ICP notes. Mid-market manufacturers in your third target region; replace content/cl-midmarket-targets.json with your real target-company list.",
+    "search_queries": {
+      "content_keywords": {},
+      "sn_search_urls": {}
+    }
+  }
+}

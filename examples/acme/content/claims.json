@@ -1,0 +1,143 @@
+{
+  "claims": [
+    {
+      "id": "reschedule-30-seconds",
+      "claim": "reschedules in 30 seconds / reprograma en 30 segundos / replaneja em 30 segundos",
+      "languages": [
+        "en",
+        "es",
+        "pt"
+      ],
+      "type": "capability",
+      "evidence": "Live product capability: the rescheduling engine (CP-SAT optimizer) recomputes the plan from current constraints in under 30 seconds. Demonstrable in any live demo session.",
+      "status": "demoable"
+    },
+    {
+      "id": "hours-to-seconds-planner",
+      "claim": "Planners go from hours of manual work to seconds / pasan de horas de trabajo manual a segundos / passam de horas de trabalho manual para segundos",
+      "languages": [
+        "en",
+        "es",
+        "pt"
+      ],
+      "type": "capability",
+      "evidence": "Live product capability: before Acme planners build plans manually (observed in customer interviews, typically 3-4h/day); after Acme the rescheduling step takes seconds. The contrast is demonstrable in a live demo.",
+      "status": "demoable"
+    },
+    {
+      "id": "scheduler-3-4-hours-daily",
+      "claim": "scheduler was spending 3-4 hours a day / programador se aventaba 3-4 horas diarias / programador passava 3-4 horas por dia",
+      "languages": [
+        "en",
+        "es",
+        "pt"
+      ],
+      "type": "outcome",
+      "evidence": "Observed pattern across early pilot plants (multiple customer discovery interviews). Specific quantification (3-4h) is a representative observed range, not a controlled study average.",
+      "status": "demoable"
+    },
+    {
+      "id": "scheduler-half-day-reorganizing",
+      "claim": "scheduler was spending half a day reorganizing / programador se aventaba medio día reorganizando / programador passava meio dia reorganizando",
+      "languages": [
+        "en",
+        "es",
+        "pt"
+      ],
+      "type": "outcome",
+      "evidence": "Observed in pilot plants when a rush order triggers a manual plan rebuild. Consistent with the 3-4h/day finding; 'half a day' is the specific replanning event cost, not the daily total.",
+      "status": "demoable"
+    },
+    {
+      "id": "plant-200-skus-three-shifts",
+      "claim": "plant running 200 SKUs across three shifts / planta con 200 SKUs y tres turnos / planta com 200 SKUs e três turnos",
+      "languages": [
+        "en",
+        "es",
+        "pt"
+      ],
+      "type": "outcome",
+      "evidence": "Represents a real customer profile observed in pilot engagements. Specific figures (200 SKUs, 3 shifts) are representative anonymized parameters, not a single named customer.",
+      "status": "demoable"
+    },
+    {
+      "id": "alignment-meetings-3-plus-hours",
+      "claim": "3+ hours a day in alignment meetings / 3+ horas al día en juntas de alineación / 3+ horas por dia em reuniões de alinhamento",
+      "languages": [
+        "en",
+        "es",
+        "pt"
+      ],
+      "type": "outcome",
+      "evidence": "Pattern observed in customer interviews. The '3+' figure is based on self-reported planner estimates in discovery sessions; not a controlled time-study.",
+      "status": "demoable"
+    },
+    {
+      "id": "half-day-to-30-seconds",
+      "claim": "rescheduling down from half a day to 30 seconds / reprogramado pase de medio día a 30 segundos / reprogramação passe de meio dia para 30 segundos",
+      "languages": [
+        "en",
+        "es",
+        "pt"
+      ],
+      "type": "capability",
+      "evidence": "Composite of the 'scheduler spends half a day on replanning' observation (pilot interviews) and the '30-second rescheduling' live product capability. The contrast is demonstrable end-to-end in a demo.",
+      "status": "demoable"
+    },
+    {
+      "id": "roi-weeks-not-months",
+      "claim": "ROI shows up in weeks, not months / ROI se ve en semanas, no meses / ROI aparece em semanas, não meses",
+      "languages": [
+        "en",
+        "es",
+        "pt"
+      ],
+      "type": "outcome",
+      "evidence": "No controlled study or customer-reported ROI timeline on file. This claim appears in executive_sponsors dm2 (all langs). Evidence must be sourced — a pilot case study with measured payback period — before this copy can ship.",
+      "status": "needs_evidence"
+    },
+    {
+      "id": "otif-points-first-quarter",
+      "claim": "OTIF +5-8 puntos en el primer trimestre / OTIF up 5-8 points in the first quarter / OTIF +5-8 pontos no primeiro trimestre",
+      "languages": [
+        "es",
+        "en",
+        "pt"
+      ],
+      "type": "stat",
+      "evidence": "No primary source on file. This specific +5-8 point OTIF improvement figure appears in executive_sponsors dm2_v1 (all langs). A controlled before/after measurement from a named (or anonymized) pilot plant is required before this claim can be promoted to demoable.",
+      "status": "needs_evidence"
+    },
+    {
+      "id": "ebitda-15pct-supply-chain",
+      "claim": "Companies lose about 15% of total EBITDA on operative supply chain mistakes / empresas pierden alrededor del 15% del EBITDA total / empresas perdem cerca de 15% do EBITDA total",
+      "languages": [
+        "en",
+        "es",
+        "pt"
+      ],
+      "type": "stat",
+      "evidence": "No primary source on file. This unattributed industry figure appears in email1 (all langs). A sourced citation (industry report, analyst study) is required before this claim can be promoted to demoable.",
+      "status": "needs_evidence"
+    },
+    {
+      "id": "otif-retailer-penalty-3pct",
+      "claim": "retailers charge ~3% of non-compliant shipment volume / retailers cobran ~3% del volumen no conforme / varejistas cobram ~3% do volume não conforme",
+      "languages": [
+        "en",
+        "es",
+        "pt"
+      ],
+      "type": "stat",
+      "evidence": "No primary source on file. This commonly cited industry figure appears in wave2 email (all langs). A sourced citation is required before this claim can be promoted to demoable.",
+      "status": "needs_evidence"
+    }
+  ],
+  "banned_phrases": [
+    {
+      "label": "product typo: Acmee",
+      "pattern": "\\bAcmee\\b",
+      "case_sensitive": true
+    }
+  ]
+}

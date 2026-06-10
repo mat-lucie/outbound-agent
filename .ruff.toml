@@ -1,0 +1,21 @@
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "TCH"]
+ignore = ["E501"]
+
+[lint.isort]
+known-first-party = ["clients", "models", "workflows", "scripts"]
+
+# Non-shipping code (tests + one-shot operational scripts) legitimately uses
+# patterns these opinionated rules flag. Source packages stay at zero-tolerance.
+[lint.per-file-ignores]
+# Tests: negative tests assert broad exceptions (B017); fixtures use late imports
+# after sys.path/env setup (E402), compact multi-statement lines (E702), and
+# lambda stubs (E731); direct file reads (SIM115), nested conditionals (SIM102),
+# and intentionally-unused bindings (F841) are clearer than the "fix" in scaffolding.
+"tests/**" = ["B017", "E402", "E702", "E731", "F841", "SIM102", "SIM115"]
+# One-shot diagnostic/repair scripts: scratch result bindings (F841) and nested
+# guards (SIM102) are fine in throwaway operational tooling.
+"scripts/**" = ["F841", "SIM102"]

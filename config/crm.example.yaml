@@ -1,0 +1,66 @@
+# CRM provider configuration — template.
+#
+# Copy this file to config/crm.yaml and fill it in. The live config/crm.yaml is
+# gitignored (see config/.gitignore); only this *.example.yaml template is
+# tracked.
+#
+# Secrets NEVER live in this file. The `credentials` block names the environment
+# variables that hold the secrets; the actual values stay in your .env (loaded
+# at process entry by cli.py). See clients/settings.py:resolve_env_ref.
+
+# Which CRM adapter the engine builds. "attio" is the bundled reference adapter.
+# Add other vendors via the /onboard skill, which generates
+# clients/crm/<vendor>_provider.py and registers it in clients/crm/factory.py.
+# If config/crm.yaml is absent entirely, the factory defaults to vendor=attio
+# built from the environment (backward-compatible with pre-config deployments).
+vendor: attio
+
+# Credential env-var NAMES (not the secrets themselves). The factory resolves
+# `api_key_env` to the value of that env var. These are the same variables the
+# Attio client reads today: ATTIO_API_KEY (auth) and ATTIO_LIST_ID (default
+# pipeline list). If `api_key_env` is omitted, AttioClient falls back to reading
+# ATTIO_API_KEY from the environment directly.
+credentials:
+  api_key_env: ATTIO_API_KEY
+  list_id_env: ATTIO_LIST_ID
+
+# --------------------------------------------------------------------------
+# FIELD / STAGE MAPPING
+# --------------------------------------------------------------------------
+
+# engine field name -> vendor (Attio) field slug.   [CONSUMED]
+# Use this if your Attio workspace renamed an attribute (e.g. your LinkedIn
+# field is `linkedin_profile`, not `linkedin`). A PARTIAL field_mapping merges
+# over these canonical defaults — naming only `linkedin_url` leaves `full_name`
+# and `company_domain` on their default slugs. Only these three engine fields
+# are configurable.
+#
+# KNOWN LIMITATION: renaming `linkedin_url` covers the READ/search/dedup-lookup
+# path (search_person_by_linkedin, extract_record_info, the corruption guard),
+# but NOT the person upsert WRITE path, which still matches/writes the literal
+# `linkedin` slug. If your workspace has BOTH a renamed slug AND the canonical
+# `linkedin` slug, person dedup can split silently. See docs/LIMITATIONS.md.
+field_mapping:
+  linkedin_url: linkedin
+  full_name: name
+  company_domain: domains
+
+# engine stage -> vendor option label + funnel rank. [CONSUMED]
+# Use this if your CRM's pipeline-stage option LABELS differ from the engine's
+# canonical names (e.g. your "Connection Sent" stage is labeled "Invite sent").
+# Keys are PipelineStage NAMES (models/pipeline.py); `name` is your vendor's
+# option label; `rank` is the funnel position (higher = further along; the
+# default ranks come from STAGE_RANK). A PARTIAL stage_mapping merges over the
+# identity default, so every unnamed stage keeps its canonical label + rank.
+stage_mapping:
+  PROSPECT:        { name: "Prospect",   rank: 0 }
+  CONNECTION_SENT: { name: "Invite sent", rank: 1 }
+  DM1_SENT:        { name: "DM1 sent",   rank: 2 }
+  # ... through UNREACHABLE (see models/pipeline.py for the full canonical set)
+
+# Which vendor field carries the pipeline stage.     [NOT YET CONSUMED]
+# Reading the stage off a different slug requires de-static-ing the pervasive
+# AttioClient.parse_entry helper (a separate refactor); until then the engine
+# reads AND writes the stage under the literal `stage` slug. A write-only
+# stage_field would silently lose the stage on round-trip, so this stays inert.
+stage_field: stage

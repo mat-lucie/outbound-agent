@@ -1,0 +1,7 @@
+{
+  "_meta": {
+    "note": "REPLACE_THIS_TEMPLATE — placeholder target-company list. Replace with your real mx mid-market targets. Top-level keys other than _meta / summary_counts / research_queue / disqualified_with_reason are tiers, each a list of {\"name\": ...} entries.",
+    "persona": "mx_midmarket_manufacturing"
+  },
+  "tier_1_high_conviction": []
+}
