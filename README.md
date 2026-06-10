@@ -8,16 +8,35 @@ response patterns back into ICP tuning. You stand it up against **your** CRM,
 PhantomBuster account, and ICP — the engine's math and cadence logic stay
 unchanged.
 
-> **First time here?** Follow the step-by-step **[Getting Started guide](GETTING_STARTED.md)**
-> — fresh clone to your first safe dry-run in ~60–90 minutes. The quick start
-> below is the condensed version.
+> **First time here?** Point an AI coding agent at this repo — it reads
+> [AGENTS.md](AGENTS.md) and drives the setup for you. Prefer doing it by
+> hand? Follow the **[Getting Started guide](GETTING_STARTED.md)**.
 
 ---
 
-## Quick start
+## Quick start (with an AI agent — recommended)
+
+This repo is built to be set up *by* an AI coding agent. Clone it, open your
+agent in the repo root, and ask it to onboard you:
 
 ```bash
-git clone <this-repo> outbound-agent
+git clone https://github.com/mat-lucie/outbound-agent.git
+cd outbound-agent
+claude        # or any agent that reads AGENTS.md
+```
+
+> *"Run the /onboard skill and set this up for my CRM and ICP."*
+
+The agent reads [AGENTS.md](AGENTS.md) automatically, follows the `/onboard`
+interview (`skills/onboard/SKILL.md`), and walks you from fresh clone to a
+safe `--dry-run`. It interviews you about your CRM, PhantomBuster account,
+and ICP — and for a non-Attio CRM it generates the adapter and proves it
+against the conformance suite.
+
+## Quick start (manual)
+
+```bash
+git clone https://github.com/mat-lucie/outbound-agent.git
 cd outbound-agent
 
 python -m venv .venv
@@ -25,17 +44,10 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -e '.[dev]'
 ```
 
-Then run the `/onboard` skill — it interviews you and wires the engine to your
-environment:
+Then follow **[GETTING_STARTED.md](GETTING_STARTED.md)** — fresh clone to your
+first safe dry-run in ~60–90 minutes.
 
-```bash
-# Open skills/onboard/SKILL.md and follow the procedure in
-# skills/onboard/references/onboarding-spec.md
-# (The skill is designed for a Claude Code / AI agent session; it is
-#  self-contained and machine-followable end-to-end.)
-```
-
-The onboard skill produces:
+Either path produces:
 
 | Output | What it is |
 |--------|-----------|
