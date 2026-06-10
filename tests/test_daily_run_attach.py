@@ -26,6 +26,7 @@ import pytest
 from clients.crm.base import Record
 from clients.crm.exceptions import UniquenessConflictError
 from workflows.daily_run import (
+    MAX_CONNECTIONS_PER_DAY,
     MAX_MESSAGES_PER_DAY,
     MalformedDailyRunRow,
     NoDailyRunRow,
@@ -47,6 +48,7 @@ def _row(
     connections_sent: int = 0,
     visits_sent: int = 0,
     reply_detection_status: str | None = "ok",
+    started_at: str = "2026-06-09T08:00:00Z",
 ) -> Record:
     """A daily_run ``Record`` as the provider returns it.
 
@@ -63,6 +65,7 @@ def _row(
         "connections_sent": connections_sent,
         "visits_sent": visits_sent,
         "run_id": "prior-run",
+        "started_at": started_at,
     }
     if reply_detection_status is not None:
         attrs["reply_detection_status"] = reply_detection_status
@@ -336,50 +339,188 @@ def test_query_todays_row_returns_none_when_absent(mock_crm):
     assert query_todays_row(mock_crm, "2026-06-09", "laptop-A") is None
 
 
-def _row_with_started(record_id: str, status: str, started_at: str) -> Record:
-    """A daily_run Record carrying a started_at timestamp for the multi-row
-    selection path."""
-    r = _row(record_id=record_id, status=status)
-    r.attributes["started_at"] = started_at
-    return r
+# ── multi-row days: aborted-then-retried (the 2026-06-10 incident) ──────────
+#
+# `_close` re-keys an aborted row to the released 4-part uniqueness_key,
+# freeing the 2-part running-lock, so a retried `daily` creates a SECOND row
+# for the same (run_date, machine_id). The bare-attribute lookup must then
+# pick deterministically and merge counters — never return an arbitrary row.
 
 
-# ── G(i): multi-row (run_date, machine_id) selection ──────────────────────
+def _incident_day_rows() -> tuple[Record, Record]:
+    """The 2026-06-10 shape: step 1 `daily` aborted at a pre-flight (zero
+    counters, no reply status), then the retry completed with 22 invites and
+    reply_detection_status=ok."""
+    aborted = _row(
+        record_id="rec_aborted",
+        status="aborted",
+        started_at="2026-06-09T08:00:00Z",
+        reply_detection_status=None,
+    )
+    completed = _row(
+        record_id="rec_completed",
+        status="completed",
+        started_at="2026-06-09T09:00:00Z",
+        connections_sent=22,
+        reply_detection_status="ok",
+    )
+    return aborted, completed
 
 
-def test_query_todays_row_prefers_running_and_warns(mock_crm, capsys):
-    """Same-day re-runs / takeovers can leave several rows sharing the bare
-    (run_date, machine_id) pair. query_todays_row prefers the "running" row and
-    emits a loud warning naming the chosen record_id."""
-    abandoned = _row_with_started("rec_old", "abandoned", "2026-06-09T08:00:00Z")
-    running = _row_with_started("rec_live", "running", "2026-06-09T12:00:00Z")
-    mock_crm.query_object_records.return_value = [abandoned, running]
+@pytest.mark.parametrize("crm_order", ["aborted_first", "completed_first"])
+def test_query_todays_row_picks_completed_over_aborted(mock_crm, capsys, crm_order):
+    """On a duplicate-row day the pick must be the completed row — in BOTH
+    CRM return orders (the incident was exactly this being order-dependent:
+    `send-dms` got the aborted zero-counter row back). A loud WARN must list
+    the duplicates."""
+    aborted, completed = _incident_day_rows()
+    rows = [aborted, completed] if crm_order == "aborted_first" else [completed, aborted]
+    mock_crm.query_object_records.return_value = rows
     chosen = query_todays_row(mock_crm, "2026-06-09", "laptop-A")
-    assert chosen is not None and chosen.record_id == "rec_live"
-    # A small page is fetched (not limit=1).
+    assert chosen is not None and chosen.record_id == "rec_completed"
+    # The full same-day page is fetched (not limit=1).
     assert mock_crm.query_object_records.call_args[1]["limit"] >= 2
-    err = capsys.readouterr().err
-    assert "WARNING" in err
-    assert "rec_live" in err
+    stderr = capsys.readouterr().err
+    assert "WARN" in stderr
+    assert "rec_aborted" in stderr and "rec_completed" in stderr
 
 
-def test_query_todays_row_two_terminal_picks_latest_started_at(mock_crm, capsys):
-    """No running row → choose the most recent by started_at."""
-    older = _row_with_started("rec_a", "failed", "2026-06-09T06:00:00Z")
-    newer = _row_with_started("rec_b", "completed", "2026-06-09T18:00:00Z")
-    # Provide out of order to prove the sort, not the input order, decides.
-    mock_crm.query_object_records.return_value = [newer, older]
+def test_query_todays_row_prefers_running_over_completed(mock_crm):
+    """A running row still holds the 2-part lock — reopening any OTHER row
+    would collide against it, so it must win the pick."""
+    running = _row(record_id="rec_running", status="running", started_at="2026-06-09T07:00:00Z")
+    completed = _row(record_id="rec_completed", status="completed", started_at="2026-06-09T09:00:00Z")
+    mock_crm.query_object_records.return_value = [completed, running]
     chosen = query_todays_row(mock_crm, "2026-06-09", "laptop-A")
-    assert chosen is not None and chosen.record_id == "rec_b"
-    assert "rec_b" in capsys.readouterr().err
+    assert chosen is not None and chosen.record_id == "rec_running"
 
 
-def test_query_todays_row_single_row_no_warning(mock_crm, capsys):
-    """The common single-row case still returns that row with no warning."""
+def test_query_todays_row_same_status_tie_breaks_to_most_recent(mock_crm):
+    """Two rows with the same status → the most recent started_at wins (it
+    carries the freshest reply-detection state; counters are merged anyway)."""
+    older = _row(record_id="rec_older", status="completed", started_at="2026-06-09T08:00:00Z")
+    newer = _row(record_id="rec_newer", status="completed", started_at="2026-06-09T11:30:00Z")
+    mock_crm.query_object_records.return_value = [older, newer]
+    chosen = query_todays_row(mock_crm, "2026-06-09", "laptop-A")
+    assert chosen is not None and chosen.record_id == "rec_newer"
+
+
+def test_query_todays_row_single_row_no_warn(mock_crm, capsys):
+    """A normal single-row day stays quiet — the duplicate WARN must not
+    cry wolf on every run."""
     mock_crm.query_object_records.return_value = [_row(status="running")]
     chosen = query_todays_row(mock_crm, "2026-06-09", "laptop-A")
     assert chosen is not None
-    assert "WARNING" not in capsys.readouterr().err
+    assert "WARN" not in capsys.readouterr().err
+
+
+def test_select_canonical_row_parses_mixed_timestamp_formats(mock_crm):
+    """started_at must be PARSED for the most-recent tie-break, not
+    string-compared: 'Z'-suffixed text sorts above '+00:00'-suffixed text
+    lexicographically ('Z' > '.') even when it is chronologically older."""
+    older_z = _row(
+        record_id="rec_older", status="completed",
+        started_at="2026-06-09T08:00:00Z",
+    )
+    newer_offset = _row(
+        record_id="rec_newer", status="completed",
+        started_at="2026-06-09T08:00:00.500000+00:00",
+    )
+    mock_crm.query_object_records.return_value = [older_z, newer_offset]
+    chosen = query_todays_row(mock_crm, "2026-06-09", "laptop-A")
+    assert chosen is not None and chosen.record_id == "rec_newer"
+
+
+def test_attach_incident_day_binds_completed_row_and_reads_reply_status(mock_crm):
+    """THE 2026-06-10 regression. Day has [aborted(0 counters, no reply
+    status), completed(22 invites, reply ok)] → attach must bind the
+    completed row: reply_detection_status rehydrates to "ok" (so `send-dms`
+    proceeds instead of refusing) and the invite counter continues at 22/25
+    (no cap reset). The reopen write must target the completed row."""
+    aborted, completed = _incident_day_rows()
+    mock_crm.query_object_records.return_value = [aborted, completed]
+    with attach_daily_run(
+        mock_crm, run_id="dm-1", run_date=date(2026, 6, 9), machine_id="laptop-A"
+    ) as run:
+        assert run.record_id == "rec_completed"
+        assert run.get_reply_detection_status() == "ok"
+        assert run.remaining("connections") == MAX_CONNECTIONS_PER_DAY - 22
+    # First write is the reopen — it must target the completed row.
+    obj, rid, values = mock_crm.update_object_record.call_args_list[0][0]
+    assert rid == "rec_completed"
+    assert values["status"] == "running"
+
+
+def test_attach_merges_counters_across_duplicate_rows(mock_crm):
+    """Counters are SUMMED across all same-day rows: a failed-mid-send row
+    (10 DMs) plus its retry (12 DMs) → remaining == 30 - 22. Binding either
+    row with only its own counters would re-open headroom that was already
+    spent — the latent cap breach."""
+    failed = _row(
+        record_id="rec_failed", status="failed",
+        started_at="2026-06-09T08:00:00Z", messages_sent=10,
+    )
+    completed = _row(
+        record_id="rec_completed", status="completed",
+        started_at="2026-06-09T09:00:00Z", messages_sent=12,
+    )
+    mock_crm.query_object_records.return_value = [failed, completed]
+    with attach_daily_run(
+        mock_crm, run_id="dm-1", run_date=date(2026, 6, 9), machine_id="laptop-A"
+    ) as run:
+        assert run.remaining("messages") == MAX_MESSAGES_PER_DAY - 22
+
+
+def test_attach_malformed_sibling_counter_fails_closed_before_reopen(mock_crm):
+    """The strict-counter rule extends to EVERY same-day row: a sibling row
+    with a missing counter raises MalformedDailyRunRow rather than being
+    silently dropped from the merge (dropping it would under-count and
+    re-open spent headroom).
+
+    CRITICALLY, the raise must happen BEFORE the reopen write: raising
+    after it would leave the bound row re-keyed to status=running holding
+    the 2-part lock with no close path — wedging every subsequent `daily`
+    and `send-dms` until a manual re-key."""
+    bad_sibling = _row(record_id="rec_bad", status="aborted", started_at="2026-06-09T08:00:00Z")
+    del bad_sibling.attributes["messages_sent"]
+    good = _row(record_id="rec_good", status="completed", started_at="2026-06-09T09:00:00Z")
+    mock_crm.query_object_records.return_value = [bad_sibling, good]
+    with pytest.raises(MalformedDailyRunRow), attach_daily_run(
+        mock_crm, run_id="dm-1", run_date=date(2026, 6, 9), machine_id="laptop-A"
+    ):
+        pytest.fail("body must not execute when a sibling counter is malformed")
+    mock_crm.update_object_record.assert_not_called()
+
+
+def test_attach_patches_own_counters_only_not_baseline(mock_crm):
+    """Row independence: sends recorded after a duplicate-day attach must
+    persist the BOUND row's own count, never the sibling baseline. If the
+    baseline leaked into the write, every later merge would double-count
+    it (compounding per retry) and the weekly outreach-volume report —
+    which sums rows per day — would inflate."""
+    failed = _row(
+        record_id="rec_failed", status="failed",
+        started_at="2026-06-09T08:00:00Z", messages_sent=10,
+    )
+    completed = _row(
+        record_id="rec_completed", status="completed",
+        started_at="2026-06-09T09:00:00Z", messages_sent=12,
+    )
+    mock_crm.query_object_records.return_value = [failed, completed]
+    with attach_daily_run(
+        mock_crm, run_id="dm-1", run_date=date(2026, 6, 9), machine_id="laptop-A"
+    ) as run:
+        run.record_send("messages", 1)
+        # Cap math sees baseline 10 + own 13.
+        assert run.remaining("messages") == MAX_MESSAGES_PER_DAY - 23
+    # The counter write carries own 13, NOT baseline-inflated 23.
+    counter_writes = [
+        c[0][2]
+        for c in mock_crm.update_object_record.call_args_list
+        if "messages_sent" in c[0][2]
+    ]
+    assert counter_writes
+    assert counter_writes[0]["messages_sent"] == 13
 
 
 # ── G(iv): read_only attach + restore-prior-status ────────────────────────

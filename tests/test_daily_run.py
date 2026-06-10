@@ -38,6 +38,7 @@ from workflows.daily_run import (
     CapacityExhausted,
     ConcurrentRunInAttio,
     DailyRun,
+    MalformedDailyRunRow,
     derive_machine_id,
     open_daily_run,
 )
@@ -194,13 +195,19 @@ def test_open_daily_run_raises_concurrent_when_unique_collision(mock_crm):
     """A provider UniquenessConflictError on create → ConcurrentRunInAttio,
     carrying the existing-row forensics from the follow-up query."""
     mock_crm.create_object_record.side_effect = _uniqueness_conflict()
-    mock_crm.query_object_records.return_value = [
-        _record(
-            "rec_other",
-            hostname="laptop-B",
-            started_at="2026-05-21T10:00:00Z",
-            run_id="concurrent-other",
-        )
+    # The pre-open scan filters on machine_id=laptop-A, so laptop-B's row
+    # does not appear in it — only the forensics query (filtered on the
+    # uniqueness_key both machines contend for) surfaces it.
+    mock_crm.query_object_records.side_effect = [
+        [],  # pre-open same-day scan
+        [
+            _record(
+                "rec_other",
+                hostname="laptop-B",
+                started_at="2026-05-21T10:00:00Z",
+                run_id="concurrent-other",
+            )
+        ],  # collision forensics query
     ]
 
     with (
@@ -229,7 +236,10 @@ def test_open_daily_run_query_failure_in_collision_path_yields_none_existing(moc
     """If the lookup-existing-row query itself fails, the ConcurrentRunInAttio
     must still be raised — never crash on the error path."""
     mock_crm.create_object_record.side_effect = _uniqueness_conflict()
-    mock_crm.query_object_records.side_effect = httpx.ConnectError("network down")
+    mock_crm.query_object_records.side_effect = [
+        [],  # pre-open same-day scan succeeds (empty day)
+        httpx.ConnectError("network down"),  # forensics lookup fails
+    ]
     with (
         pytest.raises(ConcurrentRunInAttio) as excinfo,
         open_daily_run(mock_crm, run_id="run-collide", machine_id="laptop-A"),
@@ -355,13 +365,30 @@ def test_f_pr_8_machine_id_smoke(mock_crm, monkeypatch):
         _record("rec_first"),  # first invocation: create succeeds
         _uniqueness_conflict(),  # second invocation: collision
     ]
-    mock_crm.query_object_records.return_value = [
-        _record(
-            "rec_first",
-            hostname="stable-laptop",
-            started_at="2026-05-21T08:00:00Z",
-            run_id="first-run",
-        )
+    # The second invocation's pre-open scan returns the FIRST run's closed
+    # row (it exists for today), so it needs valid counters for the seed.
+    first_row_scan = _record(
+        "rec_first",
+        hostname="stable-laptop",
+        started_at="2026-05-21T08:00:00Z",
+        run_id="first-run",
+        status="completed",
+        connections_sent=0,
+        messages_sent=0,
+        visits_sent=0,
+    )
+    # Forensics row carries no machine_id (as before this fix), so the
+    # stale same-machine takeover path stays out of this smoke test.
+    forensics_row = _record(
+        "rec_first",
+        hostname="stable-laptop",
+        started_at="2026-05-21T08:00:00Z",
+        run_id="first-run",
+    )
+    mock_crm.query_object_records.side_effect = [
+        [],  # first invocation: pre-open scan, nothing yet
+        [first_row_scan],  # second invocation: scan sees the first run's row
+        [forensics_row],  # second invocation: forensics query
     ]
 
     # First invocation — machine_id derived from gethostname().
@@ -549,6 +576,8 @@ def test_open_daily_run_stale_same_machine_takeover():
         _uniqueness_conflict(),  # initial create collides
         _record("new_rec_456"),  # retry after takeover succeeds
     ]
+    # The pre-open scan sees the stale running row — with real counters, so
+    # the new run's seed continues today's totals instead of restarting at 0.
     crm.query_object_records.return_value = [
         _record(
             "stale_rec_123",
@@ -556,12 +585,18 @@ def test_open_daily_run_stale_same_machine_takeover():
             started_at=stale_started,
             run_id="old-run",
             machine_id="laptop-A",
+            status="running",
+            connections_sent=7,
+            messages_sent=0,
+            visits_sent=0,
         )
     ]
     crm.update_object_record.return_value = _record("any")
 
     with patch("workflows.daily_run.time.sleep"), open_daily_run(crm, run_id="new-run", machine_id="laptop-A") as run:
         assert run.record_id == "new_rec_456"
+        # Seeded from the stale row's counters — caps don't reset.
+        assert run.remaining("connections") == MAX_CONNECTIONS_PER_DAY - 7
 
     # Takeover write is the first update_object_record call.
     obj, rid, values = crm.update_object_record.call_args_list[0][0]
@@ -577,14 +612,19 @@ def test_open_daily_run_cross_machine_stale_raises_concurrent():
 
     crm = MagicMock()
     crm.create_object_record.side_effect = _uniqueness_conflict()
-    crm.query_object_records.return_value = [
-        _record(
-            "other_rec",
-            hostname="laptop-B",
-            started_at=stale_started,
-            run_id="other-run",
-            machine_id="laptop-B",
-        )
+    # The pre-open scan filters on machine_id=laptop-A, so laptop-B's row
+    # does not appear in it — only the forensics query surfaces it.
+    crm.query_object_records.side_effect = [
+        [],  # pre-open same-day scan
+        [
+            _record(
+                "other_rec",
+                hostname="laptop-B",
+                started_at=stale_started,
+                run_id="other-run",
+                machine_id="laptop-B",
+            )
+        ],  # collision forensics query
     ]
 
     with pytest.raises(ConcurrentRunInAttio) as excinfo, open_daily_run(crm, run_id="my-run", machine_id="laptop-A"):
@@ -610,6 +650,8 @@ def test_open_daily_run_retry_after_takeover_collides_raises_concurrent():
         _uniqueness_conflict(),  # initial create collides
         _uniqueness_conflict(),  # retry after takeover ALSO collides (race)
     ]
+    # Same-machine stale row: the pre-open scan sees it too, so it carries
+    # valid counters for the baseline seed (strict parse fails closed).
     crm.query_object_records.return_value = [
         _record(
             "stale_rec_123",
@@ -617,6 +659,10 @@ def test_open_daily_run_retry_after_takeover_collides_raises_concurrent():
             started_at=stale_started,
             run_id="old-run",
             machine_id="laptop-A",
+            status="running",
+            connections_sent=0,
+            messages_sent=0,
+            visits_sent=0,
         )
     ]
     crm.update_object_record.return_value = _record("any")
@@ -636,11 +682,14 @@ def test_open_daily_run_collision_chains_vendor_error():
     vendor error body is preserved for forensics (was `from None`)."""
     crm = MagicMock()
     crm.create_object_record.side_effect = _uniqueness_conflict()
-    crm.query_object_records.return_value = [
-        _record(
-            "rec_other", hostname="laptop-B",
-            started_at="2026-05-21T10:00:00Z", run_id="other",
-        )
+    crm.query_object_records.side_effect = [
+        [],  # pre-open same-day scan
+        [
+            _record(
+                "rec_other", hostname="laptop-B",
+                started_at="2026-05-21T10:00:00Z", run_id="other",
+            )
+        ],  # collision forensics query
     ]
     with (
         pytest.raises(ConcurrentRunInAttio) as excinfo,
@@ -648,6 +697,107 @@ def test_open_daily_run_collision_chains_vendor_error():
     ):
         pass
     assert isinstance(excinfo.value.__cause__, UniquenessConflictError)
+
+
+# ── Aborted-then-retried day: counter seeding (2026-06-10 incident) ─────────
+
+
+def _prior_day_row(
+    record_id: str = "rec_prior",
+    status: str = "aborted",
+    connections_sent: int = 0,
+    messages_sent: int = 0,
+    visits_sent: int = 0,
+) -> Record:
+    return _record(
+        record_id,
+        status=status,
+        started_at="2026-06-10T08:00:00Z",
+        machine_id="laptop-A",
+        connections_sent=connections_sent,
+        messages_sent=messages_sent,
+        visits_sent=visits_sent,
+    )
+
+
+def test_open_daily_run_seeds_counters_from_prior_same_day_rows(mock_crm, capsys):
+    """A retried `daily` after an abort: the released-key close freed the
+    2-part lock, so the retry creates a SECOND row with 0/0/0 counters in
+    the CRM. The pre-open scan must seed the new run's in-memory counters
+    from the prior rows' sums so the caps continue at N/25, N/30 — not
+    restart at 0 (the daily-path half of the 2026-06-10 multi-row
+    incident). A WARN announces the seeding."""
+    mock_crm.query_object_records.return_value = [
+        _prior_day_row(connections_sent=22, messages_sent=5),
+    ]
+    mock_crm.create_object_record.return_value = _record("rec_retry")
+    with open_daily_run(mock_crm, run_id="retry-run", machine_id="laptop-A") as run:
+        assert run.remaining("connections") == MAX_CONNECTIONS_PER_DAY - 22
+        assert run.remaining("messages") == MAX_MESSAGES_PER_DAY - 5
+        assert run.remaining("visits") == MAX_VISITS_PER_DAY
+    stderr = capsys.readouterr().err
+    assert "WARN" in stderr
+    assert "cannot reset" in stderr
+
+
+def test_open_daily_run_seeds_sum_across_multiple_prior_rows(mock_crm):
+    """Two prior rows (failed mid-send, then aborted retry) → the seed is
+    their SUM, the fail-safe direction for the caps."""
+    mock_crm.query_object_records.return_value = [
+        _prior_day_row(record_id="rec_a", status="failed", connections_sent=10),
+        _prior_day_row(record_id="rec_b", status="aborted", connections_sent=4),
+    ]
+    mock_crm.create_object_record.return_value = _record("rec_retry")
+    with open_daily_run(mock_crm, run_id="retry-run", machine_id="laptop-A") as run:
+        assert run.remaining("connections") == MAX_CONNECTIONS_PER_DAY - 14
+
+
+def test_open_daily_run_seeded_baseline_not_persisted_to_new_row(mock_crm):
+    """Row independence: the baseline inherited from prior same-day rows
+    counts against the caps but must NEVER be written into the new row's
+    counters. If it were, the prior rows' sends would be double-counted by
+    every later cross-row sum (attach merges and the weekly outreach-volume
+    report), compounding once per retry."""
+    mock_crm.query_object_records.return_value = [
+        _prior_day_row(connections_sent=22),
+    ]
+    mock_crm.create_object_record.return_value = _record("rec_retry")
+    with open_daily_run(mock_crm, run_id="retry-run", machine_id="laptop-A") as run:
+        run.record_send("connections", 3)
+        # Cap math: 22 baseline + 3 own.
+        assert run.remaining("connections") == MAX_CONNECTIONS_PER_DAY - 25
+    # The counter write carries own 3, NOT the seeded 25.
+    counter_values = mock_crm.update_object_record.call_args_list[0][0][2]
+    assert counter_values["connections_sent"] == 3
+    # The create also wrote 0s (the row's own ledger starts empty).
+    create_values = mock_crm.create_object_record.call_args[0][1]
+    assert create_values["connections_sent"] == 0
+
+
+def test_query_todays_rows_fails_closed_at_fetch_limit(mock_crm):
+    """A response at the fetch limit may be truncated; a truncated merge
+    would silently UNDERcount the caps — the one direction the strict rule
+    forbids. Fail closed instead of proceeding."""
+    from workflows.daily_run import _MAX_SAME_DAY_ROWS, query_todays_rows
+
+    mock_crm.query_object_records.return_value = [
+        _prior_day_row(record_id=f"rec_{i}") for i in range(_MAX_SAME_DAY_ROWS)
+    ]
+    with pytest.raises(RuntimeError, match="undercount"):
+        query_todays_rows(mock_crm, "2026-06-10", "laptop-A")
+
+
+def test_open_daily_run_malformed_prior_counter_fails_closed(mock_crm):
+    """A prior same-day row with a missing counter raises
+    MalformedDailyRunRow BEFORE the create — defaulting it to 0 would
+    silently re-open spent headroom, the exact breach the strict-counter
+    rule exists to prevent. No new row is created."""
+    bad = _prior_day_row(record_id="rec_bad")
+    del bad.attributes["messages_sent"]
+    mock_crm.query_object_records.return_value = [bad]
+    with pytest.raises(MalformedDailyRunRow), open_daily_run(mock_crm, run_id="retry-run", machine_id="laptop-A"):
+        pytest.fail("body must not execute when a prior counter is malformed")
+    mock_crm.create_object_record.assert_not_called()
 
 
 # ── Parametrized lease counter tests for connections/visits kinds ─────────────
