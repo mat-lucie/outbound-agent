@@ -837,3 +837,255 @@ class TestPersonaUpgradeOnCrossSearchMatch:
             "midmarket tag must survive a later enterprise match"
         assert summary.get("persona_upgraded_to_midmarket", 0) == 0
         assert summary["duplicates"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Supply-visibility (2026-06-16 root cause): distinguish net-new prospects
+# from re-stamps of records already in the pipeline, bust PB dedup on the
+# weekly scrape, and skip already-listed records via an authoritative
+# canonical-URL set BEFORE the eventual-consistent live search.
+#
+# Ported from upstream lucie-sales-agent #202 (d95d7b4) and adapted to the
+# fork's CRMProvider seam: _commit_prospect / _process_prospects take a
+# provider (wrapped via _crm), and the in-list URL set is resolved through
+# the provider contract (bulk_fetch_persons + extract_person_info).
+# ---------------------------------------------------------------------------
+
+
+class TestNetNewSupplyAccounting:
+    """_commit_prospect must classify each commit as a genuine net-new entry
+    vs a re-stamp of a record already in the pipeline list, so the weekly
+    summary can surface true supply (a re-stamp adds zero new prospects).
+    """
+
+    def test_commit_of_unlisted_record_counts_as_net_new(self):
+        attio = _make_commit_attio_mock()
+        attio.upsert_person.return_value = {"id": {"record_id": "person-NEW"}}
+        summary: dict = {}
+        in_list: set[str] = set()  # person-NEW is NOT already in the list
+
+        result = _commit_prospect(
+            _crm(attio), _PROSPECT_DATA, _RAW_CSV_ROW, _SCORE_RESULT,
+            "list-id", "2026-06-16",
+            in_list_record_ids=in_list, summary=summary,
+        )
+
+        assert result is True
+        assert summary.get("net_new_created") == 1
+        assert summary.get("restamped_existing", 0) == 0
+
+    def test_commit_of_already_listed_record_counts_as_restamp(self):
+        attio = _make_commit_attio_mock()
+        attio.upsert_person.return_value = {"id": {"record_id": "person-OLD"}}
+        summary: dict = {}
+        in_list = {"person-OLD"}  # already in the pipeline → this is a re-stamp
+
+        result = _commit_prospect(
+            _crm(attio), _PROSPECT_DATA, _RAW_CSV_ROW, _SCORE_RESULT,
+            "list-id", "2026-06-16",
+            in_list_record_ids=in_list, summary=summary,
+        )
+
+        assert result is True
+        assert summary.get("restamped_existing") == 1
+        assert summary.get("net_new_created", 0) == 0
+
+    def test_process_prospects_classifies_guard_miss_restamp(self):
+        """When the dedup guard (search_person_by_linkedin) misses an
+        already-listed record, the candidate falls through to _commit_prospect.
+        That commit must be accounted as a re-stamp, NOT net-new supply.
+        """
+        attio = MagicMock()
+        # Guard misses (returns None) even though the record IS in the list.
+        attio.search_person_by_linkedin.return_value = None
+        attio.upsert_person.return_value = {"id": {"record_id": "rec-listed"}}
+        attio.add_list_entry.return_value = None
+        attio.search_company_by_domain.return_value = None
+        attio.search_companies.return_value = []
+        attio.create_company.return_value = {"id": {"record_id": "comp-1"}}
+
+        summary = {
+            "exported": 0, "scored": 0, "qualified": 0, "duplicates": 0,
+            "rejected": 0, "added": 0, "borderline_staged": 0,
+            "reprospect_review": 0,
+        }
+        _process_prospects(
+            [{
+                "fullName": "Already Listed",
+                "title": "Director of Operations",
+                "companyName": "Acme Foods",
+                "location": "Mexico City, Mexico",
+                "companyEmployees": "5000",
+                "defaultProfileUrl": "https://www.linkedin.com/in/already-listed",
+            }],
+            _crm(attio),
+            list_id="list-123",
+            today="2026-06-16",
+            dry_run=False,
+            summary=summary,
+            seen_urls=set(),
+            in_list_record_ids={"rec-listed"},
+            persona_config={"key": "operations_leaders", "enterprise_mode": True},
+            borderline_stage=[],
+            reprospect_review=[],
+        )
+
+        assert summary["added"] == 1            # commit happened
+        assert summary.get("restamped_existing") == 1
+        assert summary.get("net_new_created", 0) == 0
+
+
+class TestWeeklyScrapeCsvNameBust:
+    """The weekly scrape must set a unique per-launch csvName (PR #179 pattern)
+    so PhantomBuster's filename-keyed dedup is busted and the same saved search
+    can re-scrape fresh rows instead of returning a frozen cached set.
+    """
+
+    def test_launch_sets_fresh_csv_name_and_downloads_with_it(self, monkeypatch):
+        from workflows.weekly_prospect import _launch_and_download
+
+        monkeypatch.setenv("PB_LI_SESSION_COOKIE", "cookie-abc")
+
+        pb = MagicMock()
+        launch = MagicMock()
+        pb.launch_agent.return_value = launch
+        pb.download_result_csv.return_value = "firstName,lastName\nA,B\n"
+
+        out = _launch_and_download(pb, "agent-1", "https://linkedin.com/sales/search/x", 100)
+
+        assert out == "firstName,lastName\nA,B\n"
+        launch_args = pb.launch_agent.call_args.args[1]
+        csv_name = launch_args.get("csvName")
+        assert csv_name and csv_name.startswith("wk-")
+        # Same name MUST be passed to the download so the per-launch CSV is fetched.
+        assert pb.download_result_csv.call_args.kwargs.get("csv_name") == csv_name
+
+
+class TestSupplyStarvationAlarm:
+    """The keystone silent-failure fix: a run that qualifies people but sources
+    zero net-new prospects must be detectable (it fires a loud operator alarm).
+    """
+
+    def test_fires_when_qualified_but_zero_net_new(self):
+        from workflows.weekly_prospect import _is_supply_starved
+        summary = {"qualified": 417, "net_new_created": 0, "restamped_existing": 200}
+        assert _is_supply_starved(summary, dry_run=False) is True
+
+    def test_silent_when_some_net_new(self):
+        from workflows.weekly_prospect import _is_supply_starved
+        summary = {"qualified": 417, "net_new_created": 5, "restamped_existing": 200}
+        assert _is_supply_starved(summary, dry_run=False) is False
+
+    def test_silent_when_nothing_qualified(self):
+        from workflows.weekly_prospect import _is_supply_starved
+        summary = {"qualified": 0, "net_new_created": 0}
+        assert _is_supply_starved(summary, dry_run=False) is False
+
+    def test_never_fires_on_dry_run(self):
+        from workflows.weekly_prospect import _is_supply_starved
+        summary = {"qualified": 417, "net_new_created": 0}
+        assert _is_supply_starved(summary, dry_run=True) is False
+
+
+# ---------------------------------------------------------------------------
+# Recycle fix (B): an authoritative canonical-URL dedup so a search miss can no
+# longer let an already-listed record fall through and get re-stamped.
+# ---------------------------------------------------------------------------
+
+
+class TestInListCanonicalUrlSet:
+    def test_builds_from_entry_field_and_bulk_fetch_gap(self):
+        """The set is built from the entry-level canonical_linkedin_url where
+        present, and from the parent person record (via the provider's bulk
+        fetch + extract_person_info) for the legacy entries that lack it."""
+        from clients.crm.base import Entry, Record, RecordInfo
+        from models.pipeline import PipelineStage
+        from workflows.weekly_prospect import _load_in_list_canonical_urls
+
+        entries = [
+            Entry(
+                entry_id="e1", record_id="r1", stage=PipelineStage.PROSPECT,
+                attributes={"canonical_linkedin_url": "https://www.linkedin.com/in/Alice/"},
+            ),
+            Entry(
+                entry_id="e2", record_id="r2", stage=PipelineStage.PROSPECT,
+                attributes={"canonical_linkedin_url": None},
+            ),
+        ]
+
+        bob = Record(record_id="r2", object="people", attributes={})
+        crm = MagicMock()
+        crm.bulk_fetch_persons.return_value = {"r2": bob}
+        crm.extract_person_info.return_value = RecordInfo(
+            name="Bob", company="Co",
+            linkedin_url="https://linkedin.com/in/bob", industry=None, title="",
+        )
+
+        urls = _load_in_list_canonical_urls(crm, entries)
+
+        assert urls == {"https://linkedin.com/in/alice", "https://linkedin.com/in/bob"}
+        # Only the entry lacking a usable URL triggers a person lookup.
+        crm.bulk_fetch_persons.assert_called_once_with({"r2"})
+
+
+class TestCanonicalUrlDedupPrecheck:
+    _PROSPECT = {
+        "fullName": "Already Here",
+        "title": "Director of Operations",
+        "companyName": "Acme Foods",
+        "location": "Mexico City, Mexico",
+        "companyEmployees": "5000",
+        "defaultProfileUrl": "https://www.linkedin.com/in/already-here",
+    }
+
+    def _summary(self):
+        return {
+            "exported": 0, "scored": 0, "qualified": 0, "duplicates": 0,
+            "rejected": 0, "added": 0, "borderline_staged": 0,
+            "reprospect_review": 0, "rejected_by_path": {},
+        }
+
+    def test_match_skips_before_live_search(self):
+        from workflows.weekly_prospect import _canonical_linkedin_url
+        attio = MagicMock()
+        canonical = _canonical_linkedin_url(self._PROSPECT["defaultProfileUrl"])
+
+        summary = self._summary()
+        _process_prospects(
+            [self._PROSPECT], _crm(attio), list_id="l", today="2026-06-17",
+            dry_run=False, summary=summary, seen_urls=set(),
+            in_list_record_ids=set(),
+            persona_config={"key": "operations_leaders", "enterprise_mode": True},
+            borderline_stage=[], reprospect_review=[],
+            in_list_canonical_urls={canonical},
+        )
+
+        # The whole point: the flaky live search is never reached for an
+        # already-listed URL, so it cannot miss and recycle the record.
+        attio.search_person_by_linkedin.assert_not_called()
+        attio.add_list_entry.assert_not_called()
+        assert summary["duplicates"] == 1
+        assert summary["added"] == 0
+
+    def test_non_match_proceeds_to_commit(self):
+        attio = MagicMock()
+        attio.search_person_by_linkedin.return_value = None
+        attio.upsert_person.return_value = {"id": {"record_id": "new-1"}}
+        attio.add_list_entry.return_value = None
+        attio.search_company_by_domain.return_value = None
+        attio.search_companies.return_value = []
+        attio.create_company.return_value = {"id": {"record_id": "c1"}}
+
+        summary = self._summary()
+        _process_prospects(
+            [self._PROSPECT], _crm(attio), list_id="l", today="2026-06-17",
+            dry_run=False, summary=summary, seen_urls=set(),
+            in_list_record_ids=set(),
+            persona_config={"key": "operations_leaders", "enterprise_mode": True},
+            borderline_stage=[], reprospect_review=[],
+            in_list_canonical_urls={"https://linkedin.com/in/someone-else"},
+        )
+
+        attio.search_person_by_linkedin.assert_called_once()
+        assert summary["added"] == 1
+        assert summary["duplicates"] == 0
