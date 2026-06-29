@@ -644,9 +644,13 @@ def compute_outreach_volume(
     d = window_start
     while d <= window_end:
         day_str = d.isoformat()
-        # limit 50 >> realistic machine count per day — the
-        # (run_date, machine_id) uniqueness constraint means one row
-        # per machine, and the fleet is typically 1-2 machines.
+        # limit 50 >> realistic row count per day: one row per machine
+        # per ATTEMPT — aborted-then-retried days legitimately carry
+        # duplicates (see daily_run.query_todays_rows), and each row
+        # records only its own sends (sibling baselines are never
+        # persisted), so summing them double-counts nothing. The
+        # abandoned-row skip below predates that invariant and
+        # undercounts takeover days that recorded sends before crashing.
         rows = crm.query_object_records(
             "daily_run",
             filters={"run_date": day_str},

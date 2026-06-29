@@ -319,6 +319,54 @@ def test_cli_daily_emits_daily_run_collision_and_exits_75():
     "ATTIO_API_KEY": "fake", "PHANTOMBUSTER_API_KEY": "fake",
     "ATTIO_LIST_ID": "list-001",
 })
+def test_cli_daily_malformed_prior_row_exits_75():
+    """CLI daily catches ``MalformedDailyRunRow`` — raisable from
+    open_daily_run's pre-open same-day scan when a prior duplicate row has
+    a corrupt counter (multi-row incident guard) — and exits EX_TEMPFAIL
+    (75) so launchd keeps its retry/backoff semantics, instead of dying
+    with a raw traceback and exit 1."""
+    from workflows.daily_run import MalformedDailyRunRow
+
+    runner = CliRunner()
+
+    with patch("workflows.run_lock.acquire_run_lock") as mock_lock, \
+         patch("workflows.audit.AuditLogger") as mock_audit, \
+         patch("clients.attio.AttioClient") as mock_attio_cls, \
+         patch("clients.phantombuster.PhantomBusterClient") as mock_pb_cls, \
+         patch("workflows.daily_run.open_daily_run") as mock_open_dr, \
+         patch("workflows.record_cache.preload_pipeline_persons", return_value=0), \
+         patch("workflows.record_cache.RecordCache"):
+        mock_lock.return_value.__enter__ = lambda self: None
+        mock_lock.return_value.__exit__ = lambda self, *a: None
+        mock_audit.return_value.__enter__ = lambda self: MagicMock()
+        mock_audit.return_value.__exit__ = lambda self, *a: None
+
+        attio_instance = MagicMock()
+        attio_instance.query_list_entries.return_value = []
+        mock_attio_cls.return_value.__enter__ = lambda self: attio_instance
+        mock_attio_cls.return_value.__exit__ = lambda self, *a: None
+        mock_pb_cls.return_value.__enter__ = lambda self: MagicMock()
+        mock_pb_cls.return_value.__exit__ = lambda self, *a: None
+
+        cm = MagicMock()
+        cm.__enter__.side_effect = MalformedDailyRunRow("messages_sent", "rec_bad")
+        cm.__exit__.return_value = False
+        mock_open_dr.return_value = cm
+
+        from cli import cli
+        result = runner.invoke(cli, ["daily", "--yes"], catch_exceptions=False)
+
+    assert result.exit_code == 75, (
+        f"expected exit 75 (EX_TEMPFAIL), got {result.exit_code}; "
+        f"output={result.output!r}"
+    )
+    assert "REFUSE" in result.output
+
+
+@patch.dict("os.environ", {
+    "ATTIO_API_KEY": "fake", "PHANTOMBUSTER_API_KEY": "fake",
+    "ATTIO_LIST_ID": "list-001",
+})
 def test_cli_daily_dry_run_skips_daily_run_open():
     """Dry-run mode should not touch Attio's daily_run uniqueness key —
     the dry-run is purely exploratory and burning a uniqueness slot

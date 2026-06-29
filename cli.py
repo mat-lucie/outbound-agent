@@ -169,6 +169,7 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
     from workflows.daily_run import (
         ConcurrentRunInAttio,
         DailyRun,
+        MalformedDailyRunRow,
         open_daily_run,
     )
     from workflows.detect_responses import NoCSVHalt, detect_responses
@@ -652,6 +653,18 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                     click.echo(f"Connections sent: {conn_result.get('sent', 0)}")
                     total_dms = dm_result.get("dm1", 0) + dm_result.get("dm2", 0) + dm_result.get("dm3", 0)
                     click.echo(f"DMs sent: {total_dms}")
+            except MalformedDailyRunRow as exc:
+                # The pre-open same-day scan (multi-row incident guard)
+                # fails closed on a prior row with a corrupt counter.
+                # EXIT_TEMPFAIL keeps launchd's retry/backoff semantics;
+                # the WARN + this message are the operator's signal to fix
+                # or archive the bad row in the CRM.
+                click.echo(
+                    f"  ⚠ REFUSE: {exc} Fix or archive the bad daily_run "
+                    f"row in your CRM, then re-run. Exiting EX_TEMPFAIL (75).",
+                    err=True,
+                )
+                raise SystemExit(EXIT_TEMPFAIL) from exc
             except ConcurrentRunInAttio as exc:
                 # PR-17 fold-in (engineer-QA IMPORTANT): use exc.run_date,
                 # not today.isoformat(). The exception carries the exact

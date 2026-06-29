@@ -68,7 +68,6 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 
-import click
 import httpx
 
 from clients.crm.exceptions import UniquenessConflictError
@@ -227,6 +226,7 @@ class DailyRun:
         machine_id: str,
         run_id: str,
         initial_counters: dict[SendKind, int],
+        baseline_counters: dict[SendKind, int] | None = None,
     ) -> None:
         self._crm = crm
         self.record_id = record_id
@@ -234,6 +234,15 @@ class DailyRun:
         self.machine_id = machine_id
         self.run_id = run_id
         self._counters: dict[SendKind, int] = dict(initial_counters)
+        # Sends recorded by OTHER same-day rows (aborted-then-retried days
+        # leave duplicates — see query_todays_rows). The baseline counts
+        # against the caps in remaining() but is NEVER persisted by
+        # _patch_counters: each row keeps only its own sends, so summing
+        # rows stays exact (no double-count) for attach merges and the
+        # weekly outreach-volume report alike.
+        self._baseline: dict[SendKind, int] = dict(
+            baseline_counters or {kind: 0 for kind in _KIND_TO_ATTR}
+        )
         # Reservations are process-local. A crash drops them on the floor
         # and the on-disk counters stay where they were — that's the
         # deliberate B-SD-006 trade-off (under-count over double-count).
@@ -249,11 +258,18 @@ class DailyRun:
     def remaining(self, kind: SendKind) -> int:
         """How many more of `kind` we can send today, accounting for
         confirmed-AND-reserved (treats reservations as already-spent
-        so callers don't over-commit while a parallel send is in flight)."""
+        so callers don't over-commit while a parallel send is in flight)
+        plus the baseline recorded by other same-day rows."""
         reserved = sum(
             lease.count for lease in self._reservations.values() if lease.kind == kind
         )
-        return max(0, _KIND_TO_CAP[kind] - self._counters[kind] - reserved)
+        return max(
+            0,
+            _KIND_TO_CAP[kind]
+            - self._baseline[kind]
+            - self._counters[kind]
+            - reserved,
+        )
 
     def can_send(self, kind: SendKind, count: int = 1) -> bool:
         return self.remaining(kind) >= count
@@ -521,6 +537,30 @@ def open_daily_run(
     date_str = actual_date.isoformat()
     key = _uniqueness_key(date_str, actual_machine)
 
+    # Pre-open scan: a retried day already has prior rows (terminal rows
+    # whose released keys freed the 2-part lock, or a stale running row
+    # about to be taken over), so the create below adds an EXTRA row. The
+    # prior rows' counters become this run's BASELINE: they count against
+    # today's caps in remaining() but are never written into the new row,
+    # so each row keeps only its own sends and cross-row sums stay exact
+    # (the daily-path half of the 2026-06-10 multi-row incident). A
+    # malformed counter on a prior row fails closed (MalformedDailyRunRow)
+    # BEFORE any row is created — same rule as attach_daily_run.
+    prior_rows = query_todays_rows(crm, date_str, actual_machine)
+    baseline_counters = _merged_counters(prior_rows)
+    if prior_rows:
+        print(
+            f"WARN: {len(prior_rows)} prior daily_run row(s) already exist "
+            f"for {date_str!r}/{actual_machine!r}: "
+            f"[{_rows_summary(prior_rows)}]. Their counters count against "
+            f"today's caps as a baseline "
+            f"(connections={baseline_counters['connections']}, "
+            f"messages={baseline_counters['messages']}, "
+            f"visits={baseline_counters['visits']}) so the daily caps "
+            f"cannot reset. Investigate and archive the stray rows.",
+            file=sys.stderr,
+        )
+
     values = {
         "run_id": run_id,
         "run_date": date_str,
@@ -573,6 +613,7 @@ def open_daily_run(
         machine_id=actual_machine,
         run_id=run_id,
         initial_counters={"connections": 0, "messages": 0, "visits": 0},
+        baseline_counters=baseline_counters,
     )
     try:
         yield run
@@ -782,61 +823,176 @@ def _strict_counter(attributes: dict, key: str, record_id: str) -> int:
         raise MalformedDailyRunRow(key, record_id) from None
 
 
-def query_todays_row(
+# When more than one daily_run row exists for the same (run_date,
+# machine_id) — an aborted-then-retried day: ``_close`` re-keys the aborted
+# row to the released 4-part key, freeing the 2-part running-lock, so the
+# retry's create makes a SECOND row — this priority picks which row to bind.
+# running first (it holds the 2-part lock; reopening any OTHER row would
+# collide against it), then completed (closed cleanly; carries the real
+# reply_detection_status), then the failure states.
+_STATUS_PRIORITY = {
+    "running": 0,
+    "completed": 1,
+    "failed": 2,
+    "aborted": 3,
+    "abandoned": 4,
+}
+# Far above any plausible same-day retry count; exists only so the query is
+# bounded. More rows than this on one day is operational chaos the WARN in
+# query_todays_row / open_daily_run would already be screaming about.
+_MAX_SAME_DAY_ROWS = 50
+
+
+def query_todays_rows(
     crm: CRMProvider, run_date: str, machine_id: str
-) -> Record | None:
-    """Return the daily_run row for (run_date, machine_id) regardless of its
-    open/closed/released-key state, or None if none exists.
+) -> list[Record]:
+    """Return ALL daily_run rows for (run_date, machine_id), open or closed.
 
     Filters on the BARE attributes ``run_date`` + ``machine_id`` — NOT the
-    composite ``uniqueness_key`` (which ``_query_existing_row`` uses) because a
-    closed row's key was re-keyed to the released 4-part form on close
-    (``_close`` → ``_released_uniqueness_key``), so a composite-key lookup would
-    report "no row" for a day that was in fact opened and closed by step 1.
-    Returns the normalized :class:`Record` (``object="daily_run"``).
+    composite ``uniqueness_key`` (which ``_query_existing_row`` uses) because
+    a closed row's key was re-keyed to the released 4-part form on close
+    (``_close`` → ``_released_uniqueness_key``), so a composite-key lookup
+    would report "no row" for a day that was in fact opened and closed by
+    step 1. ``filters`` is the vendor-native equality body (the documented
+    filter-shape leak).
 
-    Multiple rows can legitimately share the BARE (run_date, machine_id) pair:
-    only ONE holds the live 2-part uniqueness_key, but same-day re-runs after a
-    close re-key the prior row to the released 4-part form (freeing the bare
-    pair), and a stale-run takeover marks the crashed row ``abandoned`` and
-    opens a fresh one. So the bare query can return several rows. Fetch a small
-    page and choose deterministically: prefer the one whose status reads
-    ``running`` (the live row); otherwise the most recent by ``started_at``.
-    When more than one row matches, emit a loud operator warning naming the
-    chosen record_id so an unexpected duplicate is visible, not silently
-    resolved. ``filters`` is the vendor-native equality body (the documented
-    filter-shape leak)."""
+    Returns a list because the uniqueness constraint does NOT guarantee a
+    single row per day: the released-key escape hatch frees the 2-part
+    running-lock on every close, so an aborted-then-retried day legitimately
+    accumulates multiple rows (2026-06-10 incident). Callers must pick
+    deterministically (``_select_canonical_row``) and merge counters
+    (``_merged_counters``) — never ``rows[0]``."""
     rows = crm.query_object_records(
         "daily_run",
         filters={"run_date": run_date, "machine_id": machine_id},
-        limit=10,
+        limit=_MAX_SAME_DAY_ROWS,
     )
-    if not rows:
-        return None
-    if len(rows) == 1:
-        return rows[0]
+    if len(rows) >= _MAX_SAME_DAY_ROWS:
+        # A truncated page would silently UNDERcount the counter merge —
+        # the one direction the strict-counter rule forbids. Fail closed.
+        raise RuntimeError(
+            f"daily_run query for {run_date!r}/{machine_id!r} returned "
+            f"{len(rows)} rows — at the {_MAX_SAME_DAY_ROWS}-row fetch "
+            f"limit, so rows may be missing and the cap merge would "
+            f"undercount. Refusing to proceed; investigate the runaway "
+            f"duplicate rows."
+        )
+    return rows
 
-    # Multiple rows: prefer a "running" row, else the most recent by started_at.
-    running = [r for r in rows if _first_select(r.attributes, "status") == "running"]
-    if running:
-        # If multiple "running" rows exist (a real anomaly), still pick the most
-        # recent so the choice is deterministic.
-        chosen = max(running, key=lambda r: _attr_text(r.attributes, "started_at"))
-    else:
-        chosen = max(rows, key=lambda r: _attr_text(r.attributes, "started_at"))
-    click.echo(
-        f"⚠ WARNING: {len(rows)} daily_run rows matched "
-        f"(run_date={run_date!r}, machine_id={machine_id!r}); "
-        f"attaching to record_id={chosen.record_id!r} "
-        f"(status={_first_select(chosen.attributes, 'status')!r}, "
-        f"started_at={_attr_text(chosen.attributes, 'started_at')!r}). "
-        f"Inspect the others for a stale takeover or a same-day re-run.",
-        err=True,
+
+def _row_status(row: Record) -> str:
+    return _first_select(row.attributes, "status")
+
+
+def _started_at_utc(row: Record) -> datetime:
+    """Parse a row's started_at for sorting; the epoch-min sentinel for
+    absent/unparseable values so they lose every most-recent tie-break.
+
+    Parsed (not string-compared) because ISO renderings with mixed ``Z`` /
+    ``+00:00`` suffixes or differing precision do not order correctly as
+    text. Mirrors ``_is_stale_same_machine``'s normalization."""
+    raw = _attr_text(row.attributes, "started_at")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=UTC)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _select_canonical_row(rows: list[Record]) -> Record:
+    """Deterministically pick the row to bind among same-day duplicates.
+
+    Order: status priority (``_STATUS_PRIORITY``; unknown statuses last),
+    then most-recent ``started_at``, then ``record_id`` — so every process
+    picks the SAME row regardless of the CRM's return order. The 2026-06-10
+    incident was exactly this pick being arbitrary: ``send-dms`` bound the
+    aborted zero-counter row instead of the completed one and refused to
+    send on its empty reply_detection_status."""
+    return max(
+        rows,
+        key=lambda r: (
+            -_STATUS_PRIORITY.get(_row_status(r), len(_STATUS_PRIORITY)),
+            _started_at_utc(r),
+            r.record_id,
+        ),
     )
+
+
+def _rows_summary(rows: list[Record]) -> str:
+    return ", ".join(
+        f"{r.record_id or '?'}(status={_row_status(r) or '?'})" for r in rows
+    )
+
+
+def _warn_same_day_duplicates(
+    rows: list[Record], run_date: str, machine_id: str, chosen: Record
+) -> None:
+    print(
+        f"WARN: {len(rows)} daily_run rows exist for {run_date!r}/"
+        f"{machine_id!r} — an aborted-then-retried day leaves duplicates "
+        f"because the released-key close frees the 2-part lock: "
+        f"[{_rows_summary(rows)}]. Binding {chosen.record_id!r} "
+        f"(status={_row_status(chosen)!r}); the other rows' counters count "
+        f"against today's caps as a baseline, so the daily caps cannot "
+        f"reset. Investigate and archive the stray rows.",
+        file=sys.stderr,
+    )
+
+
+def _canonical_row_with_warn(
+    rows: list[Record], run_date: str, machine_id: str
+) -> Record:
+    """Pick the canonical row from a non-empty same-day list, WARNing
+    loudly when duplicates exist. Shared by ``query_todays_row`` and
+    ``attach_daily_run`` so the pick-and-warn contract cannot drift."""
+    chosen = _select_canonical_row(rows)
+    if len(rows) > 1:
+        _warn_same_day_duplicates(rows, run_date, machine_id, chosen)
     return chosen
 
 
-def _attach_from_row(crm: CRMProvider, run_id: str, row: Record) -> DailyRun:
+def query_todays_row(
+    crm: CRMProvider, run_date: str, machine_id: str
+) -> Record | None:
+    """Return THE daily_run row for (run_date, machine_id) regardless of its
+    open/closed/released-key state, or None if none exists.
+
+    When the day has accumulated multiple rows (aborted-then-retried — see
+    ``query_todays_rows``), the pick is deterministic via
+    ``_select_canonical_row`` and a loud stderr WARN lists every duplicate.
+    Returns the normalized :class:`Record` (``object="daily_run"``)."""
+    rows = query_todays_rows(crm, run_date, machine_id)
+    if not rows:
+        return None
+    return _canonical_row_with_warn(rows, run_date, machine_id)
+
+
+def _merged_counters(rows: list[Record]) -> dict[SendKind, int]:
+    """Sum each capacity counter across the given same-day rows (strict
+    parse). Zeros for an empty list.
+
+    Each run records ONLY its own sends to its own row (the baseline a run
+    inherits from siblings is never persisted — see ``DailyRun._baseline``),
+    so rows are independent and the sum is today's true total. Binding any
+    one row with only its own counters would silently restart the caps at
+    0/N — the latent cap breach behind the 2026-06-10 incident. Any
+    malformed counter on any row raises ``MalformedDailyRunRow`` (fail
+    closed), same as the single-row path."""
+    merged: dict[SendKind, int] = {kind: 0 for kind in _KIND_TO_ATTR}
+    for row in rows:
+        for kind, attr in _KIND_TO_ATTR.items():
+            merged[kind] += _strict_counter(row.attributes, attr, row.record_id)
+    return merged
+
+
+def _attach_from_row(
+    crm: CRMProvider,
+    run_id: str,
+    row: Record,
+    all_rows: list[Record],
+) -> DailyRun:
     """Build a DailyRun bound to an EXISTING fetched row, rehydrating both the
     capacity counters and the reply-detection status.
 
@@ -847,12 +1003,21 @@ def _attach_from_row(crm: CRMProvider, run_id: str, row: Record) -> DailyRun:
     persisted ``messages_sent`` / ``connections_sent`` / ``visits_sent`` so
     ``remaining("messages") == 30 - N``.
 
-    Counters are read via the STRICT ``_strict_counter`` path: a missing / null /
-    non-numeric counter on an existing row is a malformed response and raises
+    ``all_rows`` (the full same-day list — duplicates appear on aborted-
+    then-retried days, see ``query_todays_rows``) extends the same guard
+    across rows: the SIBLING rows' counters become the run's baseline
+    (``DailyRun._baseline``), counting against the caps without ever being
+    written into the bound row. Each row keeps only its own sends, so
+    binding the "wrong" duplicate can never restart the caps at 0/N and
+    repeated attaches never double-count.
+
+    Counters are read via the STRICT ``_strict_counter`` path: a missing /
+    null / non-numeric counter on any row is a malformed response and raises
     ``MalformedDailyRunRow`` (fail closed) rather than defaulting to 0. A present
     ``0`` is valid."""
     attrs = row.attributes
     record_id = row.record_id
+    siblings = [r for r in all_rows if r.record_id != record_id]
     run = DailyRun(
         crm=crm,
         record_id=record_id,
@@ -860,10 +1025,10 @@ def _attach_from_row(crm: CRMProvider, run_id: str, row: Record) -> DailyRun:
         machine_id=_attr_text(attrs, "machine_id"),
         run_id=run_id,
         initial_counters={
-            "connections": _strict_counter(attrs, "connections_sent", record_id),
-            "messages": _strict_counter(attrs, "messages_sent", record_id),
-            "visits": _strict_counter(attrs, "visits_sent", record_id),
+            kind: _strict_counter(attrs, attr, record_id)
+            for kind, attr in _KIND_TO_ATTR.items()
         },
+        baseline_counters=_merged_counters(siblings),
     )
     # Rehydrate the reply-detection status into the in-memory field that
     # get_reply_detection_status() (and the send-dms guard) reads. "" → None.
@@ -887,13 +1052,17 @@ def attach_daily_run(
 
     Component 2 state-machine (spec, follow exactly):
       1. (Caller holds the sales-daily flock — same lock `daily` uses.)
-      2. Query today's row on the BARE (run_date, machine_id) attrs. None →
-         NoDailyRunRow (caller exits EX_TEMPFAIL).
+      2. Query today's rows on the BARE (run_date, machine_id) attrs. None →
+         NoDailyRunRow (caller exits EX_TEMPFAIL). Multiple rows (aborted-
+         then-retried day) → bind the canonical one (_select_canonical_row,
+         loud WARN) and merge counters across ALL rows so the caps never
+         reset (2026-06-10 incident fix).
       3. Build the DailyRun via _attach_from_row (rehydrates counters + reply
-         status) FIRST — this strict-parses the counters and raises
-         MalformedDailyRunRow BEFORE any reopen write. Ordering matters: a
-         malformed terminal row must NOT be flipped to running (which would
-         leave it holding the lock) only to then fail the rehydrate.
+         status) FIRST — this strict-parses the counters (own row + siblings)
+         and raises MalformedDailyRunRow BEFORE any reopen write. Ordering
+         matters: a malformed terminal row must NOT be flipped to running
+         (which would leave it holding the lock) only to then fail the
+         rehydrate.
       4. status == "running" (step 1 crashed before close) → reattach as-is,
          do NOT re-key.
       5. status in {completed, failed, aborted} → write {status: running,
@@ -913,18 +1082,20 @@ def attach_daily_run(
     actual_machine = derive_machine_id(machine_id)
     date_str = actual_date.isoformat()
 
-    row = query_todays_row(crm, date_str, actual_machine)
-    if row is None:
+    rows = query_todays_rows(crm, date_str, actual_machine)
+    if not rows:
         raise NoDailyRunRow(date_str, actual_machine)
+    row = _canonical_row_with_warn(rows, date_str, actual_machine)
 
     record_id = row.record_id
     # status is a SELECT attr — read via _first_select so a "running" row is
     # recognised and NOT needlessly reopened.
     prior_status = _first_select(row.attributes, "status")
 
-    # Validate / rehydrate FIRST: strict counter parse raises before any write,
-    # so a malformed terminal row never gets flipped to "running" and stranded.
-    run = _attach_from_row(crm, run_id, row)
+    # Validate / rehydrate FIRST: strict counter parse (own row + siblings)
+    # raises before any write, so a malformed terminal row never gets flipped
+    # to "running" and stranded holding the 2-part lock with no close path.
+    run = _attach_from_row(crm, run_id, row, all_rows=rows)
 
     if read_only:
         # Snapshot attach: no reopen, no close — never rewrite a terminal row.
@@ -1004,5 +1175,6 @@ __all__ = [
     "derive_machine_id",
     "open_daily_run",
     "query_todays_row",
+    "query_todays_rows",
     "record_send",
 ]
