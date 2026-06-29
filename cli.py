@@ -1433,6 +1433,14 @@ def repair_companies_cmd(detect_csv, profile_scraper_id, dry_run):
         click.echo(f"Would repair {len(rows)} records:")
         for row in rows:
             click.echo(f"  {row['name']} — currently: {row.get('current_wrong_company', '?')}")
+        from workflows.backfill_companies import REPAIR_MAX_PROFILES_PER_LAUNCH
+        if len(rows) > REPAIR_MAX_PROFILES_PER_LAUNCH:
+            click.echo(
+                f"\nNote: the wet run scrapes at most "
+                f"{REPAIR_MAX_PROFILES_PER_LAUNCH} profiles per launch — "
+                f"{len(rows) - REPAIR_MAX_PROFILES_PER_LAUNCH} row(s) would be "
+                f"deferred to a follow-up detect/repair cycle."
+            )
         return
 
     with _attio_client() as attio, PhantomBusterClient() as pb:
@@ -1440,6 +1448,11 @@ def repair_companies_cmd(detect_csv, profile_scraper_id, dry_run):
 
     click.echo("\n=== Repair Complete ===")
     click.echo(f"Linked: {summary['linked']}, Failed: {summary['failed']}, Skipped: {summary['skipped']}")
+    if summary.get("deferred"):
+        click.echo(
+            f"Deferred: {summary['deferred']} row(s) beyond the per-launch scrape "
+            f"cap — re-run detect-bad-companies, then repair-companies again."
+        )
 
 
 @cli.command("detect-deal-dupes")
