@@ -10,6 +10,11 @@ Fold-in (post-QA convergence) additions:
   * Integration test for `_process_prospects` dispatch + observability
   * Broadened static regex regression guard catching ternary else-branches
   * Tightened corpus floor + `state_owned_wins` category requirement
+
+Sixth family `disqualifier_consulting` (consulting / professional-services
+firms + consulting-coded titles): consultancies are typically out of ICP for
+plant/operations outreach, and the industry classifier can't catch them at
+qualification time.
 """
 
 from __future__ import annotations
@@ -61,13 +66,15 @@ class TestVerdictPathsRegistry:
     def test_disqualifier_subset_is_a_subset_of_verdict_paths(self):
         assert DISQUALIFIER_VERDICT_PATHS.issubset(VERDICT_PATHS)
 
-    def test_five_pr26_slugs_are_registered(self):
+    def test_disqualifier_slugs_are_registered(self):
+        # Five PR-26 families + disqualifier_consulting.
         expected = frozenset({
             "disqualifier_hr",
             "disqualifier_finance",
             "disqualifier_innovation",
             "disqualifier_pe",
             "disqualifier_state_owned",
+            "disqualifier_consulting",
         })
         assert expected == DISQUALIFIER_VERDICT_PATHS
 
@@ -367,6 +374,164 @@ class TestStateOwnedDisqualifier:
         assert result["verdict_path"] == "disqualifier_state_owned"
 
 
+class TestConsultingDisqualifier:
+    """Consulting / professional-services family.
+
+    Consultancies are typically out of ICP for plant/operations outreach —
+    a consultancy MD getting an operations-fit DM is prospect-facing
+    embarrassment, and the industry classifier can't catch them at
+    qualification time.
+    """
+
+    ENTERPRISE_PERSONA = {"key": "operations_leaders", "enterprise_mode": True}
+
+    def test_accenture_md_regression_case(self):
+        # Regression: a consultancy MD with an "Industries Lead" title was
+        # admitted as operations_leaders before this family existed; the
+        # operator had to pull them manually.
+        result = score_prospect(
+            {
+                "name": "Test Person",
+                "title": "Consumer Goods & Services, Retail and Travel Industries Lead",
+                "company": "Accenture",
+                "location": "São Paulo, Brazil",
+                "employee_count": 700000,
+            },
+            persona_config=self.ENTERPRISE_PERSONA,
+        )
+        assert result["pass"] is False
+        assert result["verdict_path"] == "disqualifier_consulting"
+        assert result["disqualifier_keyword"] == "accenture"
+
+    def test_accenture_country_entity_fires(self):
+        assert _slug(_match_disqualifier(
+            "managing director", "accenture brazil"
+        )) == "disqualifier_consulting"
+
+    def test_big_four_and_strategy_firms_fire(self):
+        for company in (
+            "deloitte",
+            "mckinsey & company",
+            "ey brasil",
+            "kpmg méxico",
+            "pwc chile",
+            "capgemini",
+            "boston consulting group",
+        ):
+            assert _slug(_match_disqualifier(
+                "director de operaciones", company
+            )) == "disqualifier_consulting", company
+
+    def test_generic_consulting_company_name_fires(self):
+        assert _slug(_match_disqualifier(
+            "gerente de proyectos", "andina consultores industriales"
+        )) == "disqualifier_consulting"
+
+    def test_ops_title_at_consultancy_still_rejected(self):
+        # Company-based: an ops-titled person AT a consultancy is a
+        # consultant — OPS_OVERRIDE must not bypass company families.
+        assert _slug(_match_disqualifier(
+            "plant manager", "deloitte consulting"
+        )) == "disqualifier_consulting"
+
+    def test_industries_lead_title_fires(self):
+        assert _slug(_match_disqualifier(
+            "consumer goods & services, retail and travel industries lead",
+            "unknown boutique",
+        )) == "disqualifier_consulting"
+
+    def test_practice_lead_title_fires(self):
+        assert _slug(_match_disqualifier(
+            "supply chain practice lead", "boutique andina"
+        )) == "disqualifier_consulting"
+
+    def test_consultant_title_fires(self):
+        assert _slug(_match_disqualifier(
+            "senior management consultant", "indep"
+        )) == "disqualifier_consulting"
+
+    def test_consultor_spanish_title_fires(self):
+        assert _slug(_match_disqualifier(
+            "consultor de mejora continua", "lean partners latam"
+        )) == "disqualifier_consulting"
+
+    def test_glued_ampersand_ey_variants_fire(self):
+        # LinkedIn company fields render the firm as "E&Y" / "Ernst&Young"
+        # too — the spaced forms alone missed them (code-review finding).
+        for company in ("e&y brasil", "ernst&young", "strategy& méxico"):
+            assert _slug(_match_disqualifier(
+                "managing director", company
+            )) == "disqualifier_consulting", company
+
+    def test_dual_hat_title_not_lost_to_ops_bypass(self):
+        # Ordering hole (code-review finding): "hr consultant" wins the
+        # earliest-match pick, the disjoint "plant director" ops phrase
+        # bypasses HR — the bypass-exempt consulting match must then fire
+        # instead of being silently discarded.
+        match = _match_disqualifier(
+            "plant director - hr consultant", "boutique x"
+        )
+        assert match is not None
+        assert match[0] == "disqualifier_consulting"
+        assert match[1] == "consultant"
+
+    def test_ops_bypass_still_clears_titles_without_consulting(self):
+        # The fallback must not weaken the original bypass: a dual-hat
+        # ops/HR title with NO consulting keyword still bypasses.
+        assert _match_disqualifier(
+            "plant manager - hr liaison", "coca-cola femsa"
+        ) is None
+
+    def test_ops_override_does_not_bypass_consulting_title(self):
+        # "director of operations consulting" contains "director of
+        # operations" DISJOINT from "consulting", which the span rule would
+        # bypass. Consulting is exempt: ops + consulting = ops consulting.
+        assert _slug(_match_disqualifier(
+            "director of operations consulting", "boutique andina"
+        )) == "disqualifier_consulting"
+
+    def test_word_boundary_ey_does_not_match_hershey(self):
+        assert _match_disqualifier(
+            "plant director", "the hershey company"
+        ) is None
+
+    def test_word_boundary_ey_does_not_match_monterrey(self):
+        assert _match_disqualifier(
+            "director de operaciones", "cemex monterrey"
+        ) is None
+
+    def test_constructora_does_not_match_consultora(self):
+        assert _match_disqualifier(
+            "director de planta", "constructora del pacífico"
+        ) is None
+
+    def test_bare_lead_title_does_not_fire(self):
+        # "industries lead" is the consulting-speak pattern; a plain ops
+        # "lead" title must not trigger.
+        assert _match_disqualifier(
+            "production lead", "wayne manufacturing"
+        ) is None
+
+    def test_hr_consultant_keeps_hr_slug(self):
+        # Earliest-match dominance preserved: "hr consultant" matches the
+        # HR family at position 0 before "consultant" at position 3.
+        assert _slug(_match_disqualifier(
+            "hr consultant", "soylent foods"
+        )) == "disqualifier_hr"
+
+    def test_score_prospect_stashes_matched_keyword(self):
+        result = score_prospect({
+            "name": "Test Person",
+            "title": "supply chain practice lead",
+            "company": "Boutique Andina",
+            "location": "Lima, Peru",
+            "employee_count": 200,
+        })
+        assert result["pass"] is False
+        assert result["verdict_path"] == "disqualifier_consulting"
+        assert result["disqualifier_keyword"] == "practice lead"
+
+
 # -- OPS_OVERRIDE bypass --------------------------------------------------
 
 
@@ -468,8 +633,8 @@ def test_corpus_sweep_disqualifier_matches_expected():
     rows = _load_corpus()
     # Tightened floor (pr-test-analyzer NIT-4): assert against actual
     # count so a future hand can't silently delete fixture rows.
-    assert len(rows) >= 39, (
-        f"Corpus must have >= 39 labeled rows; got {len(rows)}"
+    assert len(rows) >= 61, (
+        f"Corpus must have >= 61 labeled rows; got {len(rows)}"
     )
     mismatches: list[str] = []
     for row in rows:
@@ -499,6 +664,7 @@ def test_corpus_covers_all_required_categories():
         "ops_override_bypass",
         "no_disqualifier",
         "state_owned_wins",  # prospect-weekly NIT-2 fold
+        "consulting_true_positive",
     }
     missing = required - categories
     assert not missing, f"Corpus missing categories: {missing}"

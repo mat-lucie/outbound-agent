@@ -539,6 +539,76 @@ disqualifiers:
     - state-owned
     - state owned
 
+  # Consulting / professional-services firms (COMPANY-keyed). Acme sells to
+  # manufacturing plants; a consultancy partner getting the operations-fit DM
+  # is prospect-facing embarrassment, and the industry classifier can't catch
+  # them at qualification time (it runs only after a prospect passes, and its
+  # taxonomy has no professional-services label). WORD-BOUNDARY matched (unlike
+  # the state-owned/PE substring lists) so the short brand tokens ("ey", "pwc",
+  # "bcg") can't fire inside unrelated names ("Hershey", "Monterrey"); it still
+  # catches legal-entity variants ("EY Brasil", "Accenture Brazil"). Use whole
+  # words or phrases, never truncated stems.
+  consulting_firm_keywords:
+    - accenture
+    - deloitte
+    - mckinsey
+    - ernst & young
+    - ernst and young
+    - ernst&young
+    - ey
+    - e&y
+    - kpmg
+    - pwc
+    - pricewaterhousecoopers
+    - strategy&
+    - capgemini
+    - bain & company
+    - bain and company
+    - boston consulting
+    - bcg
+    - oliver wyman
+    - roland berger
+    - kearney
+    - alvarez & marsal
+    - alixpartners
+    - tata consultancy
+    - infosys
+    - wipro
+    - cognizant
+    - globant
+    - consulting
+    - consultancy
+    - consultoría
+    - consultoria
+    - consultores
+    - consultora
+    - asesoría
+    - asesoria
+    - asesores
+
+  # Consulting-coded TITLE keywords (TITLE-keyed). Catches consultants at
+  # companies the firm list misses (boutiques, independents, in-house
+  # "Industries Lead" org structures). NOT bypassed by OPS_OVERRIDE — an ops
+  # phrase next to a consulting keyword means ops CONSULTING ("Supply Chain
+  # Consulting Director"): they sell to operators, they don't run operations.
+  # The disjoint-span bypass rule would wrongly admit exactly those titles, so
+  # the matcher short-circuits before the bypass.
+  consulting_title_keywords:
+    - consultant
+    - consulting
+    - consultancy
+    - practice lead
+    - practice leader
+    - practice director
+    - practice manager
+    - industries lead
+    - industry lead
+    - consultor
+    - consultora
+    - consultoría
+    - consultoria
+    - consultores
+
   # OPS_OVERRIDE bypass: title phrases manufacturing-ops-coded enough that an
   # HR/Finance/Innovation match is treated as incidental. Word-boundary matched.
   # Company-based disqualifiers (state-owned, PE) ignore this.

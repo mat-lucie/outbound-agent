@@ -1643,7 +1643,7 @@ def _process_prospects(
                 summary["rejected_by_path"].get(verdict_path, 0) + 1
             )
             # PR-26: open a typed Operator Review Queue row when the rejection
-            # came from one of the five new keyword disqualifiers. The queue
+            # came from one of the keyword disqualifier families. The queue
             # row exists so operators can audit keyword false-positives that
             # OPS_OVERRIDE did NOT bypass — the rejection stands, but the
             # operator now has per-prospect visibility on what fired and why.

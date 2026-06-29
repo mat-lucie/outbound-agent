@@ -209,19 +209,26 @@ JUNIOR_IC_KEYWORDS = _ICP.junior_ic_keywords
 JUNIOR_IC_EXEMPTIONS = _ICP.junior_ic_exemptions
 
 # ── PR-26: Expanded deterministic disqualifiers ──────────────────────
-# Five disqualifier families that the prior Haiku qualifier prompt named but
+# Disqualifier families that the prior Haiku qualifier prompt named but
 # the deterministic scorer let through. Each family fires a typed
 # `disqualifier_match` Operator Review Queue row (workflows/weekly_prospect.py
 # emits) so operators can audit keyword false-positives without losing the
-# rejection. Two families key on COMPANY name (state-owned utilities, PE
-# firms — no OPS_OVERRIDE bypass); three families key on TITLE keywords
-# (HR, Finance, Innovation/R&D — OPS_OVERRIDE bypasses when the title is
-# also manufacturing-ops-coded, e.g. "Plant Manager - HR Liaison").
+# rejection. Company-keyed families (state-owned utilities, PE firms,
+# consulting firms) get no OPS_OVERRIDE bypass; title-keyed families
+# (HR, Finance, Innovation/R&D — but NOT Consulting, see below) are
+# bypassed by OPS_OVERRIDE when the title is also manufacturing-ops-coded,
+# e.g. "Plant Manager - HR Liaison".
 #
 # Word-boundary match (`_match_any_word`) on TITLE keywords prevents
 # false-positives like "finance" matching "refinance". Company-name
-# checks use substring match (`_match_any`) since legal-entity names vary
-# ("Petróleos Mexicanos" / "Pemex Refinación" both should hit).
+# checks for STATE_OWNED and PE use substring match (`_match_any`) since
+# legal-entity names vary ("Petróleos Mexicanos" / "Pemex Refinación"
+# both should hit). CONSULTING_FIRM_KEYWORDS is the exception: it is
+# word-boundary matched because its short brand tokens ("ey", "pwc",
+# "bcg") would substring-fire inside unrelated names ("Hershey",
+# "Monterrey") — when adding consulting keywords, use whole words or
+# phrases, never truncated stems (a stem like "deloit" can never match
+# in word-boundary mode).
 
 # English compound forms (bare `hr` was removed — it false-matched shift-window
 # titles like "24/7 hr ops planner"). Spanish + Portuguese forms follow.
@@ -247,6 +254,32 @@ PE_KEYWORDS = _ICP.pe_keywords
 # public tender, not cold outreach, so cold messaging is wasted regardless
 # of contact seniority.
 STATE_OWNED_KEYWORDS = _ICP.state_owned_keywords
+
+# Consulting / professional-services firms (COMPANY-keyed). Consultancies are
+# typically out of ICP for plant/operations outreach — a consultancy partner
+# getting the operations-fit DM is prospect-facing embarrassment. The industry
+# classifier can't catch this at qualification time: it only runs after a
+# prospect passes, and its taxonomy has no professional-services label
+# (consultancies fall into "Other").
+#
+# Word-boundary matched (unlike STATE_OWNED/PE substring matching) because the
+# short brand tokens ("ey", "pwc", "bcg") would otherwise fire inside unrelated
+# names ("Hershey", "Monterrey"). Word-boundary still catches legal-entity
+# variants ("EY Brasil", "PwC México", "Accenture Brazil"). Glued-ampersand
+# variants ("E&Y", "Ernst&Young", "strategy&") are matched via the
+# conditional-boundary logic in _find_first_match.
+CONSULTING_FIRM_KEYWORDS = _ICP.consulting_firm_keywords
+
+# Consulting-coded TITLE keywords. Catches consultants at companies the firm
+# list misses (boutiques, independents, in-house "Industries Lead" org
+# structures). NOT bypassed by OPS_OVERRIDE — an ops phrase next to a
+# consulting keyword means ops CONSULTING ("Supply Chain Consulting Director",
+# "Operations Consultant"): they sell to operators, they don't run operations.
+# The disjoint-span bypass rule would wrongly admit exactly those titles, so
+# `_match_disqualifier` short-circuits before the bypass.
+# ("advisor"/"advisory"/"freelance" stay on the soft CONSULTANT_KEYWORDS path —
+# too ambiguous for a hard reject.)
+CONSULTING_TITLE_KEYWORDS = _ICP.consulting_title_keywords
 
 # OPS_OVERRIDE bypass: titles containing any of these are manufacturing-ops
 # coded enough that an HR/Finance/Innovation keyword match is treated as
@@ -290,7 +323,15 @@ def _find_first_match(
     best: tuple[int, int, str] | None = None
     if word_boundary:
         for kw in keywords:
-            pattern = re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE)
+            # `\b` is only a valid anchor next to a word char: `\bstrategy&\b`
+            # can never match "strategy& méxico" because `&\b` demands a word
+            # char after the ampersand. Apply each boundary only when the
+            # keyword's edge is a word char — a no-op for every plain-word
+            # keyword, and the only way edge-symbol keywords ("strategy&")
+            # can match at all.
+            prefix = r"\b" if re.match(r"\w", kw) else ""
+            suffix = r"\b" if re.search(r"\w$", kw) else ""
+            pattern = re.compile(f"{prefix}{re.escape(kw)}{suffix}", re.IGNORECASE)
             m = pattern.search(text)
             if m and (best is None or m.start() < best[0]):
                 best = (m.start(), m.end(), kw)
@@ -306,10 +347,12 @@ def _find_first_match(
 def _match_disqualifier(title_lower: str, company_lower: str) -> tuple[str, str] | None:
     """Return `(verdict_path_slug, matched_keyword)` for this prospect, or None.
 
-    Company-based checks (state-owned, PE) run first and cannot be
-    bypassed by OPS_OVERRIDE — procurement path is deterministic from
-    the company name. Title-based checks (Finance, HR, Innovation)
-    follow, with OPS_OVERRIDE bypass applied position-aware: the bypass
+    Company-based checks (state-owned, PE, consulting firms) run first
+    and cannot be bypassed by OPS_OVERRIDE — procurement path is
+    deterministic from the company name. Title-based checks (Finance,
+    HR, Innovation, Consulting) follow; Consulting is exempt from the
+    bypass (see CONSULTING_TITLE_KEYWORDS). For the other three the
+    OPS_OVERRIDE bypass is applied position-aware: the bypass
     fires ONLY when the matched OPS_OVERRIDE phrase is DISJOINT from
     the matched disqualifier keyword. When they overlap (e.g.
     `director de operaciones financieras` shares "operaciones"), the
@@ -328,7 +371,12 @@ def _match_disqualifier(title_lower: str, company_lower: str) -> tuple[str, str]
     co_pe = _find_first_match(company_lower, PE_KEYWORDS, word_boundary=False)
     if co_pe is not None:
         return ("disqualifier_pe", co_pe[2])
-    # Title-based: pick the EARLIEST match across the three families so
+    # Word-boundary (not substring like the two above) so the short brand
+    # tokens ("ey", "pwc", "bcg") can't fire inside unrelated company names.
+    co_consult = _find_first_match(company_lower, CONSULTING_FIRM_KEYWORDS, word_boundary=True)
+    if co_consult is not None:
+        return ("disqualifier_consulting", co_consult[2])
+    # Title-based: pick the EARLIEST match across the four families so
     # the verdict_path reflects the dominant signal in the title.
     title_matches: list[tuple[str, tuple[int, int, str]]] = []
     fin = _find_first_match(title_lower, FINANCE_KEYWORDS, word_boundary=True)
@@ -340,21 +388,38 @@ def _match_disqualifier(title_lower: str, company_lower: str) -> tuple[str, str]
     innov = _find_first_match(title_lower, INNOVATION_KEYWORDS, word_boundary=True)
     if innov is not None:
         title_matches.append(("disqualifier_innovation", innov))
+    consult = _find_first_match(title_lower, CONSULTING_TITLE_KEYWORDS, word_boundary=True)
+    if consult is not None:
+        title_matches.append(("disqualifier_consulting", consult))
     if not title_matches:
         return None
     slug, (dq_start, dq_end, dq_kw) = min(title_matches, key=lambda x: x[1][0])
+    # Consulting is exempt from OPS_OVERRIDE: an ops phrase alongside a
+    # consulting keyword means ops CONSULTING ("Supply Chain Consulting
+    # Director") — the disjoint-span rule below would wrongly bypass it.
+    if slug == "disqualifier_consulting":
+        return (slug, dq_kw)
     # OPS_OVERRIDE position-aware bypass.
     ops = _find_first_match(title_lower, OPS_OVERRIDE_KEYWORDS, word_boundary=True)
     if ops is not None:
         ops_start, ops_end, _ = ops
         disjoint = (ops_end <= dq_start) or (dq_end <= ops_start)
         if disjoint:
+            # The bypass clears the BYPASSABLE families only. A consulting
+            # match elsewhere in the title is exempt and must still fire:
+            # in "Plant Director - HR Consultant" the earliest-match pick
+            # is HR, the ops phrase bypasses HR — but the title is still a
+            # consultant's. Without this fallback the consulting signal was
+            # silently discarded whenever another family matched earlier.
+            for c_slug, (_, _, c_kw) in title_matches:
+                if c_slug == "disqualifier_consulting":
+                    return (c_slug, c_kw)
             return None
     return (slug, dq_kw)
 
 
 # Canonical registry of every `verdict_path` value `score_prospect` may
-# assign to its result. PR-26 adds the five `disqualifier_*` slugs; the
+# assign to its result. PR-26 adds the `disqualifier_*` slugs (six families); the
 # rest were already in use (just inline as string literals).
 # `tests/test_pr26_disqualifiers.py::test_score_prospect_verdict_paths_in_registry`
 # enforces that any future addition shows up here so the set stays
@@ -369,12 +434,13 @@ VERDICT_PATHS: frozenset[str] = frozenset({
     "borderline_reject",
     "borderline_llm_error",
     "borderline_cost_exhausted",
-    # PR-26 disqualifiers
+    # PR-26 disqualifiers (+ consulting)
     "disqualifier_hr",
     "disqualifier_finance",
     "disqualifier_innovation",
     "disqualifier_pe",
     "disqualifier_state_owned",
+    "disqualifier_consulting",
 })
 
 DISQUALIFIER_VERDICT_PATHS: frozenset[str] = frozenset({
@@ -383,6 +449,7 @@ DISQUALIFIER_VERDICT_PATHS: frozenset[str] = frozenset({
     "disqualifier_innovation",
     "disqualifier_pe",
     "disqualifier_state_owned",
+    "disqualifier_consulting",
 })
 
 
@@ -1035,12 +1102,13 @@ def score_prospect(
     }
 
     # PR-26: Expanded deterministic disqualifiers (HR/Finance/Innovation/PE/
-    # State-owned). Run BEFORE the sales/junior_ic short-circuits so that a
-    # prospect at e.g. Pemex with title "Sales Director" gets the more
-    # informative `disqualifier_state_owned` verdict (procurement-path is
-    # the actionable signal for the operator; the sales-role overlap is
-    # incidental). Company-based families ignore OPS_OVERRIDE; title-based
-    # families bypass when manufacturing-ops keywords dominate the title.
+    # State-owned, + Consulting). Run BEFORE the sales/junior_ic short-circuits
+    # so that a prospect at a state-owned enterprise with title "Sales Director"
+    # gets the more informative `disqualifier_state_owned` verdict (procurement-
+    # path is the actionable signal for the operator; the sales-role overlap is
+    # incidental). Company-based families ignore OPS_OVERRIDE; HR/Finance/
+    # Innovation bypass when manufacturing-ops keywords dominate the title;
+    # Consulting is bypass-exempt — see CONSULTING_TITLE_KEYWORDS.
     disqualifier_match = _match_disqualifier(title_lower, company.lower())
 
     # Hybrid gate: deterministic for clear-cut, Haiku for borderline.

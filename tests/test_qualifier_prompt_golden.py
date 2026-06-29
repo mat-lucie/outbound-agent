@@ -71,6 +71,8 @@ _BASE_TOY_YAML = textwrap.dedent(
       innovation_keywords: ["r&d"]
       pe_keywords: ["private equity fund"]
       state_owned_keywords: ["government of"]
+      consulting_firm_keywords: ["accenture"]
+      consulting_title_keywords: ["consultant"]
       ops_override_keywords: ["plant manager"]
     """
 )
@@ -275,6 +277,41 @@ def test_lane_labels_must_be_exactly_two(tmp_path, monkeypatch):
     )
     _write_toy_config(tmp_path, monkeypatch, block)
     with pytest.raises(ConfigError, match="lane_labels"):
+        load_icp_config()
+
+
+def test_missing_consulting_firm_keywords_raises(tmp_path, monkeypatch):
+    """Dropping the required `consulting_firm_keywords` family raises ConfigError.
+
+    The two consulting families are required scoring inputs (loaded with the
+    same `_str_list` validator as the other disqualifier families) — a missing
+    one must fail loud, not silently disable the family.
+    """
+    monkeypatch.delenv("OUTBOUND_CONFIG_DIR", raising=False)
+    body = _BASE_TOY_YAML.replace(
+        '  consulting_firm_keywords: ["accenture"]\n', ""
+    ) + _VALID_QP_BLOCK
+    assert "consulting_firm_keywords" not in body
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "icp.example.yaml").write_text(body, encoding="utf-8")
+    monkeypatch.setenv("OUTBOUND_CONFIG_DIR", str(config_dir))
+    with pytest.raises(ConfigError, match="consulting_firm_keywords"):
+        load_icp_config()
+
+
+def test_missing_consulting_title_keywords_raises(tmp_path, monkeypatch):
+    """Dropping the required `consulting_title_keywords` family raises ConfigError."""
+    monkeypatch.delenv("OUTBOUND_CONFIG_DIR", raising=False)
+    body = _BASE_TOY_YAML.replace(
+        '  consulting_title_keywords: ["consultant"]\n', ""
+    ) + _VALID_QP_BLOCK
+    assert "consulting_title_keywords" not in body
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "icp.example.yaml").write_text(body, encoding="utf-8")
+    monkeypatch.setenv("OUTBOUND_CONFIG_DIR", str(config_dir))
+    with pytest.raises(ConfigError, match="consulting_title_keywords"):
         load_icp_config()
 
 
