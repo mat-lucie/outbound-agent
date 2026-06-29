@@ -578,7 +578,8 @@ class DisqualifierMatchPayload(TypedDict):
     `score_prospect` returns `verdict_path` in
     `DISQUALIFIER_VERDICT_PATHS` (one of `disqualifier_hr`,
     `disqualifier_finance`, `disqualifier_innovation`,
-    `disqualifier_pe`, `disqualifier_state_owned`).
+    `disqualifier_pe`, `disqualifier_state_owned`,
+    `disqualifier_consulting`).
 
     `matched_keyword` is the specific keyword that fired — operators
     audit keyword false-positives without re-running the matcher.

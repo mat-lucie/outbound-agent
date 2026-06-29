@@ -75,6 +75,8 @@ class ICPConfig:
     innovation_keywords: list[str]
     pe_keywords: list[str]
     state_owned_keywords: list[str]
+    consulting_firm_keywords: list[str]
+    consulting_title_keywords: list[str]
     ops_override_keywords: list[str]
 
     # LLM qualifier prompt slots (P2b). The narrative, ICP-specific pieces of
@@ -247,6 +249,8 @@ def load_icp_config() -> ICPConfig:
         innovation_keywords=_str_list(dq, "innovation_keywords", section_name="disqualifiers"),
         pe_keywords=_str_list(dq, "pe_keywords", section_name="disqualifiers"),
         state_owned_keywords=_str_list(dq, "state_owned_keywords", section_name="disqualifiers"),
+        consulting_firm_keywords=_str_list(dq, "consulting_firm_keywords", section_name="disqualifiers"),
+        consulting_title_keywords=_str_list(dq, "consulting_title_keywords", section_name="disqualifiers"),
         ops_override_keywords=_str_list(dq, "ops_override_keywords", section_name="disqualifiers"),
         qualifier_product_summary=_str(qp, "product_summary", section_name="qualifier_prompt"),
         qualifier_geography_requirement=_str(qp, "geography_requirement", section_name="qualifier_prompt"),

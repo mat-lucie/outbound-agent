@@ -753,7 +753,12 @@ class TestHybridHaikuGate:
             {
                 "name": "x",
                 "title": "Director de Manufactura",
-                "company": "Consulting LLC",  # triggers consultant keyword
+                # NOTE: was "Consulting LLC" (consultant +8 pulled the score
+                # into the borderline band). Since disqualifier_consulting a
+                # consulting company name hard-rejects before the LLM gate —
+                # use a neutral company; size (+22) + role (+28) + non-
+                # competitor (+20) = 70 still lands 40-75.
+                "company": "Grupo Borde",
                 "location": "Mexico City, Mexico",
                 "employee_count": 1500,
             },

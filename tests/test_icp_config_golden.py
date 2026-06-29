@@ -81,7 +81,10 @@ GOLDEN = {
     "junior_ic": {"score": 32, "band": "<40", "verdict_path": "deterministic_reject_junior_ic", "pass": False, "persona": "executive_sponsors", "language": "en", "icp_lane": None, "scoring_lane": "enterprise_mode", "breakdown": {"size": 28, "role": 12, "competitor": 20, "junior_ic_penalty": -40, "industry": 12, "ops_in_industrial": 0, "total": 32}},
     "pe_firm": {"score": 19, "band": "<40", "verdict_path": "disqualifier_pe", "pass": False, "persona": "operations_leaders", "language": "en", "icp_lane": None, "scoring_lane": "enterprise_mode", "breakdown": {"size": 22, "role": 2, "competitor": 20, "industry": -25, "ops_in_industrial": 0, "total": 19}},
     "academic": {"score": 10, "band": "<40", "verdict_path": "deterministic_reject", "pass": False, "persona": "operations_leaders", "language": "en", "icp_lane": None, "scoring_lane": "enterprise_mode", "breakdown": {"size": 28, "role": 2, "competitor": 5, "industry": -25, "ops_in_industrial": 0, "total": 10}},
-    "consultant": {"score": 23, "band": "<40", "verdict_path": "deterministic_reject", "pass": False, "persona": "operations_leaders", "language": "en", "icp_lane": None, "scoring_lane": "enterprise_mode", "breakdown": {"size": 28, "role": 12, "competitor": 8, "industry": -25, "ops_in_industrial": 0, "total": 23}},
+    # "Supply Chain Consultant" now hard-rejects via the consulting TITLE family
+    # (disqualifier_consulting) instead of falling through to deterministic_reject
+    # — same score/band/pass, more informative verdict_path.
+    "consultant": {"score": 23, "band": "<40", "verdict_path": "disqualifier_consulting", "pass": False, "persona": "operations_leaders", "language": "en", "icp_lane": None, "scoring_lane": "enterprise_mode", "breakdown": {"size": 28, "role": 12, "competitor": 8, "industry": -25, "ops_in_industrial": 0, "total": 23}},
     "state_owned": {"score": 88, "band": ">75", "verdict_path": "disqualifier_state_owned", "pass": False, "persona": "operations_leaders", "language": "en", "icp_lane": None, "scoring_lane": "enterprise_mode", "breakdown": {"size": 28, "role": 28, "competitor": 20, "industry": 12, "ops_in_industrial": 0, "total": 88}},
     "global_with_override": {"score": 88, "band": ">75", "verdict_path": "enterprise_pass", "pass": True, "persona": "executive_sponsors", "language": "es", "icp_lane": 1, "scoring_lane": "enterprise_mode", "breakdown": {"size": 28, "role": 28, "competitor": 20, "industry": 12, "ops_in_industrial": 0, "total": 88}},
     "global_only": {"score": 62, "band": "60-75", "verdict_path": "borderline_pass", "pass": True, "persona": "operations_leaders", "language": "en", "icp_lane": None, "scoring_lane": "enterprise_mode", "breakdown": {"size": 28, "role": 2, "competitor": 20, "industry": 12, "ops_in_industrial": 0, "total": 62}},
@@ -160,6 +163,9 @@ def test_load_icp_config_returns_acme_reference():
     # Disqualifier-family order is load-bearing (earliest positional match).
     assert cfg.pe_keywords[0] == "private equity fund"
     assert "government of" in cfg.state_owned_keywords
+    # Consulting families (sixth disqualifier) are loaded as required lists.
+    assert "accenture" in cfg.consulting_firm_keywords
+    assert "consultant" in cfg.consulting_title_keywords
 
 
 def test_quality_gate_constants_sourced_from_config():
