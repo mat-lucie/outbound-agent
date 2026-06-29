@@ -830,8 +830,9 @@ class TestSalesNavLaunchArgShape:
         self, _pb_args, _sheet,
     ):
         """The phantom uses numberOfProfilesPerLaunch as a tight cap;
-        the launch helper sets it to len(urls) — not the saved phantom
-        default."""
+        the launch helper sets it to len(urls) + 1 header line (PB counts
+        the sheet header as a processable line, 2026-06-12 last-row-dropped
+        incident) — not the saved phantom default."""
         attio = MagicMock()
         pb = _make_pb(csv_text=_sales_nav_csv([
             {"url": "https://www.linkedin.com/in/alice", "degree": "2nd"},
@@ -846,4 +847,4 @@ class TestSalesNavLaunchArgShape:
         )
 
         launch_args = pb.launch_agent.call_args.args[1]
-        assert launch_args["numberOfProfilesPerLaunch"] == 3
+        assert launch_args["numberOfProfilesPerLaunch"] == 4

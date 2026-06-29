@@ -90,6 +90,7 @@ from clients.attio_writer import (
     WriteIntent,
 )
 from clients.attio_writer_registry import UnauthorizedAttioWriteError
+from clients.google_sheets import profiles_per_launch
 from clients.pb_envelope import PBRunFailed, PBRunTimeout, has_scraper_dedup_marker
 from models.business_calendar import operator_today
 from models.experiment import ExperimentIdImmutableError, FrozenAtState
@@ -277,7 +278,9 @@ def _launch_sales_nav_scrape(
       Google Sheets URL. The phantom auto-converts ``/in/`` URLs to
       ``/sales/lead/<id>,<auth>`` internally — no separate URL Converter
       phantom needed (see project_sales_nav_migration memory).
-    - ``numberOfProfilesPerLaunch`` ← tight cap matching the input batch
+    - ``numberOfProfilesPerLaunch`` ← tight cap matching the input batch,
+      +1 header line for sheet-fed launches (PB counts the sheet header as
+      a processable line — clients.google_sheets.profiles_per_launch)
 
     For multi-URL launches we still use a Google Sheets URL via
     :func:`workflows.daily_check.write_prospects_to_sheet`; for single
@@ -298,12 +301,20 @@ def _launch_sales_nav_scrape(
     # Build sheet input. For a single URL, pass it directly; for >1, build
     # a Google Sheets URL via the existing helper.
     if len(urls) == 1:
+        # Bare profile URL as input — no sheet, no header line, so the raw
+        # batch size is the correct per-launch count.
         sheet_url = urls[0]
+        launch_count = len(urls)
     else:
         sheet_rows = [{"profileUrl": u} for u in urls]
         sheet_url = _dc.write_prospects_to_sheet(
             sheet_rows, columns=["profileUrl"]
         )
+        # +1 for the sheet header row PB counts as a processable line — see
+        # clients.google_sheets.profiles_per_launch (2026-06-12 incident:
+        # header ate one slot, last profile of every batch went unscraped
+        # and surfaced as degree_unknown).
+        launch_count = profiles_per_launch(len(urls))
 
     # Read saved phantom args so we get identities[] and other required fields.
     agent = pb.get_agent(scraper_id)
@@ -321,7 +332,7 @@ def _launch_sales_nav_scrape(
         **saved,
         "identities": identities,
         "spreadsheetUrl": sheet_url,
-        "numberOfProfilesPerLaunch": len(urls),
+        "numberOfProfilesPerLaunch": launch_count,
         # csvName is generated PER ATTEMPT inside _do_launch_and_fetch (see
         # below) — a timed-out first container can still finish asynchronously
         # (PB is async — see pb_send_recovery) and register the batch in its

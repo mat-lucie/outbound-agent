@@ -101,6 +101,40 @@ def _backup_token() -> None:
                 os.remove(tmp)
 
 
+# Header rows prepended by write_prospects_to_sheet. PB phantoms count the
+# header as a processable CSV line (see profiles_per_launch below), so launch
+# counts derived from a batch written through that helper must add this.
+SHEET_HEADER_LINES = 1
+
+
+def profiles_per_launch(batch_size: int) -> int:
+    """``numberOfProfilesPerLaunch`` for a batch written via
+    :func:`write_prospects_to_sheet`.
+
+    The sheet writer always prepends a header row, and PB phantoms count
+    that header as a processable line: a launch with
+    ``numberOfProfilesPerLaunch=N`` against an N-row sheet processes the
+    header plus only N-1 data rows, silently dropping the LAST row of
+    every batch (verified live 2026-06-12, twice: a 1-profile Phase 0
+    batch logged "Got 2 lines from csv → Processing 1 profile" then
+    errored on the literal header → BLIND run, container 1117150263943401;
+    a 4-profile batch scraped only 3). Passing batch+header is safe
+    because the phantom treats the argument as a tight cap and never
+    processes more lines than the input contains.
+
+    Callers whose batches are bounded by a per-launch cap (e.g.
+    PHASE0_MAX_PROFILES_PER_LAUNCH, REPAIR_MAX_PROFILES_PER_LAUNCH) must
+    keep cap + SHEET_HEADER_LINES at or under the phantom's argument
+    schema maximum (150 for the SN Profile Scraper, verified 2026-06-11)
+    — PB rejects the ENTIRE launch above it.
+
+    Does NOT apply to launches that pass a bare profile URL as
+    ``spreadsheetUrl`` (no sheet, no header) — pass the raw batch size
+    there.
+    """
+    return batch_size + SHEET_HEADER_LINES
+
+
 def write_prospects_to_sheet(
     rows: list[dict],
     spreadsheet_id: str | None = None,
