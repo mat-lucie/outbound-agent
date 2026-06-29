@@ -423,7 +423,17 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                             _attio_inner_client(crm), pb, profile_scraper_id, cache=cache,
                             sales_nav_profile_scraper_id=sales_nav_profile_scraper_id,
                         )
-                        click.echo(f"Auto-detected {accept_result.get('accepted', 0)} accepted connections.\n")
+                        _phase0_deferred = accept_result.get("deferred", 0)
+                        _phase0_deferred_note = (
+                            f" ({_phase0_deferred} stale profile(s) beyond the "
+                            f"per-run scrape cap, deferred to subsequent runs)"
+                            if _phase0_deferred
+                            else ""
+                        )
+                        click.echo(
+                            f"Auto-detected {accept_result.get('accepted', 0)} "
+                            f"accepted connections.{_phase0_deferred_note}\n"
+                        )
                     else:
                         click.echo(f"Skipping (no {phase0_missing_env} set for backend={phase0_backend})\n")
 
