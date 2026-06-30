@@ -17,6 +17,20 @@ if TYPE_CHECKING:
     from clients.crm.base import CRMProvider
     from clients.phantombuster import PhantomBusterClient
 
+# Per-launch scrape cap for the repair pipeline. PB validates
+# numberOfProfilesPerLaunch against the phantom's argument schema and rejects
+# the ENTIRE launch above the max ("numberOfProfilesPerLaunch => is more than
+# maximum") — the failure mode of the 2026-06-11 Phase 0 incident. Schema
+# maxes verified 2026-06-11 via the PB API (agents/fetch → scripts/fetch →
+# argumentSchema): Sales Navigator Profile Scraper (script 11108) max=150;
+# the legacy Profile Scraper agent this pipeline launches no longer exists in
+# the PB org ("Agent not found"), so its max is unverifiable. 50 sits under
+# any plausible scraper max AND at the per-run profile-visit safety volume
+# Phase 0 enforces (PHASE0_MAX_PROFILES_PER_LAUNCH) — repair scrapes burn
+# visits on the same LinkedIn account. The deferred tail converges across
+# runs: repaired rows drop out of the next detect-bad-companies CSV.
+REPAIR_MAX_PROFILES_PER_LAUNCH = 50
+
 
 def backfill_export(crm: CRMProvider) -> str:
     """Export LinkedIn URLs of pipeline records that have no company association.
@@ -280,7 +294,7 @@ def repair_bad_companies(
 
     Returns the backfill_import summary dict.
     """
-    from clients.google_sheets import write_prospects_to_sheet
+    from clients.google_sheets import profiles_per_launch, write_prospects_to_sheet
 
     # Step 0: Clean poisoned company domains. Loop because there may be
     # multiple companies poisoned with linkedin.com (different runs of the
@@ -311,7 +325,18 @@ def repair_bad_companies(
 
     if not rows:
         click.echo("No records to repair.")
-        return {"processed": 0, "linked": 0, "failed": 0, "skipped": 0}
+        return {"processed": 0, "linked": 0, "failed": 0, "skipped": 0, "deferred": 0}
+
+    deferred = 0
+    if len(rows) > REPAIR_MAX_PROFILES_PER_LAUNCH:
+        deferred = len(rows) - REPAIR_MAX_PROFILES_PER_LAUNCH
+        rows = rows[:REPAIR_MAX_PROFILES_PER_LAUNCH]
+        click.echo(
+            f"  ⚠ Capping scrape at {REPAIR_MAX_PROFILES_PER_LAUNCH} profiles "
+            f"per launch ({deferred} deferred). After this run, re-run "
+            f"detect-bad-companies (repaired rows drop out of the new CSV) and "
+            f"repair-companies again for the remainder."
+        )
 
     click.echo(f"\n--- Step 1: Scraping {len(rows)} profiles ---")
 
@@ -323,7 +348,18 @@ def repair_bad_companies(
     from clients.phantombuster import get_phantombuster_credentials
 
     session_cookie, session_ua = get_phantombuster_credentials()
-    launch_args: dict = {"spreadsheetUrl": sheet_url}
+    # API ``arguments`` REPLACE the phantom's saved console args wholesale, so
+    # pass the per-launch count explicitly or the phantom truncates at its
+    # default. ``profiles_per_launch`` adds the sheet header line PB counts as
+    # a processable row (else the LAST repair row is silently dropped — see
+    # clients.google_sheets.profiles_per_launch). After the cap above,
+    # ``len(sheet_rows)`` is bounded by REPAIR_MAX_PROFILES_PER_LAUNCH, so
+    # batch + header stays under the phantom schema max and PB never rejects
+    # the whole launch.
+    launch_args: dict = {
+        "spreadsheetUrl": sheet_url,
+        "numberOfProfilesPerLaunch": profiles_per_launch(len(sheet_rows)),
+    }
     if session_cookie:
         launch_args["sessionCookie"] = session_cookie
         launch_args["userAgent"] = session_ua
@@ -338,7 +374,7 @@ def repair_bad_companies(
     result_csv = pb.download_result_csv(launch)
     if not result_csv:
         click.echo("  ERROR: Profile Scraper returned no CSV")
-        return {"processed": 0, "linked": 0, "failed": 0, "skipped": 0}
+        return {"processed": 0, "linked": 0, "failed": 0, "skipped": 0, "deferred": deferred}
 
     pb_output_path = f"exports/repair_companies_pb_{date.today().isoformat()}.csv"
     with open(pb_output_path, "w", encoding="utf-8") as f:
@@ -347,4 +383,6 @@ def repair_bad_companies(
 
     # Step 4: Re-link via backfill_import
     click.echo("\n--- Step 2: Re-linking companies ---")
-    return backfill_import(attio, pb_output_path, detect_csv_path)
+    summary = backfill_import(attio, pb_output_path, detect_csv_path)
+    summary["deferred"] = deferred
+    return summary

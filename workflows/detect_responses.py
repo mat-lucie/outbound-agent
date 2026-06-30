@@ -1066,6 +1066,11 @@ def detect_responses(
     # Bumped from 40 → INBOX_SCRAPE_LIMIT (200) so a single scrape covers all
     # of the operator's ~150 SN conversations. Same scrape feeds both the response
     # detector and the cadence drift detector below — no second PB launch.
+    # 2026-06-11 schema-max audit (after the Phase 0 oversized-launch
+    # incident): numberOfThreadsToScrape declares minimum=1 and NO maximum
+    # (verified via PB API scripts/fetch, script id 2449319061041483), so
+    # INBOX_SCRAPE_LIMIT=200 cannot trip the "is more than maximum"
+    # whole-launch rejection that capped the profile scrapers.
     click.echo(f"  Launching SN Inbox Scraper (numberOfThreadsToScrape={INBOX_SCRAPE_LIMIT})...")
     launch = pb.launch_agent(inbox_scraper_id, {
         "inboxFilter": "all",
