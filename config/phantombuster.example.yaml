@@ -38,7 +38,10 @@ agents:
   message_sender: "REPLACE_WITH_MESSAGE_SENDER_PHANTOM_ID"
 
   # LinkedIn Profile Scraper → connection-degree check, legacy backend.
-  # Used when pre_invite_degree_check_backend = regular.
+  # DOCUMENTED-DEAD: this agent was deleted from the PB workspace (GET
+  # /agents/fetch → 404). Only set when pre_invite_degree_check_backend =
+  # regular AND you have deployed a NEW Profile Scraper phantom; the launch
+  # sites preflight this id and fail loud if it doesn't resolve.
   # Env fallback: PB_PROFILE_SCRAPER_ID
   profile_scraper: "REPLACE_WITH_PROFILE_SCRAPER_PHANTOM_ID"
 
@@ -60,16 +63,19 @@ agents:
   inbox_scraper: "REPLACE_WITH_INBOX_SCRAPER_PHANTOM_ID"
 
 # ---------------------------------------------------------------------------
-# Pre-invite degree-check backend — NON-SECRET. Resolution: yaml → env → "regular".
+# Pre-invite degree-check backend — NON-SECRET. Resolution: yaml → env → code default.
 # ---------------------------------------------------------------------------
 # Which scraper the pre-invite degree check + Phase 0 accepted-connection
-# detection use. Valid values: regular | sales_nav. Default "regular" (legacy
-# LinkedIn Profile Scraper). Flip to "sales_nav" only after the Sales Nav
-# cookies are populated in .env AND scripts/validate_sales_nav_health.py
-# returns OK. See docs/onboarding/phantombuster-setup.md and
+# detection use. Valid values: regular | sales_nav. Code DEFAULT is
+# "sales_nav" (flipped when the legacy LinkedIn Profile Scraper agent was
+# deleted from the PB workspace — "regular" is documented-dead and requires
+# deploying a new phantom + setting profile_scraper / PB_PROFILE_SCRAPER_ID
+# first). Requires the Sales Nav cookies populated in .env; run
+# scripts/validate_sales_nav_health.py to confirm. See
+# docs/onboarding/phantombuster-setup.md and
 # docs/runbooks/phantombuster-cookie-rotation.md.
 # Env fallback: PRE_INVITE_DEGREE_CHECK_BACKEND
-pre_invite_degree_check_backend: regular
+pre_invite_degree_check_backend: sales_nav
 
 # ---------------------------------------------------------------------------
 # Credential env-var NAMES (not the secrets themselves).

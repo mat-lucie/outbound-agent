@@ -218,7 +218,25 @@ def main(dry_run: bool, limit: int | None, chunk_size: int) -> None:
         sys.exit(2)
     profile_scraper_id = os.environ.get("PB_PROFILE_SCRAPER_ID") or None
     sales_nav_profile_scraper_id = os.environ.get("PB_SALES_NAV_PROFILE_SCRAPER_ID") or None
-    backend = os.environ.get("PRE_INVITE_DEGREE_CHECK_BACKEND", "regular").strip()
+
+    from workflows.daily_check_helpers import (
+        _VALID_BACKENDS,
+        DEGREE_CHECK_BACKEND_DEFAULT,
+    )
+
+    backend = os.environ.get(
+        "PRE_INVITE_DEGREE_CHECK_BACKEND", DEGREE_CHECK_BACKEND_DEFAULT
+    ).strip()
+    if backend not in _VALID_BACKENDS:
+        # A typo'd value would silently skip the SN health pre-flight below
+        # (the gate keys on == "sales_nav") and degrade every chunk's degree
+        # check. Refuse to run on an invalid value.
+        click.echo(
+            f"ERROR: PRE_INVITE_DEGREE_CHECK_BACKEND={backend!r} is not a "
+            f"valid backend ({' | '.join(_VALID_BACKENDS)}) — fix .env.",
+            err=True,
+        )
+        sys.exit(2)
 
     today = operator_today()
 
@@ -252,9 +270,11 @@ def main(dry_run: bool, limit: int | None, chunk_size: int) -> None:
         rc, summary = quick_check(skip_parallel=True)
         click.echo(summary)
         if rc == 1:
+            # No "flip to regular" escape hatch: the legacy Profile Scraper
+            # agent was deleted from the PB workspace.
             click.echo(
-                "Sales Nav pre-flight FAILED — rotate cookies OR set "
-                "PRE_INVITE_DEGREE_CHECK_BACKEND=regular, then re-run.",
+                "Sales Nav pre-flight FAILED — rotate cookies (see "
+                "docs/runbooks/phantombuster-cookie-rotation.md), then re-run.",
                 err=True,
             )
             sys.exit(2)

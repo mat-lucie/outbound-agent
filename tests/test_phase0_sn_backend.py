@@ -216,8 +216,11 @@ def test_phase0_regular_backend_launches_with_top_level_session(monkeypatch):
         "Regular backend must NOT use the identities[0] shape"
     )
 
-    # pb.get_agent must NOT have been called on the regular path (no saved-arg fetch).
-    mock_pb.get_agent.assert_not_called()
+    # The regular path calls pb.get_agent exactly once — the documented-dead
+    # preflight (the legacy agent was deleted from the PB workspace; a dead id
+    # must fail before launch). It must NOT feed the launch args: no saved-arg
+    # fetch on this path (asserted via the top-level-cookie shape above).
+    mock_pb.get_agent.assert_called_once_with("legacy-scraper-id")
 
 
 def test_phase0_pb_timeout_degrades_gracefully(monkeypatch):

@@ -108,22 +108,28 @@ def _isolate_attio_api_key(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolate_degree_check_backend_env(monkeypatch):
-    """Guarantee no test inherits an ambient Sales Nav backend selection.
+    """Pin every test to a deterministic degree-check backend baseline.
 
     ``PRE_INVITE_DEGREE_CHECK_BACKEND`` (+ the SN scraper-id / cookie vars
     it gates on) is read at call time by both the pre-invite degree check
-    and Phase 0 ``detect_accepted_connections``. Once an operator sets
-    ``PRE_INVITE_DEGREE_CHECK_BACKEND=sales_nav`` in their developer
-    ``.env`` (or a prior test leaves it set), every degree-check test that
-    expects the default ``regular`` path silently routes through the Sales
-    Nav branch and fails — order-dependently, since collection order
-    decides whether the polluting test runs first. Deleting these here
-    before each test makes the suite order-independent for this flag.
-    Tests that exercise the sales_nav branch set the vars explicitly via
-    their own monkeypatch (which stacks on top of this delenv).
+    and Phase 0 ``detect_accepted_connections``. Without pinning, whatever
+    the operator has in their developer ``.env`` (or a prior test left set)
+    leaks into the suite and tests fail order-dependently.
+
+    The baseline is an EXPLICIT ``regular``: the code default is now
+    ``sales_nav`` (DEGREE_CHECK_BACKEND_DEFAULT — the legacy agent was
+    deleted from the PB workspace), and under that default a bare
+    environment raises SalesNavConfigError from
+    ``_resolve_degree_check_backend`` (missing SN scraper-id/cookie). The
+    bulk of the degree-check suite predates the flip and exercises the
+    legacy code path with mocked PB clients — explicit ``regular`` keeps
+    that coverage meaningful, mirroring how a re-deployed legacy phantom
+    would be selected in production. Tests that exercise the sales_nav
+    branch, or the default resolution itself, monkeypatch.setenv/delenv on
+    top of this fixture.
     """
+    monkeypatch.setenv("PRE_INVITE_DEGREE_CHECK_BACKEND", "regular")
     for var in (
-        "PRE_INVITE_DEGREE_CHECK_BACKEND",
         "PB_SALES_NAV_PROFILE_SCRAPER_ID",
         "PB_LI_SALES_NAV_SESSION_COOKIE",
     ):

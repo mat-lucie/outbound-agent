@@ -52,11 +52,19 @@ _AGENT_ENV_BY_KEY: dict[str, str] = {
 }
 
 # Pre-invite degree-check backend: env var + YAML key + the current code
-# default. The default string MUST stay "regular" — every caller that reads
-# PRE_INVITE_DEGREE_CHECK_BACKEND today defaults to it when the var is unset.
+# default. Flipped from "regular" to "sales_nav": the legacy LinkedIn Profile
+# Scraper agent was deleted from the PhantomBuster workspace, so a missing or
+# typo'd env var falling back to "regular" guaranteed a mid-run httpx 404 at
+# launch time, AFTER a production sheet write was already burned. Under a
+# sales_nav default a bare environment instead fails LOUD at resolve time
+# (missing SN scraper-id / cookie raises SalesNavConfigError naming the fix —
+# see workflows.daily_check_helpers._resolve_degree_check_backend). "regular"
+# stays selectable for a future re-deployed phantom, but is documented-dead:
+# the legacy launch sites preflight the agent id and abort with a config error
+# if it doesn't resolve.
 _BACKEND_ENV = "PRE_INVITE_DEGREE_CHECK_BACKEND"
 _BACKEND_YAML_KEY = "pre_invite_degree_check_backend"
-_BACKEND_DEFAULT = "regular"
+_BACKEND_DEFAULT = "sales_nav"
 
 
 @dataclass(frozen=True)
@@ -141,11 +149,11 @@ def _resolve_agent_id(
 
 
 def _resolve_backend(raw: dict[str, Any]) -> str:
-    """Resolve the degree-check backend: yaml → env → ``"regular"``.
+    """Resolve the degree-check backend: yaml → env → :data:`_BACKEND_DEFAULT`.
 
     Returns the RAW value (no validation). A blank yaml value falls through to
-    env, then to the default — preserving the unset→"regular" semantics every
-    current caller relies on. A non-string yaml value raises.
+    env, then to the default (``"sales_nav"`` since the 2026 legacy-scraper
+    deletion — see :data:`_BACKEND_DEFAULT`). A non-string yaml value raises.
     """
     if _BACKEND_YAML_KEY in raw:
         val = raw[_BACKEND_YAML_KEY]

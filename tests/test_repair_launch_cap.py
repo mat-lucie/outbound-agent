@@ -61,6 +61,9 @@ def _mock_attio() -> MagicMock:
 
 def _mock_pb(result_csv: str = _PB_CSV) -> MagicMock:
     pb = MagicMock()
+    # Saved SN phantom argument — the repair launch fetches it and injects
+    # the session into identities[0] (SN migration).
+    pb.get_agent.return_value = {"argument": '{"identities": [{}]}'}
     pb.launch_agent.return_value = MagicMock(container_id="ct-repair")
     pb.wait_for_completion.return_value = MagicMock(log_output="done")
     pb.download_result_csv.return_value = result_csv
@@ -77,6 +80,7 @@ def _run_repair(tmp_path, monkeypatch, n_rows: int, pb: MagicMock | None = None)
     # sandbox it so tests never touch the real one.
     monkeypatch.chdir(tmp_path)
     (tmp_path / "exports").mkdir()
+    monkeypatch.setenv("PB_LI_SALES_NAV_SESSION_COOKIE", "fake-sn-li-at")
     pb = pb or _mock_pb()
     sheet_calls: list[list[dict]] = []
 
@@ -88,15 +92,11 @@ def _run_repair(tmp_path, monkeypatch, n_rows: int, pb: MagicMock | None = None)
     with (
         patch("clients.google_sheets.write_prospects_to_sheet", side_effect=_capture_sheet),
         patch(
-            "clients.phantombuster.get_phantombuster_credentials",
-            return_value=("cookie", "ua"),
-        ),
-        patch(
             "workflows.backfill_companies.backfill_import",
             return_value=dict(import_counters),
         ) as import_mock,
     ):
-        summary = repair_bad_companies(_mock_attio(), pb, "scraper-id", detect_csv)
+        summary = repair_bad_companies(_mock_attio(), pb, "sn-scraper-id", detect_csv)
     return summary, pb, sheet_calls, import_mock
 
 
@@ -146,7 +146,7 @@ def test_batch_exactly_at_cap_is_not_deferred(tmp_path, monkeypatch):
 
 def test_empty_detect_csv_returns_deferred_zero_shape(tmp_path):
     detect_csv = _write_detect_csv(tmp_path, 0)
-    summary = repair_bad_companies(_mock_attio(), _mock_pb(), "scraper-id", detect_csv)
+    summary = repair_bad_companies(_mock_attio(), _mock_pb(), "sn-scraper-id", detect_csv)
     assert summary == {
         "processed": 0,
         "linked": 0,
@@ -154,6 +154,14 @@ def test_empty_detect_csv_returns_deferred_zero_shape(tmp_path):
         "skipped": 0,
         "deferred": 0,
     }
+
+
+def test_clean_empty_detect_csv_has_no_error_key(tmp_path):
+    """The zero-counter SUCCESS shape (empty detect CSV) must not carry the
+    failure marker — cli.py would otherwise report a clean run as FAILED."""
+    detect_csv = _write_detect_csv(tmp_path, 0)
+    summary = repair_bad_companies(_mock_attio(), _mock_pb(), "sn-scraper-id", detect_csv)
+    assert "error" not in summary
 
 
 def test_no_csv_failure_still_reports_deferred(tmp_path, monkeypatch):
@@ -165,3 +173,34 @@ def test_no_csv_failure_still_reports_deferred(tmp_path, monkeypatch):
     assert summary["deferred"] == 3
     assert summary["linked"] == 0
     import_mock.assert_not_called()
+    # The "error" key distinguishes a failed scrape from a clean run over an
+    # already-empty detect CSV (identical zero counters) — cli.py keys its
+    # "Repair FAILED" banner + non-zero exit on it.
+    assert summary["error"] == "no_csv"
+
+
+def test_repair_launch_carries_sn_full_argument_contract(tmp_path, monkeypatch):
+    """The repair launch must carry the SN phantom's full-argument contract:
+    saved fields preserved, fresh session injected into identities[0] (NOT
+    top-level sessionCookie, which the SN phantom silently ignores), and a
+    fresh csvName to bust the processed-inputs dedup DB so a repair re-scrape
+    re-visits profiles a prior daily-run scrape already processed."""
+    monkeypatch.setenv("PB_LI_USER_AGENT", "fake-ua")
+    pb = _mock_pb()
+    pb.get_agent.return_value = {
+        "argument": '{"identities": [{}], "savedField": "keep-me"}'
+    }
+    summary, pb, sheet_calls, _ = _run_repair(tmp_path, monkeypatch, 4, pb=pb)
+
+    args = pb.launch_agent.call_args.args
+    assert args[0] == "sn-scraper-id"
+    launch_args = args[1]
+    assert launch_args["numberOfProfilesPerLaunch"] == profiles_per_launch(4)
+    # SN full-argument contract.
+    assert launch_args["savedField"] == "keep-me"
+    assert launch_args["identities"][0]["sessionCookie"] == "fake-sn-li-at"
+    assert launch_args["identities"][0]["userAgent"] == "fake-ua"
+    assert "sessionCookie" not in launch_args
+    # Fresh result-file name per launch, and the CSV download keyed to it.
+    assert launch_args.get("csvName"), "repair launch must set a fresh csvName"
+    assert pb.download_result_csv.call_args.kwargs.get("csv_name") == launch_args["csvName"]

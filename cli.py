@@ -148,8 +148,8 @@ def cli():
 @click.option("--batch-size", default=lambda: load_outreach_config().invite_batch_size, help="Max connection requests per run (default: config/outreach.yaml → caps.invite_batch_size; capped by caps.invites_per_day)")
 @click.option("--network-booster-id", default=lambda: load_pb_config().network_booster_id or None, help="PhantomBuster Network Booster agent ID (default: config/phantombuster.yaml → PB_NETWORK_BOOSTER_ID)")
 @click.option("--message-sender-id", default=lambda: load_pb_config().message_sender_id or None, help="PhantomBuster Message Sender agent ID (default: config/phantombuster.yaml → PB_MESSAGE_SENDER_ID)")
-@click.option("--profile-scraper-id", default=lambda: load_pb_config().profile_scraper_id or None, help="PhantomBuster Profile Scraper agent ID, legacy backend (default: config/phantombuster.yaml → PB_PROFILE_SCRAPER_ID)")
-@click.option("--sales-nav-profile-scraper-id", default=lambda: load_pb_config().sales_nav_profile_scraper_id or None, help="PhantomBuster Sales Navigator Profile Scraper agent ID, sales_nav backend (default: config/phantombuster.yaml → PB_SALES_NAV_PROFILE_SCRAPER_ID)")
+@click.option("--profile-scraper-id", default=lambda: load_pb_config().profile_scraper_id or None, help="PhantomBuster Profile Scraper agent ID, legacy backend — documented-dead: the agent was deleted from the PB workspace; only useful with a re-deployed phantom (default: config/phantombuster.yaml → PB_PROFILE_SCRAPER_ID)")
+@click.option("--sales-nav-profile-scraper-id", default=lambda: load_pb_config().sales_nav_profile_scraper_id or None, help="PhantomBuster Sales Navigator Profile Scraper agent ID, sales_nav backend (the default) (default: config/phantombuster.yaml → PB_SALES_NAV_PROFILE_SCRAPER_ID)")
 @click.option("--inbox-scraper-id", default=lambda: load_pb_config().inbox_scraper_id or None, help="PhantomBuster Inbox Scraper agent ID (default: config/phantombuster.yaml → PB_INBOX_SCRAPER_ID)")
 @click.option("--skip-dms", is_flag=True, help="Skip Part B DM sequencing (connections only)")
 @click.option("--force-weekend", is_flag=True, help="Override the Mon-Fri-only outreach rule")
@@ -166,6 +166,7 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
         run_dm_sequencing,
         run_end_summary,
     )
+    from workflows.daily_check_helpers import _VALID_BACKENDS
     from workflows.daily_run import (
         ConcurrentRunInAttio,
         DailyRun,
@@ -401,6 +402,20 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                     # of the same migration that introduced PRE_INVITE_DEGREE_CHECK_BACKEND).
                     click.echo("--- Phase 0: Detect Accepted Connections ---")
                     phase0_backend = load_pb_config().degree_check_backend_raw.strip()
+                    if phase0_backend not in _VALID_BACKENDS:
+                        # Validate the VALUE at the routing gate. A typo'd
+                        # backend would otherwise route Phase 0 to the legacy
+                        # id; with that id unset, Phase 0 (and the SN health
+                        # gate, which keys on the same comparison) silently
+                        # skips — and on a day with an empty invite pool
+                        # nothing downstream calls the validating resolver,
+                        # so the run exits 0 with acceptance detection off.
+                        raise click.ClickException(
+                            f"PRE_INVITE_DEGREE_CHECK_BACKEND="
+                            f"{phase0_backend!r} is not a valid backend "
+                            f"({' | '.join(_VALID_BACKENDS)}) — fix .env; "
+                            "refusing to guess which scraper to launch."
+                        )
                     phase0_required_id = (
                         sales_nav_profile_scraper_id
                         if phase0_backend == "sales_nav"
@@ -575,14 +590,17 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                             click.echo(summary)
                             if rc == 1:
                                 # FAIL: stop the daily run. Operator must rotate
-                                # cookies OR flip PRE_INVITE_DEGREE_CHECK_BACKEND=regular
-                                # to bypass. Per docs/runbooks/phantombuster-cookie-rotation.md.
+                                # cookies. (The old advice to flip
+                                # PRE_INVITE_DEGREE_CHECK_BACKEND=regular is dead:
+                                # the legacy Profile Scraper agent was deleted from
+                                # the PB workspace — there is no backend to roll
+                                # back to.) Per
+                                # docs/runbooks/phantombuster-cookie-rotation.md.
                                 raise click.ClickException(
                                     "Sales Nav pre-flight FAILED — fix the named "
-                                    "issue above (typically rotate cookies) OR set "
-                                    "PRE_INVITE_DEGREE_CHECK_BACKEND=regular in .env "
-                                    "to roll back to the legacy backend, then "
-                                    "re-run /sales-daily in a fresh shell."
+                                    "issue above (typically rotate cookies via "
+                                    "docs/runbooks/phantombuster-cookie-rotation.md), "
+                                    "then re-run /sales-daily in a fresh shell."
                                 )
                             # rc=2 (WARN) prints the warning and continues —
                             # caller still gets to approve the batch interactively.
@@ -1072,6 +1090,109 @@ def limits():
 
 
 @cli.command()
+def canary():
+    """§3.20 Attio scope canary — verify the REST write+delete path is live.
+
+    Every skill's Step-0 preflight runs this AFTER an MCP read-liveness check
+    (whoami + list-lists). It does a create-note → delete-note round-trip
+    through the REST client, exercising the SAME ATTIO_API_KEY credential the
+    daily run mutates prospect data with. The round-trip targets a dedicated,
+    inert canary record (CANARY_PERSON_RECORD_ID) — never a real prospect.
+
+    Exit 0 = full read+write+delete scope confirmed. Non-zero + a typed
+    `mcp_scope_insufficient` line on stderr = halt the skill before any
+    real Attio write.
+    """
+    from clients.attio import AttioClient
+    from clients.attio_writer_registry import CANARY_PERSON_RECORD_ID
+
+    click.echo("=== Attio scope canary (REST write+delete round-trip) ===\n")
+
+    record_id = CANARY_PERSON_RECORD_ID
+    if not record_id:
+        click.echo(
+            "mcp_scope_insufficient: canary_record_unconfigured — "
+            "CANARY_PERSON_RECORD_ID is empty in clients/attio_writer_registry.py. "
+            "Create an inert Person record (not in the linkedin_outreach list) "
+            "and pin its id before running any skill.",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    # Missing credential is itself a scope problem — emit the typed line
+    # rather than letting AttioClient() raise a bare KeyError the skill
+    # can't recognize.
+    if not os.environ.get("ATTIO_API_KEY"):
+        click.echo(
+            "mcp_scope_insufficient: attio_api_key_unset — ATTIO_API_KEY is not "
+            "in the environment (.env); cannot run the scope canary.",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    note_id = None
+    with AttioClient() as attio:
+        # ---- write leg ----
+        click.echo(
+            f"Running round-trip on canary record {record_id} "
+            "(create → delete; may take up to ~35s per leg if Attio is degraded)…"
+        )
+        try:
+            note = attio.create_note(
+                record_id,
+                "Outbound agent scope canary",
+                "Transient read+write+delete scope check. Auto-deleted; safe to ignore.",
+                parent_object="people",
+            )
+            # Guard `note` itself (not note.get("id")) — this is the most
+            # safety-critical line: a non-dict return must fall to None and
+            # fail closed, never raise past the contract.
+            note_id = note.get("id", {}).get("note_id") if isinstance(note, dict) else None
+        except Exception as exc:  # noqa: BLE001 — any failure here means write scope is not live
+            click.echo(
+                f"mcp_scope_insufficient: write leg failed on canary record "
+                f"{record_id} — {type(exc).__name__}: {exc}",
+                err=True,
+            )
+            raise SystemExit(1) from exc
+
+        if not note_id:
+            click.echo(
+                "mcp_scope_insufficient: write leg returned no note_id "
+                f"(canary record {record_id}) — cannot verify delete scope.",
+                err=True,
+            )
+            raise SystemExit(1)
+
+        # ---- delete leg ----
+        try:
+            deleted = attio.delete_note(note_id)
+        except Exception as exc:  # noqa: BLE001 — delete scope is not live
+            click.echo(
+                f"mcp_scope_insufficient: delete leg failed — note {note_id} on "
+                f"canary record {record_id} was created but NOT deleted "
+                f"({type(exc).__name__}: {exc}). Orphan note left behind; "
+                f"delete it manually (DELETE /v2/notes/{note_id}).",
+                err=True,
+            )
+            raise SystemExit(1) from exc
+
+        if not deleted:
+            click.echo(
+                f"mcp_scope_insufficient: delete leg reported note {note_id} as "
+                f"not present (404/absent) — the note we just created could not "
+                f"be deleted; scope unverifiable.",
+                err=True,
+            )
+            raise SystemExit(1)
+
+    click.echo(
+        f"OK — read+write+delete confirmed. Round-trip note {note_id} "
+        f"created and deleted on canary record {record_id}."
+    )
+
+
+@cli.command()
 def pipeline():
     """Show current pipeline status from Attio."""
     from clients.attio import AttioClient
@@ -1416,9 +1537,9 @@ def detect_bad_companies_cmd():
 
 @cli.command("repair-companies")
 @click.option("--csv", "detect_csv", required=True, type=click.Path(exists=True), help="CSV from detect-bad-companies")
-@click.option("--profile-scraper-id", envvar="PB_PROFILE_SCRAPER_ID", required=True, help="PhantomBuster Profile Scraper agent ID")
+@click.option("--sales-nav-profile-scraper-id", envvar="PB_SALES_NAV_PROFILE_SCRAPER_ID", required=True, help="PhantomBuster Sales Navigator Profile Scraper agent ID (the legacy Profile Scraper agent was deleted from the PB workspace)")
 @click.option("--dry-run", is_flag=True, help="Show what would be repaired without making changes")
-def repair_companies_cmd(detect_csv, profile_scraper_id, dry_run):
+def repair_companies_cmd(detect_csv, sales_nav_profile_scraper_id, dry_run):
     """Repair pipeline records with bad company links via PB re-scraping."""
     import csv as csv_mod
 
@@ -1443,8 +1564,33 @@ def repair_companies_cmd(detect_csv, profile_scraper_id, dry_run):
             )
         return
 
-    with _attio_client() as attio, PhantomBusterClient() as pb:
-        summary = repair_bad_companies(attio, pb, profile_scraper_id, detect_csv)
+    from workflows.daily_check_helpers import SalesNavConfigError
+
+    try:
+        with _attio_client() as attio, PhantomBusterClient() as pb:
+            summary = repair_bad_companies(attio, pb, sales_nav_profile_scraper_id, detect_csv)
+    except SalesNavConfigError as exc:
+        # Missing SN cookie / dead-or-mistyped SN scraper id — operator
+        # config problems, not crashes. Surface the named fix, not a
+        # traceback.
+        raise click.ClickException(str(exc)) from exc
+
+    if summary.get("error"):
+        # The scrape produced no CSV — nothing was re-linked. Distinct from
+        # the zero-counter success over an already-clean detect CSV.
+        click.echo(
+            "\n=== Repair FAILED: scrape returned no CSV — nothing was "
+            "re-linked. Re-run repair-companies (the detect CSV is still "
+            "valid). ===",
+            err=True,
+        )
+        if summary.get("deferred"):
+            click.echo(
+                f"Deferred: {summary['deferred']} row(s) beyond the per-launch "
+                f"scrape cap remain queued behind the failed batch.",
+                err=True,
+            )
+        raise SystemExit(1)
 
     click.echo("\n=== Repair Complete ===")
     click.echo(f"Linked: {summary['linked']}, Failed: {summary['failed']}, Skipped: {summary['skipped']}")

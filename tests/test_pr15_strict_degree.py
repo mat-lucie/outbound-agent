@@ -579,13 +579,35 @@ class TestResolveDegreeCheckBackend:
         ):
             monkeypatch.delenv(var, raising=False)
 
-    def test_default_unset_is_regular(self, monkeypatch: pytest.MonkeyPatch):
-        """No env var set → defaults to legacy regular Profile Scraper.
-        This is the rollback-safe default during PR-B's rollout window."""
+    def test_default_unset_is_sales_nav(self, monkeypatch: pytest.MonkeyPatch):
+        """No env var set → defaults to sales_nav (flipped when the legacy
+        Profile Scraper agent was deleted from the PB workspace, so a regular
+        default guaranteed a mid-run 404). With a bare environment the default
+        then fails LOUD on the missing SN scraper-id — the fail-at-resolve-time
+        behavior the flip exists to provide."""
+        from workflows.daily_check_helpers import (
+            DEGREE_CHECK_BACKEND_DEFAULT,
+            SalesNavConfigError,
+            _resolve_degree_check_backend,
+        )
+
+        assert DEGREE_CHECK_BACKEND_DEFAULT == "sales_nav"
+        self._clear_env(monkeypatch)
+        with pytest.raises(SalesNavConfigError, match="PB_SALES_NAV_PROFILE_SCRAPER_ID"):
+            _resolve_degree_check_backend()
+
+    def test_default_unset_resolves_sales_nav_with_sn_env(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """No backend var + a fully configured SN env → sales_nav. The
+        production .env shape after the flip (operators may simply drop the
+        backend line)."""
         from workflows.daily_check_helpers import _resolve_degree_check_backend
 
         self._clear_env(monkeypatch)
-        assert _resolve_degree_check_backend() == "regular"
+        monkeypatch.setenv("PB_SALES_NAV_PROFILE_SCRAPER_ID", "sn-id-123")
+        monkeypatch.setenv("PB_LI_SALES_NAV_SESSION_COOKIE", "li-at-cookie")
+        assert _resolve_degree_check_backend() == "sales_nav"
 
     def test_explicit_regular_returns_regular(
         self, monkeypatch: pytest.MonkeyPatch,

@@ -283,18 +283,31 @@ def detect_bad_company_links(crm: CRMProvider) -> str:
 def repair_bad_companies(
     attio: AttioClient,
     pb: PhantomBusterClient,
-    profile_scraper_id: str,
+    sales_nav_profile_scraper_id: str,
     detect_csv_path: str,
 ) -> dict:
     """Repair pipeline records with bad company links via PB re-scraping.
 
     1. Clean linkedin.com domain from the poisoned company record(s)
-    2. Launch PB Profile Scraper on affected LinkedIn URLs
+    2. Launch the Sales Nav Profile Scraper on affected LinkedIn URLs
     3. Re-link via backfill_import (now using extract_real_domain)
+
+    Migrated to the Sales Navigator Profile Scraper — the legacy LinkedIn
+    Profile Scraper agent this pipeline used to launch was deleted from the
+    PB workspace. backfill_import already speaks the SN CSV contract: it
+    prefers ``linkedinProfileUrl`` for URL matching and falls back to
+    ``currentCompanyName`` for the company name. The SN CSV carries no
+    real-website column (``companyUrl``/``companyWebsite``), so
+    extract_real_domain returns "" and match_or_create_company falls back to
+    name-only matching — the behavior that helper documents.
 
     Returns the backfill_import summary dict.
     """
     from clients.google_sheets import profiles_per_launch, write_prospects_to_sheet
+    from workflows.daily_check_helpers import (
+        _fresh_csv_name,
+        build_sales_nav_launch_args,
+    )
 
     # Step 0: Clean poisoned company domains. Loop because there may be
     # multiple companies poisoned with linkedin.com (different runs of the
@@ -340,41 +353,58 @@ def repair_bad_companies(
 
     click.echo(f"\n--- Step 1: Scraping {len(rows)} profiles ---")
 
-    # Step 2: Write to Google Sheet and launch Profile Scraper
+    # Step 2: Write to Google Sheet and launch the Sales Nav Profile Scraper
     sheet_rows = [{"profileUrl": row["linkedin_url"]} for row in rows]
-    sheet_url = write_prospects_to_sheet(sheet_rows)
+    # columns must match the row keys — the default ["linkedInUrl", "message"]
+    # shape would write an empty sheet and the scraper would no-op silently.
+    sheet_url = write_prospects_to_sheet(sheet_rows, columns=["profileUrl"])
     click.echo(f"  Wrote {len(sheet_rows)} URLs to Google Sheet")
 
-    from clients.phantombuster import get_phantombuster_credentials
-
-    session_cookie, session_ua = get_phantombuster_credentials()
-    # API ``arguments`` REPLACE the phantom's saved console args wholesale, so
-    # pass the per-launch count explicitly or the phantom truncates at its
-    # default. ``profiles_per_launch`` adds the sheet header line PB counts as
-    # a processable row (else the LAST repair row is silently dropped — see
-    # clients.google_sheets.profiles_per_launch). After the cap above,
-    # ``len(sheet_rows)`` is bounded by REPAIR_MAX_PROFILES_PER_LAUNCH, so
-    # batch + header stays under the phantom schema max and PB never rejects
-    # the whole launch.
+    # Saved-args + identities-inject contract lives in the shared helper
+    # (raises SalesNavConfigError if the SN cookie env var is missing).
+    # launch_count: ``profiles_per_launch`` adds the sheet header line PB
+    # counts as a processable row (else the LAST repair row is silently
+    # dropped — see clients.google_sheets.profiles_per_launch). API
+    # ``arguments`` REPLACE the phantom's saved console args wholesale, so the
+    # per-launch count must be explicit or the phantom truncates at its
+    # built-in default (10). After the cap above, ``len(sheet_rows)`` is
+    # bounded by REPAIR_MAX_PROFILES_PER_LAUNCH, so batch + header stays under
+    # the phantom schema max and PB never rejects the whole launch.
+    csv_name = _fresh_csv_name("repair")
     launch_args: dict = {
-        "spreadsheetUrl": sheet_url,
-        "numberOfProfilesPerLaunch": profiles_per_launch(len(sheet_rows)),
+        **build_sales_nav_launch_args(
+            pb,
+            sales_nav_profile_scraper_id,
+            spreadsheet_url=sheet_url,
+            launch_count=profiles_per_launch(len(sheet_rows)),
+        ),
+        # Fresh result-file name per launch: PB keys the phantom's
+        # processed-inputs dedup DB on the file name, and a repair re-scrape
+        # MUST re-visit profiles a prior daily-run scrape already processed.
+        "csvName": csv_name,
     }
-    if session_cookie:
-        launch_args["sessionCookie"] = session_cookie
-        launch_args["userAgent"] = session_ua
 
-    click.echo("  Launching Profile Scraper...")
-    launch = pb.launch_agent(profile_scraper_id, launch_args)
+    click.echo("  Launching Sales Nav Profile Scraper...")
+    launch = pb.launch_agent(sales_nav_profile_scraper_id, launch_args)
 
-    # Step 3: Wait and download (F-PR-5: typed launch, container-keyed CSV)
-    click.echo("  Waiting for completion (up to 10 min)...")
-    pb.wait_for_completion(launch, poll_interval=15, max_wait=600)
+    # Step 3: Wait and download (F-PR-5: typed launch, container-keyed CSV).
+    # 900s ceiling: the SN scraper queues + executes slower than the deleted
+    # legacy scraper (daily_check Phase 0 uses 750s) and repair batches run up
+    # to the full 50-profile cap, so give it the old 600s plus headroom.
+    click.echo("  Waiting for completion (up to 15 min)...")
+    pb.wait_for_completion(launch, poll_interval=15, max_wait=900)
 
-    result_csv = pb.download_result_csv(launch)
+    result_csv = pb.download_result_csv(launch, csv_name=csv_name)
     if not result_csv:
-        click.echo("  ERROR: Profile Scraper returned no CSV")
-        return {"processed": 0, "linked": 0, "failed": 0, "skipped": 0, "deferred": deferred}
+        # "error" key distinguishes this failure from a clean run over an
+        # empty detect CSV (which returns the same zero counters) — the
+        # caller must surface it as a FAILURE, not "Repair Complete". Same
+        # pattern as Phase 0's graceful-degrade return in daily_check.
+        click.echo("  ERROR: Sales Nav Profile Scraper returned no CSV", err=True)
+        return {
+            "processed": 0, "linked": 0, "failed": 0, "skipped": 0,
+            "deferred": deferred, "error": "no_csv",
+        }
 
     pb_output_path = f"exports/repair_companies_pb_{date.today().isoformat()}.csv"
     with open(pb_output_path, "w", encoding="utf-8") as f:

@@ -61,7 +61,10 @@ def _enable_sales_nav_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _enable_regular_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("PRE_INVITE_DEGREE_CHECK_BACKEND", raising=False)
+    # Explicit since the default flip to sales_nav: an unset backend var now
+    # resolves to sales_nav and raises on the missing SN scraper-id/cookie
+    # below.
+    monkeypatch.setenv("PRE_INVITE_DEGREE_CHECK_BACKEND", "regular")
     monkeypatch.delenv("PB_SALES_NAV_PROFILE_SCRAPER_ID", raising=False)
     monkeypatch.delenv("PB_LI_SALES_NAV_SESSION_COOKIE", raising=False)
 

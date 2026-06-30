@@ -48,9 +48,10 @@ from workflows.daily_check_helpers import (
     _get_all_entries_parsed,
     _get_all_entries_with_raw,
     _normalize_linkedin_url,
-    _pb_sales_nav_session_args,
     _pb_session_args,
     _resolve_degree_check_backend,
+    build_sales_nav_launch_args,
+    preflight_legacy_profile_scraper,
 )
 
 # Intentional re-exports — silence F401. UnresolvedPlaceholderError is
@@ -795,7 +796,6 @@ def detect_accepted_connections(
     """
     import csv
     import io
-    import json
 
     list_id = os.environ.get("ATTIO_LIST_ID", "")
     all_parsed = _get_all_entries_parsed(attio)
@@ -974,22 +974,16 @@ def detect_accepted_connections(
 
     click.echo(f"  Checking {len(conn_sent_stale)} CONNECTION_SENT profiles via Profile Scraper...")
 
-    # Build URL set for matching results back to our batch
-    our_urls = {_normalize_linkedin_url(p["linkedin_url"]) for p in conn_sent_stale}
-
-    # Write to Google Sheet and launch Profile Scraper (expects 'profileUrl' column)
-    sheet_rows = [{"profileUrl": p["linkedin_url"]} for p in conn_sent_stale]
-    sheet_url = write_prospects_to_sheet(sheet_rows, columns=["profileUrl"])
-
     # PR-Phase-0-SN-migration: branch on the same flag the pre-invite path
     # already honors. ``regular`` keeps the legacy top-level-cookie launch
-    # for the LinkedIn Profile Scraper. ``sales_nav`` mirrors
-    # workflows.pre_invite_check._run_sales_nav_scraper: fetch the saved
-    # phantom argument, inject the fresh SN session into ``identities[0]``,
-    # and POST the FULL arg shape. The SN phantom (verified 2026-05-25
-    # against id 602790655114603) rejects partial argument objects with
-    # "Your Phantom Argument Isn't Valid" — top-level ``sessionCookie`` is
-    # silently ignored when ``identities`` is present.
+    # for the LinkedIn Profile Scraper (documented-dead — see the preflight
+    # below). ``sales_nav`` POSTs the full saved-args + identities-inject
+    # shape via daily_check_helpers.build_sales_nav_launch_args (the contract
+    # the SN phantom enforces — see that helper's docstring).
+    #
+    # Resolve + preflight BEFORE the sheet write below: a config error
+    # (invalid backend value, missing SN env, dead legacy agent id) must
+    # not burn a write to the production autoconnect sheet first.
     backend = _resolve_degree_check_backend()
     if backend == "sales_nav":
         if not sales_nav_profile_scraper_id:
@@ -999,22 +993,40 @@ def detect_accepted_connections(
                 "sales_nav_profile_scraper_id was not provided. "
                 "Caller (cli.py daily) must pass PB_SALES_NAV_PROFILE_SCRAPER_ID."
             )
+    else:
+        # DOCUMENTED-DEAD legacy path: the legacy Profile Scraper agent was
+        # deleted from the PB workspace and backend=regular is no longer the
+        # default. Preflight turns the otherwise-raw httpx 404 at launch into
+        # an actionable config error. Branch kept for a future re-deployed
+        # phantom (rollback requires a NEW agent id).
+        preflight_legacy_profile_scraper(pb, profile_scraper_id)
+
+    # Build URL set for matching results back to our batch
+    our_urls = {_normalize_linkedin_url(p["linkedin_url"]) for p in conn_sent_stale}
+
+    # Write to Google Sheet and launch Profile Scraper (expects 'profileUrl' column)
+    sheet_rows = [{"profileUrl": p["linkedin_url"]} for p in conn_sent_stale]
+    sheet_url = write_prospects_to_sheet(sheet_rows, columns=["profileUrl"])
+
+    if backend == "sales_nav":
+        # Already guaranteed non-None by the resolve-time guard above (the
+        # first backend branch raises when it's missing) — re-narrow for the
+        # type checker now that the guard and the launch live in separate
+        # blocks (config errors must precede the sheet write between them).
+        assert sales_nav_profile_scraper_id is not None
         click.echo("  Launching Sales Nav Profile Scraper...")
-        agent = pb.get_agent(sales_nav_profile_scraper_id)
-        raw_arg = agent.get("argument") or "{}"
-        saved = json.loads(raw_arg) if isinstance(raw_arg, str) else raw_arg
-        session = _pb_sales_nav_session_args()
-        identities = saved.get("identities") or [{}]
-        identities[0].update(session)
         csv_name = _fresh_csv_name("deg")
         launch_args = {
-            **saved,
-            "identities": identities,
-            "spreadsheetUrl": sheet_url,
-            # +1 for the sheet header row PB counts as a processable line —
-            # see clients.google_sheets.profiles_per_launch (2026-06-12
-            # last-row-dropped incident).
-            "numberOfProfilesPerLaunch": profiles_per_launch(len(conn_sent_stale)),
+            # Saved-args + identities-inject contract lives in the shared
+            # helper. launch_count: +1 for the sheet header row PB counts as
+            # a processable line — see clients.google_sheets.profiles_per_launch
+            # (last-row-dropped incident).
+            **build_sales_nav_launch_args(
+                pb,
+                sales_nav_profile_scraper_id,
+                spreadsheet_url=sheet_url,
+                launch_count=profiles_per_launch(len(conn_sent_stale)),
+            ),
             # PB keys the phantom's processed-inputs DB on the result file
             # name; a fresh name per launch forces re-scrape (Phase 0 exists
             # to observe 2nd→1st flips ON re-scrape) and isolates this
@@ -1028,8 +1040,7 @@ def detect_accepted_connections(
         launch = pb.launch_agent(profile_scraper_id, {
             "spreadsheetUrl": sheet_url,
             # Same dedup-bust as the sales_nav branch: the legacy scraper
-            # keys its processed-inputs DB on the result filename too, and
-            # this branch is the PRE_INVITE_DEGREE_CHECK_BACKEND default —
+            # keys its processed-inputs DB on the result filename too —
             # without csvName it retains the original confident-zero bug.
             "csvName": csv_name,
             **_pb_session_args(),

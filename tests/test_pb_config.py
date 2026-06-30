@@ -69,7 +69,9 @@ def _write_yaml(config_dir: Path, body: str) -> None:
 
 class TestNoYaml:
     def test_unset_env_yields_empty_ids_and_default_backend(self, clean_env):
-        """No yaml, no env: IDs are "" and backend defaults to "regular"."""
+        """No yaml, no env: IDs are "" and backend defaults to "sales_nav"
+        (flipped when the legacy Profile Scraper agent was deleted from the
+        PB workspace — see clients.pb_config._BACKEND_DEFAULT)."""
         cfg = load_pb_config()
         assert isinstance(cfg, PBConfig)
         assert cfg.search_export_id == ""
@@ -79,7 +81,7 @@ class TestNoYaml:
         assert cfg.sales_nav_profile_scraper_id == ""
         assert cfg.sales_nav_url_converter_id == ""
         assert cfg.inbox_scraper_id == ""
-        assert cfg.degree_check_backend_raw == "regular"
+        assert cfg.degree_check_backend_raw == "sales_nav"
 
     def test_env_supplies_ids_when_no_yaml(self, clean_env, monkeypatch):
         """No yaml: each ID comes from its env var."""
@@ -104,10 +106,10 @@ class TestNoYaml:
 
     def test_loader_is_live_not_cached(self, clean_env, monkeypatch):
         """Each call re-reads env — required for hot-reload + conftest delenv."""
-        monkeypatch.setenv("PRE_INVITE_DEGREE_CHECK_BACKEND", "sales_nav")
-        assert load_pb_config().degree_check_backend_raw == "sales_nav"
-        monkeypatch.delenv("PRE_INVITE_DEGREE_CHECK_BACKEND", raising=False)
+        monkeypatch.setenv("PRE_INVITE_DEGREE_CHECK_BACKEND", "regular")
         assert load_pb_config().degree_check_backend_raw == "regular"
+        monkeypatch.delenv("PRE_INVITE_DEGREE_CHECK_BACKEND", raising=False)
+        assert load_pb_config().degree_check_backend_raw == "sales_nav"
 
 
 # ---------------------------------------------------------------------------
