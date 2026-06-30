@@ -251,6 +251,14 @@ def _launch_and_download(
         click.echo("Error: PB_LI_SESSION_COOKIE not set.")
         return None
 
+    # PR #179 pattern applied to the weekly scrape: PB keys its
+    # processed-inputs dedup database on the result CSV filename. A static
+    # csvName (the default "result") makes a re-run of the same saved search
+    # return PB's frozen cached set instead of re-scraping. A fresh per-launch
+    # name busts that dedup AND yields a CSV with only this run's rows.
+    from workflows.daily_check_helpers import _fresh_csv_name
+    csv_name = _fresh_csv_name("wk")
+
     launch_args = {
         "inputType": "salesNavigatorSearchUrl",
         "salesNavigatorSearchUrl": sn_url,
@@ -258,6 +266,7 @@ def _launch_and_download(
         "numberOfLinesPerLaunch": batch_size,
         "removeDuplicateProfiles": True,
         "numberOfProfiles": 200,
+        "csvName": csv_name,
         "identities": [{
             "sessionCookie": li_cookie,
             "userAgent": li_ua or "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
@@ -268,8 +277,10 @@ def _launch_and_download(
     click.echo("  Waiting for export to complete...")
     pb.wait_for_completion(launch, poll_interval=15, max_wait=600)
 
-    # F-PR-5: CSV keyed to launch.container_id, not "latest".
-    return pb.download_result_csv(launch)
+    # F-PR-5: CSV keyed to launch.container_id, not "latest". The per-launch
+    # csvName MUST be passed here too, or the agent-scoped fallback fetches a
+    # stale file (see clients/phantombuster.download_result_csv).
+    return pb.download_result_csv(launch, csv_name=csv_name)
 
 
 def _quarantine_business_days() -> int:
@@ -891,6 +902,7 @@ def _commit_prospect(
     anthropic_client=None,
     existing_entries: list[Entry] | None = None,
     in_list_record_ids: set[str] | None = None,
+    summary: dict | None = None,
 ) -> bool:
     """Upsert a qualified prospect to Attio and add them to the pipeline list.
 
@@ -967,6 +979,17 @@ def _commit_prospect(
     if not record_id:
         click.echo("      → Failed to upsert Attio record")
         return False
+
+    # Supply accounting (2026-06-16 root cause): a record already in the
+    # pipeline list at run start is being re-stamped, not newly sourced — it
+    # adds zero net-new supply. Classify BEFORE the add (in_list_record_ids is
+    # mutated below) so the weekly summary can tell real supply from churn.
+    if summary is not None:
+        already_listed = (
+            in_list_record_ids is not None and record_id in in_list_record_ids
+        )
+        key = "restamped_existing" if already_listed else "net_new_created"
+        summary[key] = summary.get(key, 0) + 1
 
     new_entry = _safe_add_list_entry(
         crm,
@@ -1494,6 +1517,65 @@ def _open_disqualifier_match_row(
     )
 
 
+def _load_in_list_canonical_urls(
+    crm: CRMProvider, existing_entries: list[Entry]
+) -> set[str]:
+    """Build the set of canonical LinkedIn URLs already in the pipeline list.
+
+    Reads the entry-level `canonical_linkedin_url` where present (free — the
+    entries are already fetched), and resolves the rest from the parent person
+    records in a single bulk read (legacy entries predate that attribute, so
+    relying on it alone would miss exactly the old records that get recycled).
+    Per-record fetch failures are isolated by the provider's `bulk_fetch_persons`
+    and simply leave that URL out of the set — the candidate then falls back to
+    the live-search dedup, so a partial CRM outage degrades to current behaviour,
+    never worse.
+
+    The bulk read and the per-person URL extraction both go through the
+    vendor-neutral `CRMProvider` contract (`bulk_fetch_persons` →
+    `{record_id: Record}`, `extract_person_info` → `RecordInfo.linkedin_url`)
+    so this stays adapter-agnostic.
+    """
+    urls: set[str] = set()
+    need_lookup: set[str] = set()
+    for entry in existing_entries:
+        entry_url = entry.attributes.get("canonical_linkedin_url") or ""
+        canonical = _canonical_linkedin_url(entry_url) if entry_url else ""
+        if canonical:
+            urls.add(canonical)
+        elif entry.record_id:
+            need_lookup.add(entry.record_id)
+
+    if need_lookup:
+        persons = crm.bulk_fetch_persons(need_lookup)
+        resolved = 0
+        for person in persons.values():
+            url = crm.extract_person_info(person).linkedin_url
+            canonical = _canonical_linkedin_url(url) if url else ""
+            if canonical:
+                urls.add(canonical)
+                resolved += 1
+        # Surface partial under-coverage loudly: a bulk-fetch outage or
+        # missing `linkedin` fields silently shrinks the dedup set, letting
+        # those records fall back to the flaky live search (the exact recycle
+        # path this fix closes). Better to see it than to silently regress.
+        if resolved < len(need_lookup):
+            logger.warning(
+                "in_list_canonical_urls: %d/%d gap records did not resolve to a "
+                "URL (bulk-fetch failure or missing linkedin) — dedup under-covers "
+                "them; they fall back to live-search",
+                len(need_lookup) - resolved, len(need_lookup),
+            )
+
+    if existing_entries and not urls:
+        logger.warning(
+            "in_list_canonical_urls empty: %d entries scanned, 0 resolved to a "
+            "canonical URL — the recycle-fix dedup will not fire this run",
+            len(existing_entries),
+        )
+    return urls
+
+
 def _process_prospects(
     prospects_raw: list[dict],
     crm: CRMProvider,
@@ -1510,6 +1592,7 @@ def _process_prospects(
     anthropic_client=None,
     existing_entries: list[Entry] | None = None,
     seen_urls_midmarket: set[str] | None = None,
+    in_list_canonical_urls: set[str] | None = None,
 ) -> None:
     """Score, dedup, and load prospects into Attio. Mutates summary and seen_urls in place.
 
@@ -1655,6 +1738,22 @@ def _process_prospects(
 
         summary["qualified"] += 1
 
+        # Authoritative dedup (2026-06-16 recycle fix): check the candidate's
+        # canonical URL against the set of URLs already in the pipeline, built
+        # once at run start from the list itself. This is immune to the
+        # eventual-consistency misses of the live `search_person_by_linkedin`
+        # below — a miss there used to let an already-listed record fall through
+        # to _commit_prospect, which re-stamped its existing entry's cohort
+        # fields (week_starting/prospect_committed_at/invite_eligible_after/
+        # dm_step) and recycled it as a "fresh" PROSPECT (Pattern-A pollution).
+        # Catching it here means a search miss can no longer recycle an
+        # existing record.
+        canonical = _canonical_linkedin_url(prospect_data["linkedin_url"])
+        if in_list_canonical_urls and canonical and canonical in in_list_canonical_urls:
+            click.echo("      → Already in pipeline (canonical-URL match) — skipping")
+            summary["duplicates"] += 1
+            continue
+
         existing = crm.search_person_by_linkedin(prospect_data["linkedin_url"])
         if existing:
             record_id = existing.record_id
@@ -1707,6 +1806,7 @@ def _process_prospects(
             anthropic_client=anthropic_client,
             existing_entries=existing_entries,
             in_list_record_ids=in_list_record_ids,
+            summary=summary,
         )
         if not ok:
             summary.setdefault("write_errors", 0)
@@ -1718,6 +1818,20 @@ def _process_prospects(
             f"      → Added: score={score_result['score']}, "
             f"persona={score_result['persona']}, lang={score_result['language']}"
         )
+
+
+def _is_supply_starved(summary: dict, dry_run: bool) -> bool:
+    """True when a real (non-dry) run qualified candidates but sourced zero
+    net-new prospects — every qualified candidate was already in the pipeline
+    (re-stamped on commit, skipped as a duplicate, or staged for re-prospect
+    review). This is the 2026-06-16 silent-starvation signature: the run looks
+    successful ("773 scored / 417 passing") while adding nothing.
+    """
+    if dry_run:
+        return False
+    if not summary.get("qualified"):
+        return False
+    return summary.get("net_new_created", 0) == 0
 
 
 def run_weekly_prospecting(
@@ -1772,6 +1886,11 @@ def run_weekly_prospecting(
         "duplicates": 0,
         "rejected": 0,
         "added": 0,
+        # Supply accounting: of the commits counted in `added`, how many were
+        # genuine net-new pipeline entries vs re-stamps of records that were
+        # already in the list at run start. `added` conflates the two.
+        "net_new_created": 0,
+        "restamped_existing": 0,
         "borderline_staged": 0,
         "reprospect_review": 0,
         # Per-verdict-path rejection counts, surfaced in the run summary so
@@ -1826,6 +1945,14 @@ def run_weekly_prospecting(
     in_list_record_ids: set[str] = {e.record_id for e in existing_entries}
     click.echo(f"  {len(in_list_record_ids)} records already in pipeline.\n")
 
+    # Authoritative canonical-URL set for the recycle fix: the live
+    # search_person_by_linkedin dedup is eventual-consistent and misses
+    # already-listed records, which then get recycled/re-stamped. This set
+    # (built once from the list itself, resolving URLs the entry doesn't carry
+    # via one bulk read) lets _process_prospects skip them deterministically.
+    in_list_canonical_urls = _load_in_list_canonical_urls(crm, existing_entries)
+    click.echo(f"  {len(in_list_canonical_urls)} canonical URLs resolved for dedup.\n")
+
     for i, (persona_key, geo_key, sn_url) in enumerate(searches, 1):
         click.echo(f"[{i}/{len(searches)}] {persona_key} / {geo_key}")
         click.echo(f"  URL: {sn_url[:80]}...")
@@ -1858,6 +1985,7 @@ def run_weekly_prospecting(
             anthropic_client=anthropic_client,
             existing_entries=existing_entries,
             seen_urls_midmarket=seen_urls_midmarket,
+            in_list_canonical_urls=in_list_canonical_urls,
         )
         click.echo()
 
@@ -1903,7 +2031,34 @@ def run_weekly_prospecting(
         )
     if summary.get("reprospect_review"):
         click.echo(f"Re-review:  {summary['reprospect_review']} (existing person, no list entry — needs manual triage)")
+    net_new = summary.get("net_new_created", 0)
+    restamped = summary.get("restamped_existing", 0)
     click.echo(f"Added:      {summary['added']}")
+    click.echo(f"   ├ net-new pipeline entries: {net_new}")
+    click.echo(f"   └ already-listed records re-stamped: {restamped}")
+
+    # Loud supply alarm: a run that qualifies candidates but sources zero
+    # net-new prospects means the saved searches are exhausted (re-scoring the
+    # existing pool). Without this the run reads as success — "773 scored / 417
+    # passing" — while adding nothing (2026-06-16 silent starvation).
+    if _is_supply_starved(summary, dry_run):
+        click.echo("", err=True)
+        click.echo(
+            "⚠️  SUPPLY ALARM: 0 net-new prospects entered the pipeline this run.",
+            err=True,
+        )
+        click.echo(
+            f"   {summary['qualified']} qualified, but none were net-new — all "
+            f"were already in the pipeline: {restamped} re-stamped, "
+            f"{summary.get('duplicates', 0)} duplicates, "
+            f"{summary.get('reprospect_review', 0)} staged for re-prospect review.",
+            err=True,
+        )
+        click.echo(
+            "   The Sales Nav saved searches are likely exhausted — refresh the "
+            "configured search inputs (the persona search URLs).",
+            err=True,
+        )
 
     if summary["borderline_staged"] > 0:
         n = summary["borderline_staged"]
