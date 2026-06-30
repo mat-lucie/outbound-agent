@@ -285,6 +285,127 @@ class TestUpsertPersonLinkedInDedup:
             )
         assert result["id"]["entry_id"] == "entry-fresh"
 
+    # ── Fix 3: defense-in-depth stage-regression backstop ──────────────────
+    # The weekly re-stamp class PATCHed an existing entry with a lower stage
+    # (Accepted/Prospect over DM3 Sent), wiping cadence depth. add_list_entry
+    # now drops a regressing `stage` (and `dm_step`) key on the existing-entry
+    # PATCH while letting the other attrs through, and logs loudly.
+
+    @staticmethod
+    def _existing_entry(stage_title: str) -> dict:
+        return {
+            "id": {"entry_id": "entry-existing", "list_id": "list-X"},
+            "parent_record_id": "rec-1",
+            "entry_values": {"stage": [{"status": {"title": stage_title}}]},
+            "created_at": "2026-04-01T00:00:00Z",
+        }
+
+    def test_add_list_entry_drops_regressing_stage_keeps_other_attrs(
+        self, attio: AttioClient, caplog
+    ) -> None:
+        existing = self._existing_entry("DM3 Sent")
+        patched: dict = {}
+
+        def fake_request(method, path, json=None, **_):
+            if method == "POST" and path.endswith("/entries/query"):
+                return {"data": [existing]}
+            if method == "PATCH" and path == "/lists/list-X/entries/entry-existing":
+                patched["values"] = json["data"]["entry_values"]
+                return {"data": {"id": {"entry_id": "entry-existing"}}}
+            raise AssertionError(f"Unexpected call: {method} {path}")
+
+        with patch.object(attio, "_request", side_effect=fake_request), \
+                caplog.at_level("WARNING"):
+            attio.add_list_entry(
+                record_id="rec-1",
+                stage_name="Accepted",  # rank 2 < DM3 Sent rank 5 → regression
+                entry_attributes={"dm_step": 0, "persona": "operations_leaders"},
+                list_id="list-X",
+            )
+
+        # stage AND dm_step stripped together (the cadence-depth pair) so the
+        # backstop can't manufacture the stage=DM3/dm_step=0 corruption this
+        # guard fixes; non-cadence attrs preserved.
+        assert "stage" not in patched["values"]
+        assert "dm_step" not in patched["values"]
+        assert patched["values"]["persona"] == "operations_leaders"
+        # The neutralized regression is observable in aggregate, not just logs.
+        assert attio.stage_regressions_blocked == 1
+        # Loud, structured warning with the diagnostic fields.
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "entry-existing" in joined
+        assert "DM3 Sent" in joined
+        assert "Accepted" in joined
+
+    def test_add_list_entry_allows_forward_stage_transition(
+        self, attio: AttioClient
+    ) -> None:
+        existing = self._existing_entry("Accepted")  # rank 2
+        patched: dict = {}
+
+        def fake_request(method, path, json=None, **_):
+            if method == "POST" and path.endswith("/entries/query"):
+                return {"data": [existing]}
+            if method == "PATCH" and path == "/lists/list-X/entries/entry-existing":
+                patched["values"] = json["data"]["entry_values"]
+                return {"data": {"id": {"entry_id": "entry-existing"}}}
+            raise AssertionError(f"Unexpected call: {method} {path}")
+
+        with patch.object(attio, "_request", side_effect=fake_request):
+            attio.add_list_entry(
+                record_id="rec-1",
+                stage_name="DM1 Sent",  # rank 3 > Accepted rank 2 → forward
+                list_id="list-X",
+            )
+        assert patched["values"]["stage"] == "DM1 Sent"
+
+    def test_add_list_entry_keeps_equal_rank_stage(
+        self, attio: AttioClient
+    ) -> None:
+        existing = self._existing_entry("DM1 Sent")
+        patched: dict = {}
+
+        def fake_request(method, path, json=None, **_):
+            if method == "POST" and path.endswith("/entries/query"):
+                return {"data": [existing]}
+            if method == "PATCH" and path == "/lists/list-X/entries/entry-existing":
+                patched["values"] = json["data"]["entry_values"]
+                return {"data": {"id": {"entry_id": "entry-existing"}}}
+            raise AssertionError(f"Unexpected call: {method} {path}")
+
+        with patch.object(attio, "_request", side_effect=fake_request):
+            attio.add_list_entry(
+                record_id="rec-1",
+                stage_name="DM1 Sent",  # equal rank → not a regression, kept
+                list_id="list-X",
+            )
+        assert patched["values"]["stage"] == "DM1 Sent"
+
+    def test_add_list_entry_no_stage_attr_unaffected(
+        self, attio: AttioClient
+    ) -> None:
+        """A PATCH with no stage key (attrs-only) is untouched by the guard."""
+        existing = self._existing_entry("DM3 Sent")
+        patched: dict = {}
+
+        def fake_request(method, path, json=None, **_):
+            if method == "POST" and path.endswith("/entries/query"):
+                return {"data": [existing]}
+            if method == "PATCH" and path == "/lists/list-X/entries/entry-existing":
+                patched["values"] = json["data"]["entry_values"]
+                return {"data": {"id": {"entry_id": "entry-existing"}}}
+            raise AssertionError(f"Unexpected call: {method} {path}")
+
+        with patch.object(attio, "_request", side_effect=fake_request):
+            attio.add_list_entry(
+                record_id="rec-1",
+                stage_name="",  # no stage written into attrs
+                entry_attributes={"last_contact_date": "2026-06-24"},
+                list_id="list-X",
+            )
+        assert patched["values"]["last_contact_date"] == "2026-06-24"
+        assert "stage" not in patched["values"]
+
     def test_upsert_canonicalizes_linkedin_before_storing(self, attio: AttioClient) -> None:
         """New records get the canonical URL written to Attio, not the raw input."""
         captured: dict = {}

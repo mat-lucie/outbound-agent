@@ -107,6 +107,7 @@ ESCALATION_TYPES: tuple[str, ...] = (
 
     # ---- Prospect-weekly (§4.5) ----
     "icp2_geo_violation",
+    "recent_outreach_map_empty",
     "target_list_stale",
     "weekly_borderline_orphan",
     "icp_geo_unresolved",
@@ -184,6 +185,15 @@ ESCALATION_TYPES: tuple[str, ...] = (
     # re-joins stale rows). Per-launch csvName bust prevents future
     # occurrences; this escalation surfaces any residual blind runs.
     "phase0_stale_scrape",
+
+    # ---- Phase 0 PROSPECT sweep (Defect 2) ----
+    # Emitted by workflows.daily_check.detect_accepted_connections when a
+    # PROSPECT-stage record is confirmed 1st-degree by the degree check BUT
+    # already carries DM engagement (dm_step>0 or any *_sent_at /
+    # response_received_at). Flipping such a row to ACCEPTED would wipe its
+    # cadence depth (Pattern-A regression). The sweep leaves it at PROSPECT
+    # and surfaces it for the repair tooling instead of guessing a DM stage.
+    "prospect_first_degree_with_depth",
 )
 
 ESCALATION_TYPES_SET: frozenset[str] = frozenset(ESCALATION_TYPES)
@@ -633,6 +643,30 @@ class Icp2GeoViolationPayload(TypedDict):
     scoring_lane: str
 
 
+# ---- Prospect-weekly: recent_outreach_map_empty payload ----
+
+
+class RecentOutreachMapEmptyPayload(TypedDict):
+    """`recent_outreach_map_empty` — the 14-day re-prospect guard's outreach
+    map came back empty against a NON-EMPTY pipeline list. This is the exact
+    fingerprint of the weekly re-stamp silent bug: `canonical_linkedin_url` was
+    NULL on 100% of list entries, so `_load_recent_outreach_map` always yielded
+    `{}` and the guard never fired.
+
+    Emitted by `workflows.weekly_prospect._load_recent_outreach_map`. Logging
+    alone hid this for months; the queue row makes the no-op operator-visible
+    within one run. Idempotency key is the run/cutoff date so re-runs on the
+    same day collapse to one row.
+
+    Only emitted when ``entries_with_canonical == 0`` (the dead-guard
+    fingerprint) — a map that is empty merely because no one was contacted in
+    the window is a benign quiet window and is NOT escalated.
+    """
+    entries_scanned: int
+    entries_with_canonical: int
+    cutoff_date: str
+
+
 # ---- Prospect-weekly PR-29: target_list_stale payload ----
 
 
@@ -1032,6 +1066,37 @@ class DmPersonAdvanceDesyncPayload(TypedDict):
     error_class: NotRequired[str]
 
 
+# ---- Phase 0 PROSPECT sweep (Defect 2) ----
+
+class ProspectFirstDegreeWithDepthPayload(TypedDict):
+    """`prospect_first_degree_with_depth` — emitted by
+    `workflows.daily_check.detect_accepted_connections`'s PROSPECT sweep when
+    a record sitting at PROSPECT is confirmed 1st-degree by the degree check
+    BUT already carries DM engagement (dm_step>0, or any of dm1/dm2/dm3_sent_at
+    / response_received_at set).
+
+    This is a Pattern-A regression: a record that was DM'd and then knocked
+    back to PROSPECT (manual edit, parallel writer, or a cadence-desync bug).
+    The sweep MUST NOT flip it to ACCEPTED — that would reset dm_step and wipe
+    the cadence depth — and it MUST NOT guess a DM stage. It leaves the record
+    at PROSPECT and opens this queue row so the repair tooling (which knows the
+    canonical depth from the timestamps) reconciles it.
+
+    `dm_step` is the raw stored slug. The four `*_set` booleans tell the
+    operator which timestamps are populated without a secondary lookup.
+    Idempotency key: `f"prospect-1st-depth|{record_id}|{date}"` — one row per
+    record per day.
+    """
+    record_id: str
+    entry_id: str
+    linkedin_url: str
+    dm_step: str
+    dm1_sent_at_set: bool
+    dm2_sent_at_set: bool
+    dm3_sent_at_set: bool
+    response_received_at_set: bool
+
+
 # ---- audit-silent-skip-escalations TypedDicts ----
 
 
@@ -1124,6 +1189,7 @@ ESCALATION_SCHEMAS: dict[str, type] = {
     "missing_language": MissingLanguagePayload,
     "missing_copy": MissingMessagePayload,
     "icp2_geo_violation": Icp2GeoViolationPayload,
+    "recent_outreach_map_empty": RecentOutreachMapEmptyPayload,
     "target_list_stale": TargetListStalePayload,
     "resend_delivery_failed": ResendDeliveryFailedPayload,
     "threshold_recommendation": ThresholdRecommendationPayload,
@@ -1143,6 +1209,8 @@ ESCALATION_SCHEMAS: dict[str, type] = {
     "missing_quality_score": MissingQualityScorePayload,
     "accepted_missing_last_contact_date": AcceptedMissingLastContactDatePayload,
     "stale_connection_sent": StaleConnectionSentPayload,
+    # Phase 0 PROSPECT sweep (Defect 2)
+    "prospect_first_degree_with_depth": ProspectFirstDegreeWithDepthPayload,
 }
 
 

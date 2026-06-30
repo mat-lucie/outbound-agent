@@ -33,7 +33,7 @@ from models.campaign import (
     personalize,
 )
 from models.experiment import get_current_experiment_id
-from models.pipeline import STAGE_RANK, PipelineStage, is_invite_eligible, is_send_eligible
+from models.pipeline import STAGE_RANK, PipelineStage, dm_step_int, is_invite_eligible, is_send_eligible  # noqa: E501
 from models.resolution import (
     MissingLanguageError,
     compute_next_eligible_send_date,
@@ -756,6 +756,196 @@ def _escalate_phase0_stale_scrape(
         )
 
 
+def _echo_phase0_prospect_summary(*, checked: int, accepted: int, regressions: int) -> None:
+    """Echo the Defect-2 PROSPECT sweep line. No-op when no PROSPECT
+    candidates were collected so quiet runs read identically to pre-Defect-2
+    output."""
+    if checked == 0:
+        return
+    click.echo(
+        f"  PROSPECT sweep: checked {checked}, {accepted} accepted "
+        f"(already 1st-degree), {regressions} Pattern-A regression(s) flagged."
+    )
+
+
+def _prospect_accept_disposition(attrs: dict) -> Literal["flip", "regression", "skip"]:
+    """Decide what the Phase 0 PROSPECT sweep should do with a 1st-degree row.
+
+    Defect 2: Phase 0 acceptance detection historically only scanned
+    CONNECTION_SENT rows, so a LinkedIn 1st-degree connection sitting at
+    PROSPECT (we connected outside the tracked invite flow, or they invited us)
+    was invisible and never entered the DM cadence. The PROSPECT sweep closes
+    that blind spot — but a row can be at PROSPECT for two very different
+    reasons, and only ONE is safe to flip:
+
+      * "flip" (Pattern B — externally connected, never messaged): ZERO
+        engagement — dm_step coerces to 0 AND none of dm1/dm2/dm3_sent_at /
+        response_received_at are set. Flipping to ACCEPTED enters DM1 cadence
+        from scratch, which is exactly right.
+
+      * "regression" (Pattern A — DM'd then knocked back to PROSPECT): degree
+        is 1st but the row carries DM depth (dm_step>0 OR any *_sent_at OR
+        response_received_at). Flipping to ACCEPTED would reset dm_step and
+        WIPE the cadence depth, re-sending DM1 to someone already mid-cadence.
+        The sweep must NOT flip and must NOT guess a DM stage — it escalates
+        and leaves the row at PROSPECT for the repair tooling.
+
+      * "skip": caller-side guard — anything else (not yet used since the
+        caller only invokes this for confirmed-1st PROSPECT rows, but kept
+        explicit so the contract is total).
+
+    The caller is responsible for confirming degree=="1st" AND stage==PROSPECT
+    before consulting this; the disposition only reasons about engagement depth.
+    """
+    has_depth = (
+        dm_step_int(attrs.get("dm_step")) > 0
+        or bool(attrs.get("dm1_sent_at"))
+        or bool(attrs.get("dm2_sent_at"))
+        or bool(attrs.get("dm3_sent_at"))
+        or bool(attrs.get("response_received_at"))
+    )
+    return "regression" if has_depth else "flip"
+
+
+def _phase0_flip_one(
+    attrs: dict,
+    *,
+    attio: AttioClient,
+    list_id: str,
+    today_iso: str,
+    cache: RecordCache,
+    helper_escalate_failures: list,
+    cached: bool,
+) -> Literal["accepted", "regression", "skip"]:
+    """Apply the Phase 0 acceptance disposition to ONE confirmed-1st row.
+
+    Shared by both the cache-hit and post-scrape flip loops, and by both
+    candidate stages (CONNECTION_SENT and PROSPECT). Branches on the
+    candidate's ``_phase0_kind`` tag:
+
+      * ``conn_sent`` — the historical path, UNCHANGED in behavior: a 1st
+        degree is unconditionally flipped to ACCEPTED. CONNECTION_SENT rows
+        are tracked invites, so a 1st degree is an accepted invite by
+        definition; no engagement-depth gate applies.
+
+      * ``prospect`` — Defect 2 sweep: route through
+        ``_prospect_accept_disposition``. ZERO-engagement rows flip to
+        ACCEPTED (Pattern B); rows with DM depth are a Pattern-A regression —
+        do NOT flip (would wipe cadence depth), escalate instead and leave at
+        PROSPECT.
+
+    ``cached`` only tweaks the success log line ("cached" suffix) so the two
+    call sites read identically to the pre-refactor output.
+
+    Returns ``"accepted"`` (stage advanced), ``"regression"`` (Pattern-A row
+    escalated, left at PROSPECT), or ``"skip"`` (write failed — the helper
+    already opened the attio_write_failed row).
+    """
+    kind = attrs.get("_phase0_kind", "conn_sent")
+    url = attrs["linkedin_url"]
+
+    if kind == "prospect":
+        disposition = _prospect_accept_disposition(attrs)
+        if disposition == "regression":
+            _escalate_prospect_first_degree_with_depth(
+                attrs, attio=attio, escalate_failures=helper_escalate_failures
+            )
+            return "regression"
+        # disposition == "flip" → fall through to the ACCEPTED advance below.
+        label = "Phase 0 PROSPECT sweep flip"
+        step_label = "phase0_prospect_accepted"
+    else:
+        label = "Phase 0 cache-hit flip" if cached else "Phase 0 PB flip"
+        step_label = "phase0_cache_hit_accepted" if cached else "phase0_pb_accepted"
+
+    phase0_update = _phase0_accepted_update(attrs, label=label)
+    # F-PR-4 §3.15: route through _attio_advance_with_escalation so a transient
+    # Attio error opens an attio_write_failed queue row instead of being
+    # swallowed. prior_stage carries the entry's ACTUAL stage (Wave-2-B
+    # code-reviewer B1) so the monotonicity gate catches a drifted row instead
+    # of a fabricated prior. PROSPECT(rank0)→ACCEPTED(rank2) is forward.
+    ok = _attio_advance_with_escalation(
+        attio=attio,
+        entry_id=attrs["entry_id"],
+        entry_attributes=phase0_update,
+        list_id=list_id,
+        linkedin_url=url,
+        today=today_iso,
+        step_label=step_label,
+        writer_module="workflows.daily_check.detect_accepted_connections",
+        prior_stage=attrs.get("stage"),
+        person_record_id=attrs.get("record_id"),
+        escalate_failures=helper_escalate_failures,
+    )
+    if not ok:
+        return "skip"
+    name, _, _, _, _ = cache.get(attrs["record_id"])
+    if kind == "prospect":
+        click.echo(f"  ✓ {name} accepted (PROSPECT sweep, 1st-degree)")
+    else:
+        suffix = ", cached" if cached else ""
+        click.echo(
+            f"  ✓ {name} accepted (sent {attrs.get('last_contact_date', '?')}{suffix})"
+        )
+    return "accepted"
+
+
+def _escalate_prospect_first_degree_with_depth(
+    attrs: dict, *, attio: AttioClient, escalate_failures: list | None = None
+) -> None:
+    """Open a ``prospect_first_degree_with_depth`` queue row for a Pattern-A
+    regression caught by the PROSPECT sweep (a 1st-degree PROSPECT that already
+    carries DM depth). Wrapped in swallow-and-log so a queue-write outage never
+    crashes the Phase 0 sweep — mirrors the other escalate() guards here.
+
+    On escalate failure the row is appended to ``escalate_failures`` (when
+    provided) so it joins the end-of-batch ERROR rollup — without it, a
+    queue-write outage during a regression would only scroll past as a per-row
+    WARN and the operator would get no aggregated paging-level signal.
+    """
+    record_id = str(attrs.get("record_id", ""))
+    click.echo(
+        f"  ⚠ PROSPECT sweep: {attrs.get('linkedin_url', '<unknown>')!r} is "
+        f"1st-degree but carries DM depth (dm_step={attrs.get('dm_step')!r}) — "
+        f"NOT flipping to ACCEPTED (would wipe cadence depth). Pattern-A "
+        f"regression; opening prospect_first_degree_with_depth for repair.",
+        err=True,
+    )
+    try:
+        escalate(
+            type="prospect_first_degree_with_depth",
+            # operator_today() (OUTBOUND_TZ), not date.today() (UTC), so the
+            # row's date aligns with the daily_run run_date for forensics —
+            # matches the Phase 0 degrade escalations.
+            idempotency_key=(
+                f"prospect-1st-depth|{record_id}|{operator_today().isoformat()}"
+            ),
+            payload={
+                "record_id": record_id,
+                "entry_id": str(attrs.get("entry_id", "")),
+                "linkedin_url": str(attrs.get("linkedin_url", "")),
+                "dm_step": str(attrs.get("dm_step") or ""),
+                "dm1_sent_at_set": bool(attrs.get("dm1_sent_at")),
+                "dm2_sent_at_set": bool(attrs.get("dm2_sent_at")),
+                "dm3_sent_at_set": bool(attrs.get("dm3_sent_at")),
+                "response_received_at_set": bool(attrs.get("response_received_at")),
+            },
+            attio=attio,
+        )
+    except Exception as esc_exc:  # noqa: BLE001 — guard must not crash the sweep
+        click.echo(
+            f"  ⚠ could not open prospect_first_degree_with_depth escalation: "
+            f"{type(esc_exc).__name__}: {esc_exc}",
+            err=True,
+        )
+        if escalate_failures is not None:
+            escalate_failures.append({
+                "site": "_escalate_prospect_first_degree_with_depth",
+                "record_id": record_id,
+                "error_class": type(esc_exc).__name__,
+            })
+
+
 def detect_accepted_connections(
     attio: AttioClient,
     pb: PhantomBusterClient,
@@ -827,6 +1017,7 @@ def detect_accepted_connections(
         if not linkedin_url:
             continue
         attrs["linkedin_url"] = linkedin_url
+        attrs["_phase0_kind"] = "conn_sent"
         conn_sent.append(attrs)
 
     if skipped_stale:
@@ -834,6 +1025,35 @@ def detect_accepted_connections(
             f"  Skipping {skipped_stale} CONNECTION_SENT profiles older than "
             f"{ACCEPTANCE_CHECK_WINDOW_DAYS} days."
         )
+
+    # Defect 2: ALSO sweep PROSPECT-stage rows for already-1st degree
+    # connections (we connected outside the tracked invite flow, or they
+    # invited us). These were invisible to acceptance detection — only
+    # CONNECTION_SENT was scanned — so a real 1st-degree connection sat at
+    # PROSPECT forever and never entered the DM cadence. No 14-day window here
+    # (PROSPECTs have no invite last_contact_date); the recheck-cache TTL and
+    # the scrape cap provide rotation, and CONNECTION_SENT keeps scrape priority.
+    prospect_cands: list[dict] = []
+    for attrs in all_parsed:
+        if attrs["stage"] != PipelineStage.PROSPECT.value:
+            continue
+        # Sourced-gate (prospect-perception safety): only sweep records WE
+        # prospected. `prospect_committed_at` is stamped unconditionally on
+        # every pipeline commit (weekly_prospect._build_prospect_entry_attrs),
+        # so its presence is the reliable "this is a sales prospect we sourced"
+        # signal. A 1st-degree PROSPECT WITHOUT it is a manual/organic/imported
+        # connection (a peer, an inbound invite, a personal contact) we never
+        # intended to cold-DM — flipping it to ACCEPTED would drop it into the
+        # DM cadence and send a cold pitch. Skip those. (Gate before cache.get
+        # so we also avoid an unnecessary get_person on non-sourced records.)
+        if not attrs.get("prospect_committed_at"):
+            continue
+        _, _, linkedin_url, _, _ = cache.get(attrs["record_id"])
+        if not linkedin_url:
+            continue
+        attrs["linkedin_url"] = linkedin_url
+        attrs["_phase0_kind"] = "prospect"
+        prospect_cands.append(attrs)
 
     # L1-2: emit ONE aggregated stale_connection_sent queue row per day.
     # These rows are permanently beyond ACCEPTANCE_CHECK_WINDOW_DAYS and will
@@ -867,75 +1087,76 @@ def detect_accepted_connections(
             err=True,
         )
 
-    if not conn_sent:
-        click.echo("  No CONNECTION_SENT profiles to check.")
-        return {"accepted": 0, "checked": 0, "deferred": 0}
+    if not conn_sent and not prospect_cands:
+        click.echo("  No CONNECTION_SENT or PROSPECT profiles to check.")
+        return {
+            "accepted": 0,
+            "checked": 0,
+            "deferred": 0,
+            "prospects_checked": 0,
+            "prospects_accepted": 0,
+            "prospect_regressions_flagged": 0,
+        }
 
     # Consult recheck cache: profiles scraped in the last RECHECK_TTL_DAYS days
     # short-circuit the PB launch. Cached "1st" → flip to ACCEPTED now; cached
     # "2nd"/"3rd" → still pending, skip. Stale entries fall through to PB.
-    urls_in = [p["linkedin_url"] for p in conn_sent]
+    # Defect 2: PROSPECTs share the SAME cache/partition/flip pipeline as
+    # CONNECTION_SENT (DRY) — the per-row flip behavior branches on
+    # `_phase0_kind` inside _phase0_flip_one.
+    candidates = conn_sent + prospect_cands
+    urls_in = [p["linkedin_url"] for p in candidates]
     fresh_cache, stale_urls = recheck_cache.partition(urls_in)
     stale_set = set(stale_urls)
     conn_sent_stale = [p for p in conn_sent if p["linkedin_url"] in stale_set]
-    cache_hit_count = len(conn_sent) - len(conn_sent_stale)
+    prospect_stale = [p for p in prospect_cands if p["linkedin_url"] in stale_set]
+    cache_hit_count = len(candidates) - len(conn_sent_stale) - len(prospect_stale)
     if cache_hit_count:
         click.echo(
-            f"  Skipping {cache_hit_count} CONNECTION_SENT profiles cached "
+            f"  Skipping {cache_hit_count} profile(s) cached "
             f"within {recheck_cache.RECHECK_TTL_DAYS} days."
         )
 
     # Flip any cache-hit "1st" entries to ACCEPTED without re-scraping.
+    # Cache-hit flips are NOT capped (no PB cost) — apply to both stages.
     today_iso = date.today().isoformat()
     accepted = 0
+    prospects_accepted = 0
+    prospect_regressions_flagged = 0
     # Wave-1.6.3: same calibration as run_connection_requests for the
     # Phase 0 callers of _attio_advance_with_escalation. If escalate()
     # raises inside the helper, the helper now swallows + appends here so
     # the per-row loop survives and the end-of-function summary surfaces
     # the count loudly.
     helper_escalate_failures: list = []
-    for attrs in conn_sent:
+    for attrs in candidates:
         url = attrs["linkedin_url"]
         entry = fresh_cache.get(url)
         if not entry or entry.get("degree") != "1st":
             continue
-        # PR-21 (Lesson 4): Phase 0 ACCEPTED flip also stamps
-        # experiment_id_frozen_at="accepted" (preserving experiment_id).
-        # See `_phase0_accepted_update` for the canonical update + log.
-        phase0_update = _phase0_accepted_update(attrs, label="Phase 0 cache-hit flip")
-        # F-PR-4 §3.15: route through _attio_advance_with_escalation so a
-        # transient Attio error opens an attio_write_failed queue row
-        # instead of being swallowed by a broad-except + click.echo (the
-        # pre-fix behavior re-DM'd the prospect the next day because the
-        # ACCEPTED flip silently lost).
-        ok = _attio_advance_with_escalation(
+        outcome = _phase0_flip_one(
+            attrs,
             attio=attio,
-            entry_id=attrs["entry_id"],
-            entry_attributes=phase0_update,
             list_id=list_id,
-            linkedin_url=url,
-            today=today_iso,
-            step_label="phase0_cache_hit_accepted",
-            writer_module="workflows.daily_check.detect_accepted_connections",
-            # Wave-2-B fix-up (code-reviewer B1): pass the entry's
-            # actual stage from Attio, not the upstream-filter
-            # invariant (CONNECTION_SENT). If a row drifted (manual
-            # edit, parallel detect_responses advance), the
-            # monotonicity gate catches the regression instead of
-            # being silently bypassed by a fabricated prior.
-            prior_stage=attrs.get("stage"),
-            person_record_id=attrs.get("record_id"),
-            escalate_failures=helper_escalate_failures,
+            today_iso=today_iso,
+            cache=cache,
+            helper_escalate_failures=helper_escalate_failures,
+            cached=True,
         )
-        if ok:
+        if outcome == "accepted":
             accepted += 1
-            name, _, _, _, _ = cache.get(attrs["record_id"])
-            click.echo(
-                f"  ✓ {name} accepted (sent {attrs.get('last_contact_date', '?')}, cached)"
-            )
+            if attrs.get("_phase0_kind") == "prospect":
+                prospects_accepted += 1
+        elif outcome == "regression":
+            prospect_regressions_flagged += 1
 
-    if not conn_sent_stale:
-        click.echo(f"  Checked {len(conn_sent)} profiles, {accepted} accepted (all cached).")
+    if not conn_sent_stale and not prospect_stale:
+        click.echo(f"  Checked {len(candidates)} profiles, {accepted} accepted (all cached).")
+        _echo_phase0_prospect_summary(
+            checked=len(prospect_cands),
+            accepted=prospects_accepted,
+            regressions=prospect_regressions_flagged,
+        )
         if helper_escalate_failures:
             sites = ", ".join(
                 sorted({f["site"] for f in helper_escalate_failures})
@@ -949,30 +1170,59 @@ def detect_accepted_connections(
             )
         return {
             "accepted": accepted,
-            "checked": len(conn_sent),
+            "checked": len(candidates),
             "cache_hits": cache_hit_count,
             "deferred": 0,
+            "prospects_checked": len(prospect_cands),
+            "prospects_accepted": prospects_accepted,
+            "prospect_regressions_flagged": prospect_regressions_flagged,
         }
 
     # Bound the launch — see PHASE0_MAX_PROFILES_PER_LAUNCH for the 2026-06-11
-    # incident and the cap rationale. Oldest invites first: they exit the
-    # ACCEPTANCE_CHECK_WINDOW_DAYS window soonest, so they have the fewest
-    # re-check chances left. Scraped rows are stamped into the recheck cache
-    # below and read as fresh next run, so the deferred tail rotates in
-    # instead of re-queueing the same rows.
-    deferred = 0
-    if len(conn_sent_stale) > PHASE0_MAX_PROFILES_PER_LAUNCH:
-        conn_sent_stale.sort(key=lambda p: p.get("last_contact_date") or "")
-        deferred = len(conn_sent_stale) - PHASE0_MAX_PROFILES_PER_LAUNCH
-        conn_sent_stale = conn_sent_stale[:PHASE0_MAX_PROFILES_PER_LAUNCH]
+    # incident and the cap rationale. The TOTAL scrape batch (CONNECTION_SENT +
+    # PROSPECT) must stay at or under the cap so the per-run PB profile-scrape
+    # volume is UNCHANGED by the Defect-2 PROSPECT sweep (flat PB cost).
+    #
+    # CONNECTION_SENT keeps PRIORITY: fill the batch with stale CONNECTION_SENT
+    # first (oldest invites first — they exit the ACCEPTANCE_CHECK_WINDOW_DAYS
+    # window soonest, so they have the fewest re-check chances left), then fill
+    # the REMAINING budget with stale PROSPECTs. On busy CONNECTION_SENT days
+    # PROSPECTs get little/no budget — acceptable, they rotate in on quieter
+    # days. Scraped rows are stamped into the recheck cache below and read as
+    # fresh next run, so each deferred tail rotates in instead of re-queueing.
+    conn_sent_stale.sort(key=lambda p: p.get("last_contact_date") or "")
+    conn_sent_deferred = max(0, len(conn_sent_stale) - PHASE0_MAX_PROFILES_PER_LAUNCH)
+    conn_sent_batch = conn_sent_stale[:PHASE0_MAX_PROFILES_PER_LAUNCH]
+
+    prospect_budget = PHASE0_MAX_PROFILES_PER_LAUNCH - len(conn_sent_batch)
+    # Rotate the PROSPECT tail least-recently-checked first so a small budget
+    # (busy CONNECTION_SENT days) can't starve the same tail forever. Records
+    # never checked sort first (""), then oldest checked_at. Combined with the
+    # 3-day cache TTL this gives deterministic round-robin coverage.
+    prospect_stale.sort(key=lambda p: recheck_cache.last_checked(p["linkedin_url"]) or "")
+    prospect_batch = prospect_stale[:prospect_budget]
+    prospect_deferred = len(prospect_stale) - len(prospect_batch)
+
+    # Downstream pipeline (sheet write, launch, match-back, post-scrape flips)
+    # operates on the combined batch; per-row flip behavior branches on
+    # `_phase0_kind` inside _phase0_flip_one. `deferred` keeps its historical
+    # meaning (the CONNECTION_SENT tail) so existing callers/tests are unchanged;
+    # `prospect_deferred` is reported separately in the summary.
+    scrape_batch = conn_sent_batch + prospect_batch
+    deferred = conn_sent_deferred
+    if conn_sent_deferred or prospect_deferred:
         click.echo(
             f"  Capping Phase 0 scrape batch at {PHASE0_MAX_PROFILES_PER_LAUNCH} "
             f"(per-run visit-safety cap; phantom schema max is 150) — "
-            f"{deferred} stale profile(s) deferred to subsequent runs, "
-            f"oldest invites checked first."
+            f"{conn_sent_deferred} CONNECTION_SENT + {prospect_deferred} PROSPECT "
+            f"profile(s) deferred to subsequent runs, oldest invites first; "
+            f"CONNECTION_SENT keeps scrape priority."
         )
 
-    click.echo(f"  Checking {len(conn_sent_stale)} CONNECTION_SENT profiles via Profile Scraper...")
+    click.echo(
+        f"  Checking {len(scrape_batch)} profile(s) via Profile Scraper "
+        f"({len(conn_sent_batch)} CONNECTION_SENT + {len(prospect_batch)} PROSPECT)..."
+    )
 
     # PR-Phase-0-SN-migration: branch on the same flag the pre-invite path
     # already honors. ``regular`` keeps the legacy top-level-cookie launch
@@ -1002,10 +1252,10 @@ def detect_accepted_connections(
         preflight_legacy_profile_scraper(pb, profile_scraper_id)
 
     # Build URL set for matching results back to our batch
-    our_urls = {_normalize_linkedin_url(p["linkedin_url"]) for p in conn_sent_stale}
+    our_urls = {_normalize_linkedin_url(p["linkedin_url"]) for p in scrape_batch}
 
     # Write to Google Sheet and launch Profile Scraper (expects 'profileUrl' column)
-    sheet_rows = [{"profileUrl": p["linkedin_url"]} for p in conn_sent_stale]
+    sheet_rows = [{"profileUrl": p["linkedin_url"]} for p in scrape_batch]
     sheet_url = write_prospects_to_sheet(sheet_rows, columns=["profileUrl"])
 
     if backend == "sales_nav":
@@ -1025,7 +1275,7 @@ def detect_accepted_connections(
                 pb,
                 sales_nav_profile_scraper_id,
                 spreadsheet_url=sheet_url,
-                launch_count=profiles_per_launch(len(conn_sent_stale)),
+                launch_count=profiles_per_launch(len(scrape_batch)),
             ),
             # PB keys the phantom's processed-inputs DB on the result file
             # name; a fresh name per launch forces re-scrape (Phase 0 exists
@@ -1070,7 +1320,7 @@ def detect_accepted_connections(
         kind = "failed (PB status=error)" if failed else "timed out"
         click.echo(
             f"  ⚠ Phase 0 scrape {kind} ({exc}). Skipping live acceptance "
-            f"detection this run; {len(conn_sent_stale)} profile(s) will be "
+            f"detection this run; {len(scrape_batch)} profile(s) will be "
             f"re-checked next run. Daily run continues to Parts A/B.",
             err=True,
         )
@@ -1096,7 +1346,7 @@ def detect_accepted_connections(
             payload = {
                 "run_date": op_today,
                 "backend": backend,
-                "profiles_pending": len(conn_sent_stale),
+                "profiles_pending": len(scrape_batch),
                 "profiles_deferred": deferred,
                 "container_id": exc.container_id,
                 "error": str(exc)[:300],
@@ -1107,7 +1357,7 @@ def detect_accepted_connections(
             payload = {
                 "run_date": op_today,
                 "backend": backend,
-                "profiles_pending": len(conn_sent_stale),
+                "profiles_pending": len(scrape_batch),
                 "profiles_deferred": deferred,
                 "wait_max_seconds": wait_max,
                 "error": str(exc)[:300],
@@ -1130,6 +1380,9 @@ def detect_accepted_connections(
             "checked": len(conn_sent),
             "cache_hits": cache_hit_count,
             "deferred": deferred,
+            "prospects_checked": len(prospect_cands),
+            "prospects_accepted": prospects_accepted,
+            "prospect_regressions_flagged": prospect_regressions_flagged,
             "error": "pb_failed" if failed else "pb_timeout",
         }
 
@@ -1146,7 +1399,7 @@ def detect_accepted_connections(
         _escalate_phase0_stale_scrape(
             attio=attio,
             backend=backend,
-            profiles_submitted=len(conn_sent_stale),
+            profiles_submitted=len(scrape_batch),
             profiles_deferred=deferred,
             rows_matched=0,
             dedup_marker_present=has_scraper_dedup_marker(
@@ -1172,6 +1425,9 @@ def detect_accepted_connections(
             "checked": len(conn_sent),
             "cache_hits": cache_hit_count,
             "deferred": deferred,
+            "prospects_checked": len(prospect_cands),
+            "prospects_accepted": prospects_accepted,
+            "prospect_regressions_flagged": prospect_regressions_flagged,
             "error": "no_csv",
         }
 
@@ -1204,7 +1460,7 @@ def detect_accepted_connections(
         _escalate_phase0_stale_scrape(
             attio=attio,
             backend=backend,
-            profiles_submitted=len(conn_sent_stale),
+            profiles_submitted=len(scrape_batch),
             profiles_deferred=deferred,
             rows_matched=rows_matched,
             dedup_marker_present=dedup_marker,
@@ -1215,7 +1471,7 @@ def detect_accepted_connections(
         if rows_matched == 0:
             click.echo(
                 f"  ❌ Phase 0 scrape returned NO fresh rows for "
-                f"{len(conn_sent_stale)} submitted profile(s) "
+                f"{len(scrape_batch)} submitted profile(s) "
                 f"(container {launch.container_id}, dedup marker: "
                 f"{'YES' if dedup_marker else 'no'}). Acceptance detection is "
                 f"BLIND this run — skipping recheck_cache stamping so these "
@@ -1227,6 +1483,9 @@ def detect_accepted_connections(
                 "checked": len(conn_sent),
                 "cache_hits": cache_hit_count,
                 "deferred": deferred,
+                "prospects_checked": len(prospect_cands),
+                "prospects_accepted": prospects_accepted,
+                "prospect_regressions_flagged": prospect_regressions_flagged,
                 "error": "stale_scrape",
             }
         click.echo(
@@ -1236,44 +1495,41 @@ def detect_accepted_connections(
             err=True,
         )
 
-    # Match results to Attio entries and update accepted ones
+    # Match results to Attio entries and update accepted ones. Both stages
+    # (CONNECTION_SENT + PROSPECT) share this loop; _phase0_flip_one branches
+    # the flip behavior on `_phase0_kind` (PROSPECTs route through the
+    # Pattern-A/B disposition gate so a 1st-degree-with-depth row is escalated
+    # rather than flipped — never wiping cadence depth).
     cache_updates: dict[str, str | None] = {}
-    for attrs in conn_sent_stale:
+    for attrs in scrape_batch:
         normalized = _normalize_linkedin_url(attrs["linkedin_url"])
         degree = degree_lookup.get(normalized, "")
         if degree:
             cache_updates[attrs["linkedin_url"]] = degree
         if degree == "1st":
-            # PR-21 (Lesson 4): Phase 0 PB-scrape flip also stamps
-            # experiment_id_frozen_at="accepted" (preserving experiment_id).
-            # See `_phase0_accepted_update` for the canonical update + log.
-            phase0_stale_update = _phase0_accepted_update(attrs, label="Phase 0 PB flip")
-            # F-PR-4 §3.15: route through _attio_advance_with_escalation so a
-            # transient Attio error opens an attio_write_failed queue row
-            # instead of being swallowed (mirrors the cache-hit branch above).
-            ok = _attio_advance_with_escalation(
+            outcome = _phase0_flip_one(
+                attrs,
                 attio=attio,
-                entry_id=attrs["entry_id"],
-                entry_attributes=phase0_stale_update,
                 list_id=list_id,
-                linkedin_url=attrs["linkedin_url"],
-                today=today_iso,
-                step_label="phase0_pb_accepted",
-                writer_module="workflows.daily_check.detect_accepted_connections",
-                # Wave-2-B fix-up (code-reviewer B1): see CONNECTION_SENT
-                # comment at the cache-hit branch above. Real prior, not
-                # upstream-filter invariant.
-                prior_stage=attrs.get("stage"),
-                person_record_id=attrs.get("record_id"),
-                escalate_failures=helper_escalate_failures,
+                today_iso=today_iso,
+                cache=cache,
+                helper_escalate_failures=helper_escalate_failures,
+                cached=False,
             )
-            if ok:
+            if outcome == "accepted":
                 accepted += 1
-                name, _, _, _, _ = cache.get(attrs["record_id"])
-                click.echo(f"  ✓ {name} accepted (sent {attrs.get('last_contact_date', '?')})")
+                if attrs.get("_phase0_kind") == "prospect":
+                    prospects_accepted += 1
+            elif outcome == "regression":
+                prospect_regressions_flagged += 1
 
     recheck_cache.record_many(cache_updates)
-    click.echo(f"  Checked {len(conn_sent_stale)} profiles, {accepted} accepted.")
+    click.echo(f"  Checked {len(scrape_batch)} profiles, {accepted} accepted.")
+    _echo_phase0_prospect_summary(
+        checked=len(prospect_cands),
+        accepted=prospects_accepted,
+        regressions=prospect_regressions_flagged,
+    )
     if helper_escalate_failures:
         # Wave-1.6.3: surface swallowed escalate() failures in the Phase 0
         # ACCEPTED-flip path. Per-row WARN already named each; this is the
@@ -1292,9 +1548,12 @@ def detect_accepted_connections(
     return {
         "accepted": accepted,
         "checked": len(conn_sent),
-        "scraped": len(conn_sent_stale),
+        "scraped": len(scrape_batch),
         "cache_hits": cache_hit_count,
         "deferred": deferred,
+        "prospects_checked": len(prospect_cands),
+        "prospects_accepted": prospects_accepted,
+        "prospect_regressions_flagged": prospect_regressions_flagged,
     }
 
 

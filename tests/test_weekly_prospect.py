@@ -874,7 +874,35 @@ class TestNetNewSupplyAccounting:
         assert summary.get("net_new_created") == 1
         assert summary.get("restamped_existing", 0) == 0
 
+    def test_net_new_commit_stamps_canonical_linkedin_url(self):
+        """Fix 2a: a net-new commit must stamp `canonical_linkedin_url` on the
+        list-entry attrs. This field is the key the 14-day re-prospect guard
+        (`_load_recent_outreach_map`) reads — it was NULL on 100% of entries,
+        which made the guard a silent no-op (weekly re-stamp root cause).
+        """
+        from clients.attio import _canonical_linkedin_url
+
+        attio = _make_commit_attio_mock()
+        attio.upsert_person.return_value = {"id": {"record_id": "person-NEW"}}
+        in_list: set[str] = set()
+
+        result = _commit_prospect(
+            _crm(attio), _PROSPECT_DATA, _RAW_CSV_ROW, _SCORE_RESULT,
+            "list-id", "2026-06-16",
+            in_list_record_ids=in_list, summary={},
+        )
+
+        assert result is True
+        attrs = attio.add_list_entry.call_args.kwargs["entry_attributes"]
+        assert attrs["canonical_linkedin_url"] == _canonical_linkedin_url(
+            _PROSPECT_DATA["linkedin_url"]
+        )
+
     def test_commit_of_already_listed_record_counts_as_restamp(self):
+        """An already-listed record is counted as a re-stamp for observability
+        but its existing entry must NOT be rewritten — the daily cadence engine
+        owns it (weekly re-stamp cadence wipe). add_list_entry must NOT be called.
+        """
         attio = _make_commit_attio_mock()
         attio.upsert_person.return_value = {"id": {"record_id": "person-OLD"}}
         summary: dict = {}
@@ -889,6 +917,10 @@ class TestNetNewSupplyAccounting:
         assert result is True
         assert summary.get("restamped_existing") == 1
         assert summary.get("net_new_created", 0) == 0
+        # The record stays in the list (no double-add) and its entry is left
+        # untouched — weekly must never re-stamp a record the daily cadence owns.
+        assert attio.add_list_entry.call_count == 0
+        assert "person-OLD" in in_list
 
     def test_process_prospects_classifies_guard_miss_restamp(self):
         """When the dedup guard (search_person_by_linkedin) misses an
@@ -930,9 +962,12 @@ class TestNetNewSupplyAccounting:
             reprospect_review=[],
         )
 
-        assert summary["added"] == 1            # commit happened
+        assert summary["added"] == 1            # commit returned True
         assert summary.get("restamped_existing") == 1
         assert summary.get("net_new_created", 0) == 0
+        # Fix 1: the existing entry must NOT be re-stamped — the record is
+        # already in the list, so add_list_entry is skipped entirely.
+        assert attio.add_list_entry.call_count == 0
 
 
 class TestWeeklyScrapeCsvNameBust:
