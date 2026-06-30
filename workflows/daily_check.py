@@ -11,7 +11,7 @@ from clients.attio import AttioClient
 
 if TYPE_CHECKING:
     from clients.crm.base import CRMProvider
-from clients.google_sheets import write_prospects_to_sheet
+from clients.google_sheets import profiles_per_launch, write_prospects_to_sheet
 from clients.outreach_config import load_outreach_config
 from clients.pb_envelope import (
     INVITE_OPTIMISTIC_ADVANCE,
@@ -1011,7 +1011,10 @@ def detect_accepted_connections(
             **saved,
             "identities": identities,
             "spreadsheetUrl": sheet_url,
-            "numberOfProfilesPerLaunch": len(conn_sent_stale),
+            # +1 for the sheet header row PB counts as a processable line —
+            # see clients.google_sheets.profiles_per_launch (2026-06-12
+            # last-row-dropped incident).
+            "numberOfProfilesPerLaunch": profiles_per_launch(len(conn_sent_stale)),
             # PB keys the phantom's processed-inputs DB on the result file
             # name; a fresh name per launch forces re-scrape (Phase 0 exists
             # to observe 2nd→1st flips ON re-scrape) and isolates this
