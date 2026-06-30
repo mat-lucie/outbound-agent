@@ -76,7 +76,6 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
-import json
 import os
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
@@ -99,6 +98,7 @@ from workflows import recheck_cache
 from workflows.daily_check_helpers import (
     _normalize_linkedin_url,
     _resolve_degree_check_backend,
+    preflight_legacy_profile_scraper,
 )
 from workflows.escalation import escalate
 
@@ -316,29 +316,18 @@ def _launch_sales_nav_scrape(
         # and surfaced as degree_unknown).
         launch_count = profiles_per_launch(len(urls))
 
-    # Read saved phantom args so we get identities[] and other required fields.
-    agent = pb.get_agent(scraper_id)
-    raw_arg = agent.get("argument") or "{}"
-    saved = json.loads(raw_arg) if isinstance(raw_arg, str) else raw_arg
-
-    # Inject fresh Sales Nav cookie into identities[0]. Helper raises
-    # SalesNavConfigError if cookie env var is missing.
+    # Saved-args + identities-inject contract (raises SalesNavConfigError if
+    # the cookie env var is missing) lives in the shared helper.
     import workflows.daily_check_helpers as _dch
-    session = _dch._pb_sales_nav_session_args()
-    identities = saved.get("identities") or [{}]
-    identities[0].update(session)
-
-    launch_args = {
-        **saved,
-        "identities": identities,
-        "spreadsheetUrl": sheet_url,
-        "numberOfProfilesPerLaunch": launch_count,
-        # csvName is generated PER ATTEMPT inside _do_launch_and_fetch (see
-        # below) — a timed-out first container can still finish asynchronously
-        # (PB is async — see pb_send_recovery) and register the batch in its
-        # file's dedup DB; reusing the same name on retry would make the retry
-        # refuse to re-scrape and defeat the fresh-name dedup-bust.
-    }
+    launch_args = _dch.build_sales_nav_launch_args(
+        pb, scraper_id, spreadsheet_url=sheet_url, launch_count=launch_count
+    )
+    # csvName is deliberately NOT set here — it is generated PER ATTEMPT
+    # inside _do_launch_and_fetch (see below): a timed-out first container
+    # can still finish asynchronously (PB is async — see pb_send_recovery)
+    # and register the batch in its file's dedup DB; reusing the same name
+    # on retry would make the retry refuse to re-scrape and defeat the
+    # fresh-name dedup-bust.
 
     def _do_launch_and_fetch() -> tuple[str, str]:
         # Fresh csvName PER ATTEMPT: a timed-out first container can still
@@ -678,10 +667,15 @@ def _pre_invite_degree_check(
                 # Drop the whole batch — fail-safe.
                 return [], []
         else:
-            # Legacy regular Profile Scraper path — UNCHANGED for rollback
-            # parity (per plan PR-B subtask 5: backend=regular is preserved
-            # as the legacy path so flipping the flag back is a clean
-            # restoration of prior behavior).
+            # Legacy regular Profile Scraper path — DOCUMENTED-DEAD: the
+            # legacy agent was deleted from the PB workspace, so
+            # backend=regular (now explicit-only; default is sales_nav)
+            # requires deploying a NEW phantom first. Preflight before the
+            # sheet write so a dead agent id fails as a config error instead
+            # of a raw httpx 404 mid-launch. Launch logic itself is kept
+            # unchanged (plan PR-B subtask 5 rollback parity) for a future
+            # re-deployed phantom.
+            preflight_legacy_profile_scraper(pb, scraper_id_for_strict)
             sheet_rows = [{"profileUrl": p["linkedInUrl"]} for p in to_send_stale]
             sheet_url = _dc.write_prospects_to_sheet(sheet_rows, columns=["profileUrl"])
             launch = pb.launch_agent(scraper_id_for_strict, {

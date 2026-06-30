@@ -61,6 +61,28 @@ SPECIAL_WRITER_ALIASES: frozenset[str] = frozenset({
     "__bootstrap_canary__",
 })
 
+# §3.20 MCP scope canary — pinned target record.
+#
+# The Step-0 canary (every skill's "Verify Attio MCP scope" preflight) does a
+# create-note → delete-note round-trip through the REST client to prove the
+# `ATTIO_API_KEY` credential — the SAME credential the daily run mutates
+# prospect data with — has live read+write+delete scope before any real write.
+#
+# The round-trip MUST target a dedicated, inert record, never a real prospect:
+# an earlier MCP-based canary (now removed) left an orphan note on a live
+# prospect because no target was pinned. Create a Person record that exists
+# ONLY as the canary anchor:
+#   - a clearly-labelled "do not contact" name
+#   - deliberately NOT a member of the `linkedin_outreach` list, so the daily
+#     run never fetches it (selection is list-entry-scoped — see
+#     workflows/daily_check.py `_get_all_entries_parsed`), hence it can never be
+#     invited or DM'd.
+# Pin its record id here (version-controlled, not an env var) so every machine
+# and skill resolves the same target. Left empty by default — the canary
+# command fails closed with `canary_record_unconfigured` until an operator
+# creates the inert Person and sets this constant.
+CANARY_PERSON_RECORD_ID: str = ""
+
 WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
     # ---- LinkedIn Outreach: cadence + step state ----
     ("linkedin_outreach", "dm_step"): [

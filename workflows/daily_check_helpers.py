@@ -5,17 +5,25 @@ and entry fetch helpers. These are pure functions with no side effects on
 Attio state — safe to test in isolation.
 """
 
+import json
 import os
 import re
+from typing import TYPE_CHECKING
 from urllib.parse import unquote
+
+import httpx
 
 from clients.attio import AttioClient
 from clients.pb_config import (
+    _BACKEND_DEFAULT,
     li_user_agent_stripped,
     load_pb_config,
     sales_nav_session_cookie_stripped,
 )
 from clients.phantombuster import get_phantombuster_credentials
+
+if TYPE_CHECKING:
+    from clients.phantombuster import PhantomBusterClient
 
 
 def _normalize_linkedin_url(url: str) -> str:
@@ -291,6 +299,19 @@ def _fresh_csv_name(prefix: str) -> str:
 
 _VALID_BACKENDS = ("regular", "sales_nav")
 
+# Public name for the code default of PRE_INVITE_DEGREE_CHECK_BACKEND.
+# The VALUE is owned by clients.pb_config._BACKEND_DEFAULT (the single
+# source of truth for the yaml→env→default resolution) — this is a
+# re-export so cli.py / scripts.drain_prospect_backlog can read the default
+# at their routing gates without reaching into a private name, and so the
+# default lives in exactly one place. Flipped to "sales_nav" when the legacy
+# LinkedIn Profile Scraper agent was deleted from the PB workspace: a
+# missing/typo'd env var falling back to "regular" guaranteed a mid-run
+# httpx 404 at launch time, after a production sheet write was already
+# burned. Under a sales_nav default a bare environment fails LOUD at resolve
+# time instead (missing SN scraper-id / cookie raises SalesNavConfigError).
+DEGREE_CHECK_BACKEND_DEFAULT = _BACKEND_DEFAULT
+
 
 def _resolve_degree_check_backend() -> str:
     """Return the pre-invite degree-check backend, validating env vars.
@@ -365,3 +386,99 @@ def _resolve_degree_check_backend() -> str:
             "docs/runbooks/phantombuster-cookie-rotation.md."
         )
     return raw
+
+
+def build_sales_nav_launch_args(
+    pb: "PhantomBusterClient",
+    scraper_id: str,
+    *,
+    spreadsheet_url: str,
+    launch_count: int,
+) -> dict:
+    """Build the launch argument dict for the Sales Nav Profile Scraper.
+
+    The SN phantom (verified 2026-05-25) rejects partial argument objects
+    with "Your Phantom Argument Isn't Valid" — and silently ignores
+    top-level ``sessionCookie`` when ``identities`` is present. So every
+    launch must: fetch the phantom's SAVED argument, inject the fresh SN
+    session into ``identities[0]``, and POST the full shape with only
+    ``spreadsheetUrl`` / ``numberOfProfilesPerLaunch`` overridden. This
+    helper is the single home for that contract — callers (pre-invite
+    degree check, Phase 0 acceptance detection, repair-companies) merge
+    their own ``csvName`` on top, because csvName policy differs per caller
+    (pre-invite regenerates it PER RETRY ATTEMPT to bust the
+    processed-inputs dedup DB; the others set it once per launch).
+
+    ``launch_count`` is the value for ``numberOfProfilesPerLaunch`` — the
+    caller computes it (``clients.google_sheets.profiles_per_launch`` for
+    sheet-fed batches, which adds the header line PB counts; the raw batch
+    size for a single bare-URL launch).
+
+    Raises:
+        SalesNavConfigError: the SN session cookie env var is missing
+            (via :func:`_pb_sales_nav_session_args`), or the scraper id
+            does not resolve in the PB workspace (``GET /agents/fetch``
+            404s — the same deleted-agent event class that killed the
+            legacy scraper, wrapped here so all three SN launch sites fail
+            with the env var named instead of a raw httpx traceback).
+    """
+    try:
+        agent = pb.get_agent(scraper_id)
+    except httpx.HTTPStatusError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            raise SalesNavConfigError(
+                f"Sales Nav Profile Scraper agent {scraper_id!r} does not "
+                "exist in the PhantomBuster workspace (GET /agents/fetch → "
+                "404). Check PB_SALES_NAV_PROFILE_SCRAPER_ID against the PB "
+                "dashboard — the phantom may have been deleted or the id "
+                "mistyped."
+            ) from exc
+        raise
+    raw_arg = agent.get("argument") or "{}"
+    saved = json.loads(raw_arg) if isinstance(raw_arg, str) else raw_arg
+    session = _pb_sales_nav_session_args()
+    identities = saved.get("identities") or [{}]
+    identities[0].update(session)
+    return {
+        **saved,
+        "identities": identities,
+        "spreadsheetUrl": spreadsheet_url,
+        "numberOfProfilesPerLaunch": launch_count,
+    }
+
+
+class LegacyScraperGoneError(RuntimeError):
+    """Raised when the legacy LinkedIn Profile Scraper agent doesn't resolve in PB."""
+
+
+def preflight_legacy_profile_scraper(
+    pb: "PhantomBusterClient", profile_scraper_id: str
+) -> None:
+    """Fail loud if the legacy Profile Scraper agent doesn't exist in PB.
+
+    The legacy agent (PB_PROFILE_SCRAPER_ID) was DELETED from the
+    PhantomBuster workspace — verified via ``GET /api/v2/agents/fetch``
+    returning 404 "Agent not found". Any ``backend=regular`` launch against
+    it crashes mid-run with a raw httpx 404 AFTER the prospect sheet has
+    already been written. This preflight runs before the launch so an
+    explicitly selected (it is no longer the default — see
+    ``DEGREE_CHECK_BACKEND_DEFAULT``) but dead legacy backend fails at
+    config-error level with the fix named, matching how
+    ``_resolve_degree_check_backend`` treats missing SN env vars.
+
+    Raises:
+        LegacyScraperGoneError: the agent id 404s in the PB workspace.
+    """
+    try:
+        pb.get_agent(profile_scraper_id)
+    except httpx.HTTPStatusError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            raise LegacyScraperGoneError(
+                f"Legacy LinkedIn Profile Scraper agent {profile_scraper_id!r} "
+                "does not exist in the PhantomBuster workspace (deleted). "
+                "backend=regular cannot work against it. Either unset "
+                "PRE_INVITE_DEGREE_CHECK_BACKEND (the default is sales_nav) "
+                "or deploy a new Profile Scraper phantom and update "
+                "PB_PROFILE_SCRAPER_ID."
+            ) from exc
+        raise

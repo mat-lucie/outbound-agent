@@ -743,13 +743,16 @@ class TestSalesNavPbFailureModes:
         assert still == []
         assert already == []
 
-    def test_pb_get_agent_raises_propagates(
+    def test_pb_get_agent_404_raises_config_error(
         self, _pb_args, _sheet,
     ):
-        """If get_agent fails (e.g., scraper-id doesn't exist), the
-        exception propagates — that's a hard config error, not a transient
-        failure."""
+        """If get_agent 404s (scraper-id doesn't exist — the deleted-agent
+        event class that killed the legacy scraper), the error propagates as
+        SalesNavConfigError naming the env var to fix — a hard config error,
+        not a transient failure, and not silently dropped."""
         import httpx
+
+        from workflows.daily_check_helpers import SalesNavConfigError
 
         attio = MagicMock()
         pb = MagicMock()
@@ -762,8 +765,9 @@ class TestSalesNavPbFailureModes:
         )
 
         batch = [_row("A")]
-        # get_agent fails → exception propagates (not silently dropped).
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(
+            SalesNavConfigError, match="PB_SALES_NAV_PROFILE_SCRAPER_ID"
+        ):
             _pre_invite_degree_check(
                 batch, pb, None, attio, "list-id",
                 sales_nav_profile_scraper_id=SALES_NAV_SCRAPER_ID,
