@@ -123,6 +123,18 @@ def lookup(url: str) -> dict | None:
     return entry
 
 
+def last_checked(url: str) -> str | None:
+    """Return the ``checked_at`` ISO date for ``url`` regardless of freshness,
+    or None if the URL has never been recorded (within RETENTION_DAYS).
+
+    Unlike :func:`lookup`, this does NOT apply the RECHECK_TTL_DAYS freshness
+    filter — callers use it to ROTATE a stale batch (least-recently-checked
+    first) so a capped scrape can't starve the same tail indefinitely.
+    """
+    entry = _load().get(_normalize_url(url))
+    return (entry or {}).get("checked_at")
+
+
 def partition(urls: list[str]) -> tuple[dict[str, dict], list[str]]:
     """Split URLs into (fresh cache hits, stale URLs that need PB).
 

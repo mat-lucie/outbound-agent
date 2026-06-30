@@ -1,5 +1,6 @@
 """Attio CRM API v2 client."""
 
+import logging
 import os
 import time
 from collections.abc import Callable
@@ -9,6 +10,42 @@ from urllib.parse import unquote
 import httpx
 
 from models.pipeline import STAGE_RANK, PipelineStage
+
+logger = logging.getLogger(__name__)
+
+
+def _is_stage_regression(prior_stage: str, new_stage: str) -> bool:
+    """True iff ``new_stage`` ranks strictly below ``prior_stage``.
+
+    Defense-in-depth backstop for the weekly re-stamp cadence-desync class: a
+    caller PATCHing an existing list entry to a LOWER stage (e.g. Accepted over
+    DM3 Sent) would wipe cadence depth. Unknown/garbage stage strings fall back
+    to rank 0 (mirrors the ``_filter_and_rank_entries_for_record`` defensive
+    fallback), so a malformed prior never reads as "advanced" and a malformed
+    new stage is treated as the lowest rank.
+
+    NOTE on the CRM-provider boundary: this client is the vendor layer, and it
+    is mapping-unaware by design — the ``AttioProvider`` translates canonical
+    ``PipelineStage`` values to vendor option labels BEFORE handing them here.
+    Under the shipped IDENTITY ``stage_mapping`` (vendor label == canonical
+    value) both the incoming ``new_stage`` and the stored ``prior_stage`` parse
+    cleanly via ``PipelineStage(...)`` and the rank comparison is exact. Under a
+    NON-identity mapping the stored/incoming strings are vendor labels that
+    ``PipelineStage(...)`` cannot parse, so both fall to rank 0 and this backstop
+    safely NO-OPs (it never strips a legitimate advance, only fails to catch a
+    regression). The comparison is internally consistent either way — both sides
+    come from the same label space — so the guard can never misfire and corrupt
+    a forward write; the monotonicity gate at the writer boundary remains the
+    primary defense for non-identity deployments.
+    """
+    def _rank(stage_str: str) -> int:
+        try:
+            return STAGE_RANK[PipelineStage(stage_str)]
+        except (KeyError, ValueError):
+            return 0
+
+    return _rank(new_stage) < _rank(prior_stage)
+
 
 # Substrings that mark a company record as carrying LinkedIn's own Clearbit
 # enrichment instead of the prospect's real employer. Matches subdomains
@@ -221,6 +258,12 @@ class AttioClient:
         # _company_corruption_cache so the corruption lookup can hop from
         # a person id to the right cached flag.
         self._person_to_company: dict[str, str] = {}
+        # Count of stage-regressing add_list_entry PATCHes the defense-in-depth
+        # backstop neutralized over this client's lifetime. A batch orchestrator
+        # can read this after a run and escalate if it fired — escalate() can't
+        # be called from here (circular import with workflows.escalation, which
+        # imports AttioClient).
+        self.stage_regressions_blocked: int = 0
 
     def _field_slug(self, engine_field: str) -> str:
         """Resolve an engine field name to this workspace's vendor attribute slug.
@@ -625,6 +668,45 @@ class AttioClient:
         if existing:
             target_entry_id = existing[0].get("id", {}).get("entry_id", "")
             if target_entry_id:
+                # Defense-in-depth backstop for the weekly re-stamp cadence-desync
+                # class: a PATCH that would move the existing entry to a LOWER
+                # stage (e.g. Accepted/Prospect over DM3 Sent) wipes cadence
+                # depth. When that's detected we strip the cadence-depth PAIR
+                # — both `stage` AND `dm_step` — so the write cannot leave the
+                # row in the self-contradictory state this guard exists to
+                # prevent (stage=DM3 Sent + dm_step=0 is the exact "regressed"
+                # fingerprint). Stripping `stage` alone would manufacture that
+                # corruption. The other attributes still PATCH. Scope is
+                # deliberately the universal cadence pair; the weekly finalize
+                # path's own _commit_prospect already-listed skip is the primary
+                # fix — this generic client chokepoint must not couple to any
+                # caller's attr schema. Log loudly (this must NEVER be silent)
+                # and bump a counter so a fired backstop is observable in
+                # aggregate without grepping logs. We do NOT escalate() here:
+                # workflows.escalation imports AttioClient, so calling it risks a
+                # circular import; the batch orchestrator drains
+                # `stage_regressions_blocked` and escalates. The fresh-POST branch
+                # below needs no guard (a brand-new entry has no prior stage).
+                # See _is_stage_regression for the non-identity-mapping caveat
+                # (under a non-identity stage_mapping this guard safely no-ops).
+                if "stage" in attrs:
+                    prior_stage = AttioClient.parse_entry(existing[0]).get("stage", "") or ""
+                    if _is_stage_regression(prior_stage, attrs["stage"]):
+                        self.stage_regressions_blocked += 1
+                        logger.warning(
+                            "add_list_entry: dropping regressing stage+dm_step on "
+                            "entry_id=%s — prior_stage=%r, attempted new "
+                            "stage=%r would lower cadence depth; stage and dm_step "
+                            "keys stripped, other attrs still patched "
+                            "(stage_regressions_blocked=%d)",
+                            target_entry_id,
+                            prior_stage,
+                            attrs["stage"],
+                            self.stage_regressions_blocked,
+                        )
+                        attrs = {
+                            k: v for k, v in attrs.items() if k not in ("stage", "dm_step")
+                        }
                 return self.update_list_entry(
                     entry_id=target_entry_id,
                     entry_attributes=attrs,

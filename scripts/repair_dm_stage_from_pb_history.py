@@ -53,6 +53,11 @@ TERMINAL_STAGES = {
     PipelineStage.QUALIFIED,
     PipelineStage.NOT_INTERESTED,
     PipelineStage.PARTNER_INTRO,
+    # UNREACHABLE is a rank-90 undeliverability terminal, gated out of every
+    # send/invite loop. A stale PB "send" (often an InMail-required attempt
+    # miscounted as delivered) must NOT resurrect it to DM1 Sent and drop it
+    # back into the send queue — skip it like the other terminals.
+    PipelineStage.UNREACHABLE,
 }
 DM_STAGE_BY_COUNT = {
     1: PipelineStage.DM1_SENT,

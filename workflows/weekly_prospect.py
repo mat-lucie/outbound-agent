@@ -511,6 +511,7 @@ def _load_recent_outreach_map(
     """
     entries = crm.query_list_entries(list_id=list_id)
     out: dict[str, date] = {}
+    entries_with_canonical = 0  # how many entries carry a usable canonical URL
     for entry in entries:
         url = entry.attributes.get("canonical_linkedin_url") or ""
         if not url:
@@ -518,6 +519,7 @@ def _load_recent_outreach_map(
         canonical = _canonical_linkedin_url(url)
         if not canonical:
             continue
+        entries_with_canonical += 1
         last_contact = entry.attributes.get("last_contact_date")
         if not last_contact:
             continue
@@ -530,16 +532,49 @@ def _load_recent_outreach_map(
         # Keep the most-recent date per URL.
         if canonical not in out or lc_date > out[canonical]:
             out[canonical] = lc_date
-    # Observability: a zero map against a non-empty list is the fingerprint
-    # of the silent bug this fix closed (wrong attribute key → always `{}`).
-    # Surfacing the count makes that failure mode visible within one run
-    # instead of hiding for months.
-    if entries and not out:
+    # Observability: distinguish the SILENT-BUG fingerprint from a benign quiet
+    # window. The bug this fix closed was NULL `canonical_linkedin_url` on every
+    # entry → the map keyed on a dead field → always `{}`. The TELL is
+    # `entries_with_canonical == 0` against a non-empty list. A map that is empty
+    # only because no one was contacted in the last 14 days (canonical present,
+    # but no recent last_contact_date) is NOT a bug — escalating it would be a
+    # false alarm that trains the operator to ignore the signal (the very way the
+    # original bug hid). So escalate ONLY on the zero-canonical fingerprint; log
+    # the benign quiet-window case at info.
+    if entries and entries_with_canonical == 0:
         logger.warning(
-            "recent_outreach_map empty: %d entries scanned, 0 had a usable "
-            "canonical_linkedin_url + last_contact_date >= %s — 14-day "
-            "re-prospect guard will not fire this run",
+            "recent_outreach_map: %d entries scanned, 0 carry a usable "
+            "canonical_linkedin_url — the 14-day re-prospect guard is a NO-OP "
+            "this run (the dead-guard fingerprint). cutoff=%s",
             len(entries),
+            cutoff_date,
+        )
+        # Fix 2b: surface the dead-guard fingerprint in the operator review
+        # queue so the no-op is visible within one run (logging alone hid it for
+        # months). Swallow escalate failures — the guard must never crash the
+        # weekly run on an escalation transport error.
+        try:
+            escalate(
+                type="recent_outreach_map_empty",
+                idempotency_key=f"recent-outreach-map-empty|{cutoff_date.isoformat()}",
+                payload={
+                    "entries_scanned": len(entries),
+                    "entries_with_canonical": entries_with_canonical,
+                    "cutoff_date": cutoff_date.isoformat(),
+                },
+                attio=crm,
+            )
+        except Exception as esc_exc:  # noqa: BLE001 — guard must not crash the run
+            logger.warning(
+                "could not open recent_outreach_map_empty escalation: %s: %s",
+                type(esc_exc).__name__,
+                esc_exc,
+            )
+    elif not out:
+        logger.info(
+            "recent_outreach_map empty but %d entries carry canonical_url — "
+            "benign quiet window (no contact in last 14d, cutoff=%s), guard intact",
+            entries_with_canonical,
             cutoff_date,
         )
     else:
@@ -984,18 +1019,37 @@ def _commit_prospect(
     # pipeline list at run start is being re-stamped, not newly sourced — it
     # adds zero net-new supply. Classify BEFORE the add (in_list_record_ids is
     # mutated below) so the weekly summary can tell real supply from churn.
+    already_listed = (
+        in_list_record_ids is not None and record_id in in_list_record_ids
+    )
     if summary is not None:
-        already_listed = (
-            in_list_record_ids is not None and record_id in in_list_record_ids
-        )
         key = "restamped_existing" if already_listed else "net_new_created"
         summary[key] = summary.get(key, 0) + 1
+
+    # Fix 1 (weekly re-stamp cadence wipe): a record already in the pipeline
+    # list is owned by the daily cadence engine. Re-stamping its entry here via
+    # _safe_add_list_entry → add_list_entry PATCH overwrites stage→Prospect/
+    # Accepted and dm_step→0, wiping cadence depth. Skip the add entirely —
+    # weekly must never rewrite a record the daily cadence owns. This mirrors
+    # the _process_prospects skip and the in-run dedup lesson. The record is
+    # already in in_list_record_ids and existing_entries; leave both as-is.
+    if already_listed:
+        return True
+
+    entry_attrs = _build_prospect_entry_attrs(score_result, today, record_id=record_id)
+    # Fix 2a: stamp canonical_linkedin_url on commit. This is the key the
+    # 14-day re-prospect guard (_load_recent_outreach_map) reads — it was NULL
+    # on 100% of list entries, making that guard a silent no-op. Stamping it on
+    # every net-new commit populates the guard going forward.
+    canonical = _canonical_linkedin_url(prospect_data.get("linkedin_url") or "")
+    if canonical:
+        entry_attrs["canonical_linkedin_url"] = canonical
 
     new_entry = _safe_add_list_entry(
         crm,
         record_id=record_id,
         stage_name=stage_name,
-        entry_attributes=_build_prospect_entry_attrs(score_result, today, record_id=record_id),
+        entry_attributes=entry_attrs,
         list_id=list_id,
         existing_entries=existing_entries,
     )

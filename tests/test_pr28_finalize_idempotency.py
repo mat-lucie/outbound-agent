@@ -347,13 +347,72 @@ class TestHasRecentOutreach:
         # empty while `entries` is non-empty.
         crm = _crm_with_entries([_entry(last_contact_date=date.today().isoformat())])
         cutoff = date.today() - timedelta(days=14)
-        with caplog.at_level(logging.WARNING, logger="workflows.weekly_prospect"):
+        with patch(
+            "workflows.weekly_prospect.escalate"
+        ), caplog.at_level(logging.WARNING, logger="workflows.weekly_prospect"):
             result = _load_recent_outreach_map(crm, "LIST", cutoff)
         assert result == {}
         warning_messages = [
             r.message for r in caplog.records if r.levelname == "WARNING"
         ]
-        assert any("recent_outreach_map empty" in m for m in warning_messages)
+        assert any(
+            "0 carry a usable canonical_linkedin_url" in m for m in warning_messages
+        )
+
+    def test_canonical_present_but_no_recent_contact_does_not_escalate(self, caplog):
+        """Benign quiet window: entries DO carry canonical_linkedin_url but none
+        had contact in the 14-day window. The map is empty, but this is NOT the
+        dead-guard bug — escalating it would be a false alarm. Assert no
+        escalation, an info log, and an intact guard ({} returned)."""
+        import logging
+
+        old = (date.today() - timedelta(days=90)).isoformat()
+        crm = _crm_with_entries([
+            _entry(
+                linkedin_url="https://www.linkedin.com/in/x/",
+                last_contact_date=old,
+            )
+        ])
+        cutoff = date.today() - timedelta(days=14)
+        with patch(
+            "workflows.weekly_prospect.escalate"
+        ) as mock_escalate, caplog.at_level(logging.INFO, logger="workflows.weekly_prospect"):
+            result = _load_recent_outreach_map(crm, "LIST", cutoff)
+        assert result == {}
+        mock_escalate.assert_not_called()
+        assert any("benign quiet window" in r.message for r in caplog.records)
+
+    def test_empty_map_against_nonempty_entries_escalates(self):
+        """Fix 2b: a zero map from a non-empty list is the exact silent-bug
+        fingerprint (NULL canonical_linkedin_url). It must open an operator
+        review queue row so the no-op surfaces, not just a log line. The guard
+        must still return {} and never crash on escalate failure.
+        """
+        crm = _crm_with_entries([_entry(last_contact_date=date.today().isoformat())])
+        cutoff = date.today() - timedelta(days=14)
+        with patch("workflows.weekly_prospect.escalate") as mock_escalate:
+            result = _load_recent_outreach_map(crm, "LIST", cutoff)
+
+        assert result == {}
+        mock_escalate.assert_called_once()
+        kwargs = mock_escalate.call_args.kwargs
+        assert kwargs["type"] == "recent_outreach_map_empty"
+        assert kwargs["payload"]["entries_scanned"] == 1
+        assert kwargs["payload"]["entries_with_canonical"] == 0  # the bug fingerprint
+        assert kwargs["payload"]["cutoff_date"] == cutoff.isoformat()
+        assert kwargs["attio"] is crm
+
+    def test_empty_map_escalate_failure_does_not_crash(self):
+        """Fix 2b swallow: an escalate raising must not abort the guard."""
+        crm = _crm_with_entries([_entry(last_contact_date=date.today().isoformat())])
+        with patch(
+            "workflows.weekly_prospect.escalate",
+            side_effect=RuntimeError("attio down"),
+        ):
+            result = _load_recent_outreach_map(
+                crm, "LIST", date.today() - timedelta(days=14),
+            )
+        assert result == {}
 
 
 # -- weekly_finalize_idempotent -----------------------------------------

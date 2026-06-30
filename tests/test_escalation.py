@@ -70,8 +70,15 @@ class TestSlugInventory:
         #   - stale_connection_sent
         # feat/port-phase0-rescrape (PR #179 port) added 1 more:
         #   - phase0_stale_scrape (silent-zero guard for stale/dedup-refused scrapes)
-        # New count: 89 + 1 = 90.
-        assert len(ESCALATION_TYPES) == 90
+        # fix/weekly-restamp-phase0-sweep (port of upstream #206) added 2 more:
+        #   - recent_outreach_map_empty (weekly_prospect._load_recent_outreach_map
+        #     surfaces the silent zero-map no-op of the 14-day re-prospect guard).
+        #   - prospect_first_degree_with_depth (detect_accepted_connections
+        #     PROSPECT sweep flags a Pattern-A regression — a 1st-degree
+        #     PROSPECT that already carries DM depth — instead of flipping it
+        #     to ACCEPTED and wiping its cadence depth).
+        # New count: 89 + 1 + 2 = 92.
+        assert len(ESCALATION_TYPES) == 92
 
     def test_no_duplicate_slugs(self):
         assert len(ESCALATION_TYPES) == len(ESCALATION_TYPES_SET)
