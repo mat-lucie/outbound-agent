@@ -406,6 +406,7 @@ def test_phase0_scrape_timeout_payload_validates_against_schema():
         "run_date": "2026-05-28",
         "backend": "sales_nav",
         "profiles_pending": 54,
+        "profiles_deferred": 0,
         "wait_max_seconds": 750,
         "error": "PB run X did not finish in 750s",
     }
@@ -537,6 +538,7 @@ def test_phase0_scrape_failed_payload_validates_against_schema():
         "run_date": "2026-06-09",
         "backend": "sales_nav",
         "profiles_pending": 54,
+        "profiles_deferred": 0,
         "container_id": "ct-failed",
         "error": "PB run ct-failed (agent=sn-scraper-id) reported status=error.",
     }

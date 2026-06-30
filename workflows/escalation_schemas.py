@@ -441,6 +441,10 @@ class Phase0ScrapeTimeoutPayload(TypedDict):
     run_date: str
     backend: str
     profiles_pending: int
+    # 2026-06-11 oversized-launch fix: stale rows beyond the per-run scrape
+    # cap (PHASE0_MAX_PROFILES_PER_LAUNCH) that were never submitted this
+    # run. Lets the operator see the backlog behind a degraded run.
+    profiles_deferred: int
     wait_max_seconds: int
     error: str
 
@@ -457,6 +461,8 @@ class Phase0ScrapeFailedPayload(TypedDict):
     run_date: str
     backend: str
     profiles_pending: int
+    # Same backlog-visibility field as Phase0ScrapeTimeoutPayload.
+    profiles_deferred: int
     container_id: str
     error: str
 
@@ -472,6 +478,11 @@ class Phase0StaleScrapePayload(TypedDict):
     run_date: str
     backend: str
     profiles_submitted: int
+    # 2026-06-11 oversized-launch fix: BLIND/no_csv runs stamp nothing into
+    # the recheck cache, so the SAME capped head batch is re-picked every
+    # run while this flavor keeps firing — without this field the deferred
+    # tail queued behind a poison head batch is invisible to the operator.
+    profiles_deferred: int
     rows_matched: int
     dedup_marker_present: bool
     container_id: str

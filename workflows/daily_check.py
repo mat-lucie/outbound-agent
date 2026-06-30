@@ -105,6 +105,21 @@ ACCEPTANCE_CHECK_WINDOW_DAYS = 14
 # changes, visibility only.
 STALE_CONNECTION_SENT_ESCALATE_DAYS = 45
 
+# 2026-06-11 oversized-launch fix: Phase 0 passes the whole stale batch as
+# numberOfProfilesPerLaunch, but the Sales Navigator Profile Scraper's
+# argument schema caps that field at 150 (verified 2026-06-11 via PB
+# scripts/fetch, script id 11108) and PB rejects the ENTIRE launch above it
+# ("numberOfProfilesPerLaunch => is more than maximum"). Phase 0 then goes
+# BLIND for the run, and because BLIND runs skip recheck_cache stamping the
+# same oversized launch recurs every run until the stale set shrinks — hit
+# in prod 2026-06-11 with 197 stale profiles. Cap each run's scrape batch
+# well under the schema max; the deferred tail stays unstamped in the
+# recheck cache and rotates into the next run's batch. 50 (not 150) keeps
+# the per-run LinkedIn profile-visit volume at what the retired visit
+# budget (MAX_VISITS_PER_DAY) allowed — one run must not burn a week of
+# account-safety headroom clearing a backlog.
+PHASE0_MAX_PROFILES_PER_LAUNCH = 50
+
 
 def _is_blocked_by_stored_floor(
     attrs: dict,
@@ -688,6 +703,7 @@ def _escalate_phase0_stale_scrape(
     attio: AttioClient,
     backend: str,
     profiles_submitted: int,
+    profiles_deferred: int,
     rows_matched: int,
     dedup_marker_present: bool,
     container_id: str,
@@ -706,8 +722,13 @@ def _escalate_phase0_stale_scrape(
     ``phase0-stale-scrape|{date}|partial``,
     ``phase0-stale-scrape|{date}|no_csv``.
 
-    ``flavor`` is NOT a payload field — the payload schema is unchanged
-    (Phase0StaleScrapePayload).
+    ``flavor`` is NOT a payload field (Phase0StaleScrapePayload).
+
+    ``profiles_deferred`` (2026-06-11 oversized-launch fix) is the stale
+    tail beyond the per-run scrape cap. BLIND/no_csv runs stamp nothing
+    into the recheck cache, so the same head batch is re-picked while this
+    row keeps firing — the payload must surface the backlog hidden behind
+    a poison head batch.
     """
     op_today = operator_today().isoformat()
     try:
@@ -718,6 +739,7 @@ def _escalate_phase0_stale_scrape(
                 "run_date": op_today,
                 "backend": backend,
                 "profiles_submitted": profiles_submitted,
+                "profiles_deferred": profiles_deferred,
                 "rows_matched": rows_matched,
                 "dedup_marker_present": dedup_marker_present,
                 "container_id": container_id,
@@ -742,12 +764,17 @@ def detect_accepted_connections(
 ) -> dict:
     """Phase 0: Live-check CONNECTION_SENT profiles for accepted connections.
 
-    Launches PB Profile Scraper on all CONNECTION_SENT profiles to get current
+    Launches PB Profile Scraper on CONNECTION_SENT profiles to get current
     connectionDegree. Any with "1st" degree are moved to ACCEPTED in Attio.
     Keeps original last_contact_date so DM1 timing counts from send date.
 
     Only checks profiles whose last_contact_date is within the last
     ACCEPTANCE_CHECK_WINDOW_DAYS days (older invites rarely convert).
+
+    At most PHASE0_MAX_PROFILES_PER_LAUNCH stale profiles are scraped per
+    run (2026-06-11 oversized-launch fix), oldest invites first; the tail
+    is deferred and rotates in on subsequent runs via the recheck cache.
+    The ``deferred`` key of the returned summary carries the tail size.
 
     Backend selection mirrors the pre-invite degree-check (PR-B):
     ``PRE_INVITE_DEGREE_CHECK_BACKEND=sales_nav`` routes the scrape through
@@ -842,7 +869,7 @@ def detect_accepted_connections(
 
     if not conn_sent:
         click.echo("  No CONNECTION_SENT profiles to check.")
-        return {"accepted": 0, "checked": 0}
+        return {"accepted": 0, "checked": 0, "deferred": 0}
 
     # Consult recheck cache: profiles scraped in the last RECHECK_TTL_DAYS days
     # short-circuit the PB launch. Cached "1st" → flip to ACCEPTED now; cached
@@ -920,7 +947,30 @@ def detect_accepted_connections(
                 f"Operator review queue is missing reconciliation rows.",
                 err=True,
             )
-        return {"accepted": accepted, "checked": len(conn_sent), "cache_hits": cache_hit_count}
+        return {
+            "accepted": accepted,
+            "checked": len(conn_sent),
+            "cache_hits": cache_hit_count,
+            "deferred": 0,
+        }
+
+    # Bound the launch — see PHASE0_MAX_PROFILES_PER_LAUNCH for the 2026-06-11
+    # incident and the cap rationale. Oldest invites first: they exit the
+    # ACCEPTANCE_CHECK_WINDOW_DAYS window soonest, so they have the fewest
+    # re-check chances left. Scraped rows are stamped into the recheck cache
+    # below and read as fresh next run, so the deferred tail rotates in
+    # instead of re-queueing the same rows.
+    deferred = 0
+    if len(conn_sent_stale) > PHASE0_MAX_PROFILES_PER_LAUNCH:
+        conn_sent_stale.sort(key=lambda p: p.get("last_contact_date") or "")
+        deferred = len(conn_sent_stale) - PHASE0_MAX_PROFILES_PER_LAUNCH
+        conn_sent_stale = conn_sent_stale[:PHASE0_MAX_PROFILES_PER_LAUNCH]
+        click.echo(
+            f"  Capping Phase 0 scrape batch at {PHASE0_MAX_PROFILES_PER_LAUNCH} "
+            f"(per-run visit-safety cap; phantom schema max is 150) — "
+            f"{deferred} stale profile(s) deferred to subsequent runs, "
+            f"oldest invites checked first."
+        )
 
     click.echo(f"  Checking {len(conn_sent_stale)} CONNECTION_SENT profiles via Profile Scraper...")
 
@@ -1033,6 +1083,7 @@ def detect_accepted_connections(
                 "run_date": op_today,
                 "backend": backend,
                 "profiles_pending": len(conn_sent_stale),
+                "profiles_deferred": deferred,
                 "container_id": exc.container_id,
                 "error": str(exc)[:300],
             }
@@ -1043,6 +1094,7 @@ def detect_accepted_connections(
                 "run_date": op_today,
                 "backend": backend,
                 "profiles_pending": len(conn_sent_stale),
+                "profiles_deferred": deferred,
                 "wait_max_seconds": wait_max,
                 "error": str(exc)[:300],
             }
@@ -1063,6 +1115,7 @@ def detect_accepted_connections(
             "accepted": accepted,
             "checked": len(conn_sent),
             "cache_hits": cache_hit_count,
+            "deferred": deferred,
             "error": "pb_failed" if failed else "pb_timeout",
         }
 
@@ -1080,6 +1133,7 @@ def detect_accepted_connections(
             attio=attio,
             backend=backend,
             profiles_submitted=len(conn_sent_stale),
+            profiles_deferred=deferred,
             rows_matched=0,
             dedup_marker_present=has_scraper_dedup_marker(
                 getattr(completion, "log_output", "") or ""
@@ -1103,6 +1157,7 @@ def detect_accepted_connections(
             "accepted": accepted,
             "checked": len(conn_sent),
             "cache_hits": cache_hit_count,
+            "deferred": deferred,
             "error": "no_csv",
         }
 
@@ -1136,6 +1191,7 @@ def detect_accepted_connections(
             attio=attio,
             backend=backend,
             profiles_submitted=len(conn_sent_stale),
+            profiles_deferred=deferred,
             rows_matched=rows_matched,
             dedup_marker_present=dedup_marker,
             container_id=str(launch.container_id or ""),
@@ -1156,6 +1212,7 @@ def detect_accepted_connections(
                 "accepted": accepted,
                 "checked": len(conn_sent),
                 "cache_hits": cache_hit_count,
+                "deferred": deferred,
                 "error": "stale_scrape",
             }
         click.echo(
@@ -1223,6 +1280,7 @@ def detect_accepted_connections(
         "checked": len(conn_sent),
         "scraped": len(conn_sent_stale),
         "cache_hits": cache_hit_count,
+        "deferred": deferred,
     }
 
 
