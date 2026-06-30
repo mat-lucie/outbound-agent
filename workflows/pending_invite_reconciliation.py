@@ -38,6 +38,8 @@ from typing import TYPE_CHECKING
 
 import click
 
+from clients.crm.attio_provider import AttioProvider
+from clients.crm.base import CRMProvider
 from models.business_calendar import operator_today
 from models.pipeline import PipelineStage
 from workflows import recheck_cache
@@ -50,12 +52,12 @@ from workflows.pre_invite_check import (
     _IMMUTABLE_FROZEN_AT_VALUES,
     _launch_sales_nav_scrape,
 )
-from workflows.record_cache import RecordCache
 
 if TYPE_CHECKING:
     from datetime import date
 
     from clients.attio import AttioClient
+    from clients.crm.base import Record
     from clients.phantombuster import PhantomBusterClient
     from workflows.audit import AuditLogger
 
@@ -64,6 +66,23 @@ if TYPE_CHECKING:
 _WRITER_MODULE = (
     "workflows.pending_invite_reconciliation.run_pending_invite_reconciliation"
 )
+
+
+def _linkedin_url_from_person(person: Record | None) -> str:
+    """Pull the LinkedIn URL off a normalized person :class:`Record` — its
+    ``attributes["linkedin"]`` slug (the same field RecordCache ultimately
+    reads), WITHOUT the linked-company resolution ``extract_person_info`` also
+    does (the sweep only needs the URL, not name/company/title, so we skip that
+    per-record company fetch). Returns "" when absent.
+
+    Default to "" (not the raw slug value) so a value-less / non-string slug
+    can't become a truthy non-URL that wastes a scrape slot and mis-counts as
+    resolved.
+    """
+    if person is None:
+        return ""
+    url = person.attributes.get("linkedin")
+    return str(url) if url else ""
 
 
 def run_pending_invite_reconciliation(
@@ -95,7 +114,8 @@ def run_pending_invite_reconciliation(
             dropped.
 
     Returns a summary dict: examined, candidates, scraped, flipped,
-    left_at_prospect, failed, skipped_recently_checked, skipped_over_batch.
+    left_at_prospect, failed, skipped_recently_checked, skipped_over_batch,
+    skipped_no_linkedin_url.
     """
     today_iso = (today or operator_today()).isoformat()
     summary = {
@@ -107,6 +127,7 @@ def run_pending_invite_reconciliation(
         "failed": 0,
         "skipped_recently_checked": 0,
         "skipped_over_batch": 0,
+        "skipped_no_linkedin_url": 0,
         "dry_run": dry_run,
     }
 
@@ -119,19 +140,42 @@ def run_pending_invite_reconciliation(
         click.echo("No PROSPECT rows to reconcile.")
         return summary
 
-    # Resolve each PROSPECT entry's LinkedIn URL via the same cache the daily
-    # run uses, then collapse duplicate records so every entry_id for a
-    # prospect flips in lock-step (mirrors _build_invite_send_data → dedupe).
-    cache = RecordCache(attio)
+    # Resolve each PROSPECT entry's LinkedIn URL. Prefer the list-entry
+    # attribute `canonical_linkedin_url` (free — already in the parsed
+    # snapshot), but it is NOT reliably populated on PROSPECT rows (the
+    # backfill skews to later stages), so fall back to the person record's
+    # `linkedin` field. The fallback uses ONE parallelized bulk read
+    # (CRMProvider.bulk_fetch_persons, 8 workers) instead of the daily run's
+    # per-record RecordCache N+1 — the sweep only needs the URL, not
+    # name/company/title. Rows that resolve to no URL anywhere are skipped
+    # LOUDLY (counted, never silently dropped). Then collapse duplicate
+    # records so every entry_id for a prospect flips in lock-step (mirrors
+    # _build_invite_send_data → dedupe).
+    #
+    # Wrap the raw client in the vendor-neutral provider (mirrors RecordCache's
+    # union shim) so the bulk read routes through the CRMProvider contract.
+    crm: CRMProvider = attio if isinstance(attio, CRMProvider) else AttioProvider(attio)
     rows: list[dict] = []
+    need_lookup: list[dict] = []
     for attrs in prospects:
-        record_id = attrs.get("record_id")
-        if not record_id:
-            continue
-        _, _, linkedin_url, _, _ = cache.get(record_id)
-        if not linkedin_url:
-            continue
-        rows.append({**attrs, "linkedInUrl": linkedin_url})
+        url = attrs.get("canonical_linkedin_url")
+        if url:
+            rows.append({**attrs, "linkedInUrl": url})
+        elif attrs.get("record_id"):
+            need_lookup.append(attrs)
+    if need_lookup:
+        persons = crm.bulk_fetch_persons({a["record_id"] for a in need_lookup})
+        for attrs in need_lookup:
+            url = _linkedin_url_from_person(persons.get(attrs["record_id"]))
+            if url:
+                rows.append({**attrs, "linkedInUrl": url})
+    no_url = len(prospects) - len(rows)
+    if no_url:
+        summary["skipped_no_linkedin_url"] = no_url
+        click.echo(
+            f"  ⚠ {no_url} PROSPECT row(s) have no resolvable LinkedIn URL "
+            f"(no canonical_linkedin_url and no person `linkedin` field) — skipped."
+        )
     deduped, _dropped = _dedupe_by_linkedin_url(rows)
     summary["candidates"] = len(deduped)
     if not deduped:
