@@ -1007,3 +1007,152 @@ class TestSalesNavDuplicateEntryHealing:
             c.kwargs.get("entry_id") == "ent-A"
             for c in attio.update_list_entry.call_args_list
         )
+
+
+# ----------------------------------------------------------------------
+# Bounded re-scrape of rows the SN phantom drops
+# ----------------------------------------------------------------------
+
+
+@patch("workflows.daily_check.write_prospects_to_sheet", return_value="https://sheet.example/foo")
+@patch("workflows.daily_check._pb_session_args", return_value={})
+class TestSalesNavDroppedRowRetry:
+    """The SN phantom intermittently omits rows from its result CSV. A wet
+    run must re-scrape the missing rows ONCE and recover them rather than
+    silently routing them to degree_unknown + a PROSPECT re-queue."""
+
+    def test_wet_rescrapes_dropped_row_and_recovers_it(
+        self, _pb_args, _sheet, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """First CSV drops carol; the retry CSV returns her as 2nd → she
+        lands in still_to_invite, two launches fire, no escalation."""
+        escalations = _record_escalate(monkeypatch)
+        attio = MagicMock()
+        batch = [_row("A"), _row("B"), _row("C")]
+
+        first_csv = _sales_nav_csv([
+            {"url": "https://www.linkedin.com/in/alice", "degree": "2nd"},
+            {"url": "https://www.linkedin.com/in/bob", "degree": "2nd"},
+            # carol dropped from the first CSV
+        ])
+        retry_csv = _sales_nav_csv([
+            {"url": "https://www.linkedin.com/in/carol", "degree": "2nd"},
+        ])
+        pb = _make_pb()
+        pb.download_result_csv.side_effect = [first_csv, retry_csv]
+
+        with patch("workflows.recheck_cache.record_many"):
+            still, already = _pre_invite_degree_check(
+                batch, pb, None, attio, "list-id",
+                sales_nav_profile_scraper_id=SALES_NAV_SCRAPER_ID,
+            )
+
+        assert pb.launch_agent.call_count == 2, "missing row must trigger one re-scrape"
+        assert {r["entry_id"] for r in still} == {"ent-A", "ent-B", "ent-C"}
+        assert escalations == [], "recovered row must not open a degree_unknown row"
+
+    def test_wet_rescrape_still_missing_escalates_once(
+        self, _pb_args, _sheet, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Retry also drops carol → exactly one CSV_MISS degree_unknown row,
+        carol never reaches still_to_invite."""
+        escalations = _record_escalate(monkeypatch)
+        attio = MagicMock()
+        batch = [_row("A"), _row("B"), _row("C")]
+
+        first_csv = _sales_nav_csv([
+            {"url": "https://www.linkedin.com/in/alice", "degree": "2nd"},
+            {"url": "https://www.linkedin.com/in/bob", "degree": "2nd"},
+        ])
+        pb = _make_pb()
+        pb.download_result_csv.side_effect = [first_csv, ""]  # retry recovers nothing
+
+        with patch("workflows.recheck_cache.record_many"):
+            still, already = _pre_invite_degree_check(
+                batch, pb, None, attio, "list-id",
+                sales_nav_profile_scraper_id=SALES_NAV_SCRAPER_ID,
+            )
+
+        assert pb.launch_agent.call_count == 2
+        assert {r["entry_id"] for r in still} == {"ent-A", "ent-B"}
+        carol = [c for c in escalations if c["payload"].get("record_id") == "rec-C"]
+        carol_reasons = [c["payload"]["failure_reason"] for c in carol]
+        assert carol_reasons == [REASON_SALES_NAV_CSV_MISS], (
+            f"still-missing row must escalate CSV_MISS exactly once; got {carol_reasons!r}"
+        )
+
+    def test_retry_launch_failure_is_reported_distinctly(
+        self, _pb_args, _sheet, monkeypatch: pytest.MonkeyPatch, capsys,
+    ):
+        """When the re-scrape LAUNCH itself fails (PBRunFailed → ('',{},{})),
+        the operator sees a distinct 'launch did not complete' line rather than
+        a 'recovered 0' line that reads like a persistent per-row drop. The
+        still-missing row still escalates exactly once."""
+        escalations = _record_escalate(monkeypatch)
+        attio = MagicMock()
+        batch = [_row("A"), _row("B"), _row("C")]
+        first_csv = _sales_nav_csv([
+            {"url": "https://www.linkedin.com/in/alice", "degree": "2nd"},
+            {"url": "https://www.linkedin.com/in/bob", "degree": "2nd"},
+        ])
+        pb = _make_pb(csv_text=first_csv)
+        # First scrape completes; the retry launch fails outright.
+        pb.wait_for_completion.side_effect = [
+            MagicMock(),
+            PBRunFailed(
+                container_id="container-RETRY-FAIL",
+                agent_id=SALES_NAV_SCRAPER_ID,
+                log_tail="phantom error on retry",
+            ),
+        ]
+
+        with patch("workflows.recheck_cache.record_many"):
+            still, _ = _pre_invite_degree_check(
+                batch, pb, None, attio, "list-id",
+                sales_nav_profile_scraper_id=SALES_NAV_SCRAPER_ID,
+            )
+
+        assert pb.launch_agent.call_count == 2
+        assert {r["entry_id"] for r in still} == {"ent-A", "ent-B"}
+        err = capsys.readouterr().err
+        assert "re-scrape launch did not complete" in err
+        carol = [c for c in escalations if c["payload"].get("record_id") == "rec-C"]
+        assert [c["payload"]["failure_reason"] for c in carol] == [REASON_SALES_NAV_CSV_MISS]
+
+    def test_dry_run_does_not_rescrape(
+        self, _pb_args, _sheet, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Dry-run never burns a re-scrape.
+
+        FORK DIVERGENCE from upstream #200: this fork's
+        ``_pre_invite_degree_check`` fully short-circuits dry-run (Wave-1.6
+        FIX-1 "dry-run honesty") and returns BEFORE any PB launch — so the
+        whole scrape block (and therefore the bounded re-scrape) is wet-only
+        by construction. The fork's guarantee is strictly stronger than
+        upstream's (which launched a single preview scrape): zero launches in
+        dry-run, not one."""
+        _record_escalate(monkeypatch)
+        attio = MagicMock()
+        batch = [_row("A"), _row("B"), _row("C")]
+        first_csv = _sales_nav_csv([
+            {"url": "https://www.linkedin.com/in/alice", "degree": "2nd"},
+            {"url": "https://www.linkedin.com/in/bob", "degree": "2nd"},
+        ])
+        pb = _make_pb()
+        pb.download_result_csv.side_effect = [first_csv, _sales_nav_csv([
+            {"url": "https://www.linkedin.com/in/carol", "degree": "2nd"},
+        ])]
+
+        with (
+            patch("workflows.recheck_cache.record_many"),
+            patch("workflows.pre_invite_check.AttioWriter"),
+        ):
+            _pre_invite_degree_check(
+                batch, pb, None, attio, "list-id",
+                sales_nav_profile_scraper_id=SALES_NAV_SCRAPER_ID,
+                dry_run=True,
+            )
+
+        assert pb.launch_agent.call_count == 0, (
+            "dry-run short-circuits before any PB launch (fork divergence)"
+        )

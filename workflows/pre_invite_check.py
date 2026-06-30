@@ -668,6 +668,80 @@ def _pre_invite_degree_check(
                 # Both empty => PB failure path (helper already logged).
                 # Drop the whole batch — fail-safe.
                 return [], []
+            elif scraped_lookup:
+                # The Sales Nav phantom intermittently omits 1-3 of every ~25
+                # requested rows from its result CSV (observed csv_row_count
+                # 22-24 / 25). A requested URL with no scraped degree falls to
+                # the blank/missing arm of the partition below, opens a
+                # `degree_unknown` queue row, stays at PROSPECT and silently
+                # re-queues on the NEXT run — the same row can churn for days
+                # without ever being invited. Re-scrape ONLY the still-missing
+                # rows once and merge the recovered degrees before the
+                # partition (and its escalations) run.
+                #
+                # Bounded to a single retry — mirrors the timeout-retry-once
+                # convention in _launch_sales_nav_scrape — so a phantom that is
+                # systematically dropping rows can never spin the daily run.
+                # Gated on `scraped_lookup` being non-empty: a wholesale-0
+                # result is the dead-cookie/auth path handled just above, where
+                # a retry would only burn a second failed launch.
+                missing_norm = our_urls - set(scraped_lookup)
+                if missing_norm:
+                    missing_urls = [
+                        p["linkedInUrl"] for p in to_send_stale
+                        if _normalize_linkedin_url(p["linkedInUrl"]) in missing_norm
+                    ]
+                    # A recurring shortfall is a phantom-health signal the
+                    # operator must see. (This whole scrape block is wet-only:
+                    # the dry-run short-circuit at the top of this function
+                    # returns before any PB launch, so the silent-requeue bug
+                    # — and therefore this remediation — is wet-only by
+                    # construction.)
+                    click.echo(
+                        f"  ⚠ Sales Nav scrape returned {len(scraped_lookup)} of "
+                        f"{len(to_send_stale)} requested degree(s) — "
+                        f"{len(missing_urls)} row(s) missing from the result CSV. "
+                        f"Re-scraping the missing row(s) once before escalating.",
+                        err=True,
+                    )
+                    retry_cid, retry_lookup, retry_extras = _launch_sales_nav_scrape(
+                        pb,
+                        scraper_id_for_strict,
+                        missing_urls,
+                    )
+                    scraped_lookup.update(retry_lookup)
+                    extras.update(retry_extras)
+                    still_missing = missing_norm - set(scraped_lookup)
+                    recovered = len(missing_norm) - len(still_missing)
+                    # Rows still missing after the retry fall through to the
+                    # per-row `degree_unknown` escalation below — NOT
+                    # swallowed either way.
+                    if not retry_cid and not retry_lookup:
+                        # The retry LAUNCH itself failed/timed out:
+                        # _launch_sales_nav_scrape returns ("", {}, {}) and
+                        # has already echoed the cause above. Call this out
+                        # distinctly — otherwise the "recovered 0" line below
+                        # reads like the phantom persistently dropping these
+                        # specific rows, when the whole second launch died.
+                        click.echo(
+                            f"  ⚠ Sales Nav re-scrape launch did not complete "
+                            f"(see the error above) — {len(still_missing)} "
+                            f"row(s) escalating as degree_unknown below.",
+                            err=True,
+                        )
+                    else:
+                        # Completed retry (container present). Surface the
+                        # retry container id so the operator can pull THIS
+                        # launch's PB log for the rows still missing — the
+                        # CSV-miss escalation below records only the first
+                        # scrape's container.
+                        click.echo(
+                            f"  Sales Nav re-scrape (container {retry_cid or '?'}) "
+                            f"recovered {recovered} of {len(missing_norm)} missing "
+                            f"degree(s); {len(still_missing)} still missing"
+                            f"{' (degree_unknown rows opened below)' if still_missing else ''}.",
+                            err=True,
+                        )
         else:
             # Legacy regular Profile Scraper path — DOCUMENTED-DEAD: the
             # legacy agent was deleted from the PB workspace, so
