@@ -852,3 +852,158 @@ class TestSalesNavLaunchArgShape:
 
         launch_args = pb.launch_agent.call_args.args[1]
         assert launch_args["numberOfProfilesPerLaunch"] == 4
+
+
+# ----------------------------------------------------------------------
+# A1/A2 — duplicate-entry healing + telemetry (Phase A)
+# ----------------------------------------------------------------------
+
+
+def _row_multi(suffix: str, entry_ids: list[str]) -> dict:
+    """A to_send_data row carrying multiple list entries (dedup-merged
+    duplicates) under `entry_ids`, mirroring _dedupe_by_linkedin_url output."""
+    row = _row(suffix)
+    row["entry_ids"] = entry_ids
+    return row
+
+
+@patch("workflows.daily_check.write_prospects_to_sheet", return_value="https://sheet.example/foo")
+@patch("workflows.daily_check._pb_session_args", return_value={})
+class TestSalesNavDuplicateEntryHealing:
+    """A1: a dedup-merged prospect carries every associated list entry in
+    `entry_ids`. The Pattern-A flips must flip ALL of them — a duplicate left
+    at PROSPECT is re-selected next run (the daily re-selection leak)."""
+
+    def test_pending_flip_writes_all_entry_ids(self, _pb_args, _sheet):
+        attio = MagicMock()
+        csv = _sales_nav_csv([
+            {"url": "https://www.linkedin.com/in/alice", "degree": "2nd", "pending": "true"},
+        ])
+        pb = _make_pb(csv_text=csv)
+        # Alice has two list entries (a duplicate that dedup merged).
+        batch = [_row_multi("A", ["ent-A1", "ent-A2"])]
+
+        still, already = _pre_invite_degree_check(
+            batch, pb, None, attio, "list-id",
+            sales_nav_profile_scraper_id=SALES_NAV_SCRAPER_ID,
+        )
+
+        assert still == []
+        assert already == []
+        flipped = {
+            c.kwargs["entry_id"]: c.kwargs["entry_attributes"]
+            for c in attio.update_list_entry.call_args_list
+        }
+        # BOTH entries flipped — the duplicate can't re-leak into tomorrow's pool.
+        assert set(flipped) == {"ent-A1", "ent-A2"}
+        assert flipped["ent-A1"]["stage"] == "Connection Sent"
+        assert flipped["ent-A2"]["stage"] == "Connection Sent"
+
+    def test_first_degree_flip_writes_all_entry_ids(self, _pb_args, _sheet):
+        attio = MagicMock()
+        csv = _sales_nav_csv([
+            {"url": "https://www.linkedin.com/in/alice", "degree": "1st"},
+        ])
+        pb = _make_pb(csv_text=csv)
+        batch = [_row_multi("A", ["ent-A1", "ent-A2"])]
+
+        still, already = _pre_invite_degree_check(
+            batch, pb, None, attio, "list-id",
+            sales_nav_profile_scraper_id=SALES_NAV_SCRAPER_ID,
+        )
+
+        assert still == []
+        assert len(already) == 1
+        flipped = {
+            c.kwargs["entry_id"]: c.kwargs["entry_attributes"]
+            for c in attio.update_list_entry.call_args_list
+        }
+        assert set(flipped) == {"ent-A1", "ent-A2"}
+        assert flipped["ent-A1"]["stage"] == "Accepted"
+        assert flipped["ent-A2"]["stage"] == "Accepted"
+
+    def test_pending_flip_partial_entry_failure_never_invites(
+        self, _pb_args, _sheet, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """If one of a prospect's entry writes fails, the row must NOT fall
+        through to the invite queue (§3.1) — it stays out and is queued for
+        retry/triage."""
+        from clients.attio_writer import AttioError
+
+        escalations = _record_escalate(monkeypatch)
+        attio = MagicMock()
+        csv = _sales_nav_csv([
+            {"url": "https://www.linkedin.com/in/alice", "degree": "2nd", "pending": "true"},
+        ])
+        pb = _make_pb(csv_text=csv)
+        batch = [_row_multi("A", ["ent-A1", "ent-A2"])]
+
+        def _apply(intent):
+            if intent.record_id == "ent-A2":
+                raise AttioError("simulated second-entry failure")
+            return None
+
+        with patch("clients.attio_writer.AttioWriter.apply", side_effect=_apply):
+            still, already = _pre_invite_degree_check(
+                batch, pb, None, attio, "list-id",
+                sales_nav_profile_scraper_id=SALES_NAV_SCRAPER_ID,
+            )
+
+        assert still == []
+        assert already == []
+        assert any(
+            str(c["payload"].get("scrape_attempt_id", "")).startswith("pending-flip-fail")
+            for c in escalations
+        )
+
+    def test_pattern_a_pending_flips_audit_event_emitted(self, _pb_args, _sheet):
+        """A2: the heal-path volume is emitted as an audit event so the daily
+        re-selection leak is measurable day over day."""
+        attio = MagicMock()
+        audit_logger = MagicMock()
+        csv = _sales_nav_csv([
+            {"url": "https://www.linkedin.com/in/alice", "degree": "2nd", "pending": "true"},
+            {"url": "https://www.linkedin.com/in/bob", "degree": "2nd", "pending": "false"},
+        ])
+        pb = _make_pb(csv_text=csv)
+        batch = [_row("A"), _row("B")]
+
+        _pre_invite_degree_check(
+            batch, pb, None, attio, "list-id",
+            sales_nav_profile_scraper_id=SALES_NAV_SCRAPER_ID,
+            audit_logger=audit_logger,
+        )
+
+        events = {
+            c.args[0]: c.kwargs
+            for c in audit_logger.event.call_args_list
+            if c.args
+        }
+        assert "pattern_a_pending_flips" in events
+        assert events["pattern_a_pending_flips"]["pending_flipped"] == 1
+        assert events["pattern_a_pending_flips"]["failed"] == 0
+
+    def test_audit_event_failure_never_aborts_the_run(self, _pb_args, _sheet):
+        """The telemetry event fires after flips are durable; a sidecar failure
+        must NOT propagate out and abort the wet invite send."""
+        attio = MagicMock()
+        audit_logger = MagicMock()
+        audit_logger.event.side_effect = RuntimeError("audit sink down")
+        csv = _sales_nav_csv([
+            {"url": "https://www.linkedin.com/in/alice", "degree": "2nd", "pending": "true"},
+        ])
+        pb = _make_pb(csv_text=csv)
+
+        # Must not raise despite the audit sink failing.
+        still, already = _pre_invite_degree_check(
+            [_row("A")], pb, None, attio, "list-id",
+            sales_nav_profile_scraper_id=SALES_NAV_SCRAPER_ID,
+            audit_logger=audit_logger,
+        )
+
+        assert still == []
+        # The flip itself still happened (durable before the audit call).
+        assert any(
+            c.kwargs.get("entry_id") == "ent-A"
+            for c in attio.update_list_entry.call_args_list
+        )

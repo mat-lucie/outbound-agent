@@ -105,6 +105,7 @@ from workflows.escalation import escalate
 if TYPE_CHECKING:
     from clients.attio import AttioClient
     from clients.phantombuster import PhantomBusterClient
+    from workflows.audit import AuditLogger
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +471,7 @@ def _pre_invite_degree_check(
     sales_nav_profile_scraper_id: str | None = None,
     today: date | None = None,
     dry_run: bool = False,
+    audit_logger: AuditLogger | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Scrape LinkedIn degree for each PROSPECT before inviting.
 
@@ -780,6 +782,10 @@ def _pre_invite_degree_check(
     # operator. See the try/except at the escalate site for the
     # orphan-prevention rationale.
     flip_fail_escalate_failed_count = 0
+    # A2 telemetry: count successful Pattern-A pending→CONNECTION_SENT flips
+    # (the heal-path volume). `already_connected` already tallies the
+    # 1st-degree→ACCEPTED flips; `failed_to_flip` tallies the failures.
+    pending_flipped_count = 0
     today_iso = (today_op or date.today()).isoformat()
     writer = AttioWriter(attio=attio)
     for row in to_send_data:
@@ -889,45 +895,64 @@ def _pre_invite_degree_check(
             # multi-attribute write via F-PR-4's AttioWriter — stage,
             # last_contact_date, and (when present) experiment_id_frozen_at
             # all succeed or all fail. PR-21 widens the updates dict above.
-            try:
-                writer.apply(WriteIntent(
-                    object="linkedin_outreach",
-                    record_id=row["entry_id"],
-                    updates=updates,
-                    prior_values={
-                        # Pre-flip stage is the row's current stage from
-                        # the upstream filter (PROSPECT or CONNECTION_SENT
-                        # depending on caller). Pass the value the row
-                        # actually has so monotonicity check passes.
-                        "stage": str(row.get("current_stage", PipelineStage.PROSPECT.value)),
-                    },
-                    writer_module="workflows.pre_invite_check._pre_invite_degree_check",
-                    is_list_entry=True,
-                    list_id=list_id,
-                ))
+            # A1 (duplicate-entry fix): a dedup-merged prospect carries every
+            # associated list entry in `entry_ids` (injected by
+            # _dedupe_by_linkedin_url before this function runs). Flip ALL of
+            # them — a duplicate left at PROSPECT re-leaks into tomorrow's
+            # invite pool. Fall back to the singular `entry_id` when entry_ids
+            # is absent. The PR-15 atomicity contract (stage + last_contact_date
+            # + frozen_at succeed/fail together) holds PER ENTRY; a partial
+            # failure routes the whole row to failed_to_flip so no invite leaks.
+            flip_exc: Exception | None = None
+            for entry_id in row.get("entry_ids") or [row.get("entry_id")]:
+                if not entry_id:
+                    continue
+                try:
+                    writer.apply(WriteIntent(
+                        object="linkedin_outreach",
+                        record_id=entry_id,
+                        updates=updates,
+                        prior_values={
+                            # Pre-flip stage is the row's current stage from
+                            # the upstream filter (PROSPECT or CONNECTION_SENT
+                            # depending on caller). Pass the value the row
+                            # actually has so monotonicity check passes.
+                            "stage": str(row.get("current_stage", PipelineStage.PROSPECT.value)),
+                        },
+                        writer_module="workflows.pre_invite_check._pre_invite_degree_check",
+                        is_list_entry=True,
+                        list_id=list_id,
+                    ))
+                except (AttioError, UnauthorizedAttioWriteError,
+                        httpx.HTTPStatusError, httpx.RequestError,
+                        ConnectionError, TimeoutError) as exc:
+                    # PR-21 (Lesson 5): narrow to Attio/transient exceptions.
+                    # KeyError, AttributeError, TypeError propagate as code bugs.
+                    # PR-15 fold-in (silent-failure-hunter BLOCKING B1):
+                    # UnauthorizedAttioWriteError extends PermissionError not
+                    # AttioError; widened catch keeps batch processing alive.
+                    flip_exc = exc
+                    click.echo(
+                        f"  ⚠ Pattern-A flip failed for {row['linkedInUrl']} "
+                        f"(record_id={row['record_id']!r}, entry_id={entry_id!r}) "
+                        f"({type(exc).__name__}): {exc}; skipping invite to be safe",
+                        err=True,
+                    )
+            if flip_exc is None:
                 click.echo(
                     f"  [PR-21] Pattern-A flip: record_id={row['record_id']!r} "
-                    f"entry_id={row.get('entry_id')!r} url={row['linkedInUrl']} "
+                    f"entry_ids={row.get('entry_ids') or [row.get('entry_id')]!r} "
+                    f"url={row['linkedInUrl']} "
                     f"experiment_id={prior_experiment_id!r} frozen_at: "
                     f"{prior_frozen_at!r} → 'accepted'",
                     err=True,
                 )
                 already_connected.append(row)
-            except (AttioError, UnauthorizedAttioWriteError,
-                    httpx.HTTPStatusError, httpx.RequestError,
-                    ConnectionError, TimeoutError) as exc:
-                # PR-21 (Lesson 5): narrow to Attio/transient exceptions.
-                # KeyError, AttributeError, TypeError propagate as code bugs.
-                # Transient failures go to `failed_to_flip` list (not silent drop).
-                # PR-15 fold-in (silent-failure-hunter BLOCKING B1):
-                # UnauthorizedAttioWriteError extends PermissionError not AttioError;
-                # widened catch keeps batch processing alive even on registry typos.
-                click.echo(
-                    f"  ⚠ Pattern-A flip failed for {row['linkedInUrl']} "
-                    f"(record_id={row['record_id']!r}, entry_id={row.get('entry_id')!r}) "
-                    f"({type(exc).__name__}): {exc}; skipping invite to be safe",
-                    err=True,
-                )
+            else:
+                # At least one entry failed to flip. Keep the prospect OUT of
+                # the invite pool (never fall through to still_to_invite —
+                # the §3.1 brand-event failure) and surface for triage.
+                # `flip_exc` carries the last failure for the escalate payload.
                 failed_to_flip.append(row)
                 # PR-15 fold-in (silent-failure-hunter IMPORTANT I1):
                 # Emit an Operator Review Queue row so operator can triage.
@@ -953,7 +978,7 @@ def _pre_invite_degree_check(
                                 "record_id": str(row["record_id"]),
                                 "linkedin_url": row["linkedInUrl"],
                                 "last_known_degree": "1st",
-                                "scrape_attempt_id": f"flip-fail-{type(exc).__name__}",
+                                "scrape_attempt_id": f"flip-fail-{type(flip_exc).__name__}",
                                 "requested_at": datetime.now(UTC).isoformat(),
                                 "csv_row_count_observed": 0,
                                 "csv_row_count_expected": 1,
@@ -1023,41 +1048,56 @@ def _pre_invite_degree_check(
                         and pending_prior_frozen_at not in _IMMUTABLE_FROZEN_AT_VALUES
                     ):
                         pending_updates["experiment_id_frozen_at"] = "connection_sent"
-                    try:
-                        writer.apply(WriteIntent(
-                            object="linkedin_outreach",
-                            record_id=row["entry_id"],
-                            updates=pending_updates,
-                            prior_values={
-                                "stage": str(
-                                    row.get("current_stage", PipelineStage.PROSPECT.value)
-                                ),
-                            },
-                            writer_module="workflows.pre_invite_check._pre_invite_degree_check",
-                            is_list_entry=True,
-                            list_id=list_id,
-                        ))
+                    # A1 (duplicate-entry fix): flip ALL of the prospect's list
+                    # entries (entry_ids), not just the first. A duplicate left
+                    # at PROSPECT is re-selected next run — the exact daily
+                    # re-selection leak. Each entry's write is independently
+                    # transient-guarded; ANY failure routes the whole row to
+                    # failed_to_flip (leave at PROSPECT, retry next run, never
+                    # fall through to still_to_invite — the §3.1 brand-event).
+                    pending_flip_exc: Exception | None = None
+                    for entry_id in row.get("entry_ids") or [row.get("entry_id")]:
+                        if not entry_id:
+                            continue
+                        try:
+                            writer.apply(WriteIntent(
+                                object="linkedin_outreach",
+                                record_id=entry_id,
+                                updates=pending_updates,
+                                prior_values={
+                                    "stage": str(
+                                        row.get("current_stage", PipelineStage.PROSPECT.value)
+                                    ),
+                                },
+                                writer_module="workflows.pre_invite_check._pre_invite_degree_check",
+                                is_list_entry=True,
+                                list_id=list_id,
+                            ))
+                        except (AttioError, UnauthorizedAttioWriteError,
+                                httpx.HTTPStatusError, httpx.RequestError,
+                                ConnectionError, TimeoutError) as exc:
+                            pending_flip_exc = exc
+                            click.echo(
+                                f"  ⚠ pending-flip failed for {row['linkedInUrl']} "
+                                f"(record_id={row['record_id']!r}, "
+                                f"entry_id={entry_id!r}) "
+                                f"({type(exc).__name__}): {exc}; leaving at PROSPECT "
+                                f"(will retry next run)",
+                                err=True,
+                            )
+                    if pending_flip_exc is None:
+                        pending_flipped_count += 1
                         click.echo(
                             f"  [Pattern-A pending] flip PROSPECT→CONNECTION_SENT: "
                             f"record_id={row['record_id']!r} "
-                            f"entry_id={row.get('entry_id')!r} "
+                            f"entry_ids={row.get('entry_ids') or [row.get('entry_id')]!r} "
                             f"url={row['linkedInUrl']} (hasPendingInvitation)",
                             err=True,
                         )
-                    except (AttioError, UnauthorizedAttioWriteError,
-                            httpx.HTTPStatusError, httpx.RequestError,
-                            ConnectionError, TimeoutError) as exc:
-                        # Transient/registry failure: leave at PROSPECT (do NOT
-                        # invite — that's the brand-event failure mode) and
-                        # record for retry. Never fall through to still_to_invite.
-                        click.echo(
-                            f"  ⚠ pending-flip failed for {row['linkedInUrl']} "
-                            f"(record_id={row['record_id']!r}, "
-                            f"entry_id={row.get('entry_id')!r}) "
-                            f"({type(exc).__name__}): {exc}; leaving at PROSPECT "
-                            f"(will retry next run)",
-                            err=True,
-                        )
+                    else:
+                        # Transient/registry failure on at least one entry: leave
+                        # at PROSPECT and record for retry + operator triage.
+                        # `pending_flip_exc` carries the last failure for escalate.
                         failed_to_flip.append(row)
                         # Durable operator-review row (mirrors the 1st-degree
                         # flip-fail path) so the failure survives beyond the
@@ -1076,7 +1116,7 @@ def _pre_invite_degree_check(
                                         "linkedin_url": row["linkedInUrl"],
                                         "last_known_degree": degree,
                                         "scrape_attempt_id":
-                                            f"pending-flip-fail-{type(exc).__name__}",
+                                            f"pending-flip-fail-{type(pending_flip_exc).__name__}",
                                         "requested_at": datetime.now(UTC).isoformat(),
                                         "csv_row_count_observed": 0,
                                         "csv_row_count_expected": 1,
@@ -1237,5 +1277,36 @@ def _pre_invite_degree_check(
             f"log lines above.",
             err=True,
         )
+
+    # A2 telemetry (wet path only): surface the heal-path volume so the daily
+    # re-selection leak is measurable day over day instead of invisible in
+    # ephemeral stderr. `pending_flipped` is the count of PROSPECT rows that
+    # LinkedIn already held a pending invite for (the leak being healed);
+    # `already_first_degree` is the 1st-degree→ACCEPTED reconciliation.
+    if not dry_run:
+        click.echo(
+            f"  Pattern-A: flipped {pending_flipped_count} pending"
+            f"→CONNECTION_SENT, {len(already_connected)} already-1st-degree"
+            f"→ACCEPTED, {len(failed_to_flip)} failed."
+        )
+        if audit_logger is not None:
+            # Best-effort: this event fires AFTER every Pattern-A flip is
+            # durable in Attio but BEFORE the caller proceeds to send the
+            # invite queue. A telemetry sidecar failure must never abort the
+            # wet send (mirrors the escalate() best-effort pattern above).
+            try:
+                audit_logger.event(
+                    "pattern_a_pending_flips",
+                    pending_flipped=pending_flipped_count,
+                    already_first_degree=len(already_connected),
+                    failed=len(failed_to_flip),
+                )
+            except Exception as audit_exc:  # noqa: BLE001 — telemetry never blocks send
+                click.echo(
+                    f"  ⚠ pattern_a_pending_flips audit event failed "
+                    f"[{type(audit_exc).__name__}]: {audit_exc}. "
+                    f"Flips are durable; continuing.",
+                    err=True,
+                )
 
     return still_to_invite, already_connected

@@ -821,6 +821,8 @@ class TestWriterRegistryParity:
         "scripts.attio_dedup",
         # PR-22: 7th writer — archaeology backfill for legacy rows
         "scripts.backfill_experiment_id_archaeology",
+        # Phase C: 8th writer — reconciliation sweep re-stamps connection_sent.
+        "workflows.pending_invite_reconciliation.run_pending_invite_reconciliation",
     }
 
     def test_experiment_id_has_all_6_writers(self):
@@ -834,8 +836,9 @@ class TestWriterRegistryParity:
             f"got {sorted(owners)}, expected {sorted(self.EXPECTED_WRITERS_EXPERIMENT_ID)}"
         )
 
-    def test_experiment_id_frozen_at_has_all_7_writers(self):
-        """PR-22 update: 7 writers (added scripts.backfill_experiment_id_archaeology)."""
+    def test_experiment_id_frozen_at_has_all_8_writers(self):
+        """PR-22: 7th writer (archaeology backfill). Phase C: 8th writer
+        (pending_invite_reconciliation re-stamps connection_sent)."""
         from clients.attio_writer_registry import get_authorized_writers
 
         owners = get_authorized_writers("linkedin_outreach", "experiment_id_frozen_at")

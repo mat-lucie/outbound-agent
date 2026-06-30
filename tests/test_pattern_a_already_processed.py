@@ -97,3 +97,22 @@ def test_empty_batch_advances_nothing():
     )
     assert n == 0
     assert not attio.update_list_entry.called
+
+
+def test_advances_all_entry_ids_for_duplicate_prospect():
+    """A1: a dedup-merged prospect carries every list entry in `entry_ids`;
+    ALL of them must advance so a duplicate left at PROSPECT can't re-leak."""
+    attio = MagicMock()
+    row = _row("a")
+    row["entry_ids"] = ["ent-a1", "ent-a2"]
+    n = _advance_already_processed_rows(
+        [row], attio=attio, list_id="list-id", today="2026-05-29",
+    )
+    assert n == 2  # one per entry
+    flipped = {
+        c.kwargs["entry_id"]: c.kwargs["entry_attributes"]
+        for c in attio.update_list_entry.call_args_list
+    }
+    assert set(flipped) == {"ent-a1", "ent-a2"}
+    assert flipped["ent-a1"]["stage"] == PipelineStage.CONNECTION_SENT.value
+    assert flipped["ent-a2"]["stage"] == PipelineStage.CONNECTION_SENT.value

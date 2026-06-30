@@ -114,6 +114,10 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
         # tally (source of truth for confirmed sends) when the in-run
         # advance failed. Same guarded write path.
         "workflows.consistency_sweep.run_company_tally_consistency_sweep",
+        # Phase C reconciliation sweep: flips PROSPECT→CONNECTION_SENT for
+        # rows a fresh Sales Nav scrape confirms are already pending on
+        # LinkedIn (clears the pre-fix re-selection backlog).
+        "workflows.pending_invite_reconciliation.run_pending_invite_reconciliation",
     ],
     # last_contact_date — multi-writer: DM cadence (run_dm_sequencing),
     # PR-9.5 dedup union-merge MAX-of-duplicates per §3.11, and PR-15
@@ -131,6 +135,9 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
         # tally (source of truth for confirmed sends) when the in-run
         # advance failed. Same guarded write path.
         "workflows.consistency_sweep.run_company_tally_consistency_sweep",
+        # Phase C reconciliation sweep (stamps last_contact_date alongside the
+        # PROSPECT→CONNECTION_SENT flip).
+        "workflows.pending_invite_reconciliation.run_pending_invite_reconciliation",
     ],
     ("linkedin_outreach", "quality_score"):
         "workflows.quality_gate.score_prospect",
@@ -223,6 +230,9 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
         "scripts.migrate_experiments_tsv_to_attio",
         "scripts.attio_dedup",
         "scripts.backfill_experiment_id_archaeology",  # PR-22: 7th writer
+        # Phase C reconciliation sweep: re-stamps connection_sent on the
+        # PROSPECT→CONNECTION_SENT flip (same guard as pre_invite_check).
+        "workflows.pending_invite_reconciliation.run_pending_invite_reconciliation",
     ],
     ("linkedin_outreach", "experiment_id_backfill_confidence"):
         "scripts.backfill_experiment_id_archaeology",

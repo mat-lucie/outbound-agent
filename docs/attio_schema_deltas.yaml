@@ -370,6 +370,7 @@ attributes:
       - scripts.migrate_experiments_tsv_to_attio
       - scripts.attio_dedup
       - scripts.backfill_experiment_id_archaeology
+      - workflows.pending_invite_reconciliation.run_pending_invite_reconciliation
     note: |
       §3.1 full enum (6 values — no "no_active_experiment" sentinel, never add it).
       Seven authorized writers (PR-22 adds 7th):
