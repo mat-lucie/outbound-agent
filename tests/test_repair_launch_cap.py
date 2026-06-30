@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv
 from unittest.mock import MagicMock, patch
 
+from clients.google_sheets import profiles_per_launch
 from workflows.backfill_companies import (
     REPAIR_MAX_PROFILES_PER_LAUNCH,
     repair_bad_companies,
@@ -107,10 +108,14 @@ def test_oversized_backlog_is_capped_and_tail_deferred(tmp_path, monkeypatch):
     n = REPAIR_MAX_PROFILES_PER_LAUNCH + 17
     summary, pb, sheet_calls, _ = _run_repair(tmp_path, monkeypatch, n)
 
-    # The launch argument must never exceed the cap — PB rejects the whole
-    # launch above the phantom's schema max.
+    # The launch argument is the capped batch + the sheet header line PB
+    # counts as a processable row (clients.google_sheets.profiles_per_launch);
+    # cap + header must stay under the phantom's schema max or PB rejects the
+    # whole launch.
     launch_args = pb.launch_agent.call_args.args[1]
-    assert launch_args["numberOfProfilesPerLaunch"] == REPAIR_MAX_PROFILES_PER_LAUNCH
+    assert launch_args["numberOfProfilesPerLaunch"] == profiles_per_launch(
+        REPAIR_MAX_PROFILES_PER_LAUNCH
+    )
 
     # The sheet feeding the phantom holds only the capped head batch.
     assert len(sheet_calls) == 1
@@ -124,7 +129,7 @@ def test_within_cap_batch_passes_through_unchanged(tmp_path, monkeypatch):
     summary, pb, sheet_calls, _ = _run_repair(tmp_path, monkeypatch, 5)
 
     launch_args = pb.launch_agent.call_args.args[1]
-    assert launch_args["numberOfProfilesPerLaunch"] == 5
+    assert launch_args["numberOfProfilesPerLaunch"] == profiles_per_launch(5)
     assert len(sheet_calls[0]) == 5
     assert summary["deferred"] == 0
 
@@ -133,7 +138,9 @@ def test_batch_exactly_at_cap_is_not_deferred(tmp_path, monkeypatch):
     summary, pb, _, _ = _run_repair(tmp_path, monkeypatch, REPAIR_MAX_PROFILES_PER_LAUNCH)
 
     launch_args = pb.launch_agent.call_args.args[1]
-    assert launch_args["numberOfProfilesPerLaunch"] == REPAIR_MAX_PROFILES_PER_LAUNCH
+    assert launch_args["numberOfProfilesPerLaunch"] == profiles_per_launch(
+        REPAIR_MAX_PROFILES_PER_LAUNCH
+    )
     assert summary["deferred"] == 0
 
 

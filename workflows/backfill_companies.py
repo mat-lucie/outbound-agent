@@ -294,7 +294,7 @@ def repair_bad_companies(
 
     Returns the backfill_import summary dict.
     """
-    from clients.google_sheets import write_prospects_to_sheet
+    from clients.google_sheets import profiles_per_launch, write_prospects_to_sheet
 
     # Step 0: Clean poisoned company domains. Loop because there may be
     # multiple companies poisoned with linkedin.com (different runs of the
@@ -350,11 +350,15 @@ def repair_bad_companies(
     session_cookie, session_ua = get_phantombuster_credentials()
     # API ``arguments`` REPLACE the phantom's saved console args wholesale, so
     # pass the per-launch count explicitly or the phantom truncates at its
-    # default. After the cap above, ``len(sheet_rows)`` is bounded by
-    # REPAIR_MAX_PROFILES_PER_LAUNCH so PB never rejects the whole launch.
+    # default. ``profiles_per_launch`` adds the sheet header line PB counts as
+    # a processable row (else the LAST repair row is silently dropped — see
+    # clients.google_sheets.profiles_per_launch). After the cap above,
+    # ``len(sheet_rows)`` is bounded by REPAIR_MAX_PROFILES_PER_LAUNCH, so
+    # batch + header stays under the phantom schema max and PB never rejects
+    # the whole launch.
     launch_args: dict = {
         "spreadsheetUrl": sheet_url,
-        "numberOfProfilesPerLaunch": len(sheet_rows),
+        "numberOfProfilesPerLaunch": profiles_per_launch(len(sheet_rows)),
     }
     if session_cookie:
         launch_args["sessionCookie"] = session_cookie
