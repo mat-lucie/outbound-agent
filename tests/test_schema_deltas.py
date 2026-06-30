@@ -108,6 +108,9 @@ class TestShippedManifest:
                 "scripts.attio_dedup",
                 # PR-22: 7th writer — archaeology backfill for legacy NULL frozen_at rows
                 "scripts.backfill_experiment_id_archaeology",
+                # Phase C: reconciliation sweep re-stamps connection_sent on the
+                # PROSPECT→CONNECTION_SENT flip (same guard as pre_invite_check).
+                "workflows.pending_invite_reconciliation.run_pending_invite_reconciliation",
             },
             ("linkedin_outreach", "suppress_re_engagement"): {
                 "workflows.cross_channel_suppression",

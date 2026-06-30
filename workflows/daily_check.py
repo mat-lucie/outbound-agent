@@ -1750,6 +1750,8 @@ def run_connection_requests(
             # true no-op preview (no PB launch, no GSheet write, no
             # AttioWriter flip). Closes the 2026-05-25 leak.
             dry_run=dry_run,
+            # A2 telemetry: emit the pattern_a_pending_flips heal-path event.
+            audit_logger=audit_logger,
         )
         if pre_invite_already_connected:
             click.echo(
@@ -1923,6 +1925,11 @@ def run_connection_requests(
         # baseline-v0). None is a valid experiment tag meaning "no active experiment".
         current_experiment_id = get_current_experiment_id()
         updated = 0
+        # A2: rows advanced via the already-processed (Pattern-A) path. Counted
+        # separately from `updated` (the regular per-row loop) so the summary
+        # line reflects ALL Attio-confirmed advances, not just confirmed-send
+        # advances.
+        already_processed_advanced = 0
         # Wave-1.6.2 FIX-A (adversarial EXT-SB-1 BLOCKING): tally failed
         # `experiment_id_immutability_violation` escalate() calls so we can
         # surface a loud end-of-batch summary line. See the try/except at the
@@ -1971,7 +1978,10 @@ def run_connection_requests(
                     f"{len(to_send_data)} profile(s) — advancing to CONNECTION_SENT "
                     f"(already invited; Pattern-A fix), not opening pb_silent_no_op."
                 )
-                _advance_already_processed_rows(
+                # A2: capture the advanced count (previously discarded) so the
+                # summary line below reflects the already-processed advance path,
+                # not just the regular per-row loop's `updated`.
+                already_processed_advanced = _advance_already_processed_rows(
                     to_send_data,
                     attio=attio,
                     list_id=list_id,
@@ -2272,15 +2282,24 @@ def run_connection_requests(
     # stamping them would suppress a needed re-check next run.
     if recheck_data and not batch_advance_gate_failed:
         recheck_cache.record_many({row["linkedInUrl"]: None for row in recheck_data})
-    # L3-3: honest summary. "queued N" = prepared for PB; "advanced M" = Attio-confirmed.
-    # Print both when they differ so operators can spot PB send-phantom gaps.
-    if updated != len(to_send_data):
+    # L3-3: honest summary. "queued N" = prepared for PB; "advanced M" =
+    # Attio-confirmed. A2: the total now spans BOTH advance paths — the
+    # regular per-row loop (`updated`, confirmed sends) AND the already-
+    # processed Pattern-A path (`already_processed_advanced`). Pre-fix the
+    # latter was discarded, so a batch healed entirely via already-processed
+    # logged "advanced 0" despite every row advancing. Print both when they
+    # differ so operators can spot real PB send-phantom gaps.
+    total_advanced = updated + already_processed_advanced
+    if total_advanced != len(to_send_data):
         click.echo(
             f"Connection requests: queued {len(to_send_data)}, "
-            f"advanced {updated} (Attio-confirmed)."
+            f"advanced {total_advanced} (Attio-confirmed"
+            + (f"; {already_processed_advanced} via already-processed"
+               if already_processed_advanced else "")
+            + ")."
         )
     else:
-        click.echo(f"Sent {len(to_send_data)} connection requests. Attio updated: {updated}/{len(to_send_data)}.")
+        click.echo(f"Sent {len(to_send_data)} connection requests. Attio updated: {total_advanced}/{len(to_send_data)}.")
     if escalate_failed_count > 0:
         # Wave-1.6.2 FIX-A: a swallowed escalate() failure is acceptable
         # (the alternative is orphan re-invites — see the try/except in

@@ -509,8 +509,8 @@ def compute_invite_outcome(
 ) -> SendOutcome:
     """Invite-path override of the (unreliable) parsed Network Booster outcome.
 
-    On a clean launch (authenticated, no cap/restriction) with at least one
-    requested invite, optimistically mark every requested URL as sent so the
+    Authoritative advance: on a clean launch (authenticated, no cap/restriction)
+    with at least one requested invite, mark ALL requested URLs as sent so the
     standard per-row advance path runs (with correct experiment-cohort
     stamping), stamping `drift_skipped_reason=INVITE_OPTIMISTIC_ADVANCE` so the
     advance is auditable. Otherwise return the parsed outcome unchanged:
@@ -518,6 +518,18 @@ def compute_invite_outcome(
       - auth failure / cap / restriction → stays Skipped → gate fails →
         pb_silent_no_op (invites re-queue; never a false CONNECTION_SENT).
       - no requested invites (recheck-only batch) → nothing to advance.
+
+    Advancing every requested row on a clean launch is deliberate: withholding
+    rows that the phantom physically invited but omitted from its per-launch log
+    (log-format drift OR its own already-processed dedup) left them at PROSPECT
+    and re-fed them forever — the daily re-selection leak, with pending invites
+    piling up on LinkedIn. The explicit per-launch profile-count argument removed
+    the silent truncation that once motivated a `requested ∩ processed` gate, so
+    a row absent from the parsed list is now a benign artifact, not an
+    un-attempted row. The HARD blocks remain in `invite_launch_advanceable`
+    (auth failure / cap / restriction → invites did NOT go out → no advance),
+    and the pre-invite degree check reconciles the rare ghost via
+    `hasPendingInvitation`.
 
     DM batches must NOT use this — they have a reliable `status` column and go
     through `parse_send_outcome` + `should_advance_batch` directly.

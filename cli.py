@@ -1601,6 +1601,57 @@ def repair_companies_cmd(detect_csv, sales_nav_profile_scraper_id, dry_run):
         )
 
 
+@cli.command("reconcile-pending-invites")
+@click.option("--sales-nav-profile-scraper-id", envvar="PB_SALES_NAV_PROFILE_SCRAPER_ID", required=True, help="PhantomBuster Sales Navigator Profile Scraper agent ID")
+@click.option("--dry-run/--wet", "dry_run", default=True, help="Preview PROSPECT candidates without scraping or writing (default). Pass --wet to scrape and apply.")
+@click.option("--force", "force_rescrape", is_flag=True, help="Bypass the recheck-cache TTL and re-scrape every PROSPECT candidate")
+@click.option("--batch-size", default=25, show_default=True, type=int, help="Max profiles scraped this run (PB cost bound)")
+def reconcile_pending_invites_cmd(sales_nav_profile_scraper_id, dry_run, force_rescrape, batch_size):
+    """Flip PROSPECT rows that are already pending on LinkedIn to CONNECTION_SENT.
+
+    Phase C backlog-clearer for the re-selection leak. On --wet, re-scrapes
+    PROSPECT rows via Sales Nav and flips ONLY those returning
+    hasPendingInvitation=true (a fresh, positive already-invited signal — never
+    ghost-advances). Defaults to --dry-run (candidate preview, no scrape/write);
+    review, then re-run with --wet.
+    """
+    from clients.attio import AttioClient
+    from clients.phantombuster import PhantomBusterClient
+    from workflows.daily_check_helpers import SalesNavConfigError
+    from workflows.pending_invite_reconciliation import (
+        run_pending_invite_reconciliation,
+    )
+    from workflows.pre_invite_check import ConfigError
+
+    click.echo("=== Sales Agent -- Reconcile Pending Invites ===\n")
+    list_id = os.environ.get("ATTIO_LIST_ID", "")
+    if not list_id:
+        raise click.ClickException("ATTIO_LIST_ID is not set.")
+
+    try:
+        with AttioClient() as attio, PhantomBusterClient() as pb:
+            summary = run_pending_invite_reconciliation(
+                attio=attio,
+                pb=pb,
+                sales_nav_profile_scraper_id=sales_nav_profile_scraper_id,
+                list_id=list_id,
+                dry_run=dry_run,
+                force_rescrape=force_rescrape,
+                batch_size=batch_size,
+            )
+    except (SalesNavConfigError, ConfigError) as exc:
+        # Config failures (e.g. a missing Sales Nav session cookie on the wet
+        # scrape path) surface the named fix, not a traceback. No write happened.
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"\nSummary: {summary}")
+    if dry_run and summary.get("candidates"):
+        click.echo(
+            f"\n{summary['candidates']} candidate(s) previewed. "
+            f"Re-run with --wet to scrape and flip the genuinely-pending rows."
+        )
+
+
 @cli.command("detect-deal-dupes")
 @click.option(
     "--out",
