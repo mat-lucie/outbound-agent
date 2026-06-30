@@ -118,6 +118,10 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
         # rows a fresh Sales Nav scrape confirms are already pending on
         # LinkedIn (clears the pre-fix re-selection backlog).
         "workflows.pending_invite_reconciliation.run_pending_invite_reconciliation",
+        # One-shot: park CONNECTION_SENT rows older than
+        # STALE_CONNECTION_SENT_ESCALATE_DAYS at UNREACHABLE (forward-only;
+        # they are permanently past the acceptance-detection window).
+        "scripts.remediate_stale_connection_sent_20260615",
     ],
     # last_contact_date — multi-writer: DM cadence (run_dm_sequencing),
     # PR-9.5 dedup union-merge MAX-of-duplicates per §3.11, and PR-15

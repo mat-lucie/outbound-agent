@@ -23,7 +23,7 @@ from clients.pb_envelope import (
     should_advance_batch,
 )
 from clients.phantombuster import PhantomBusterClient
-from models.business_calendar import operator_today
+from models.business_calendar import business_days_between, operator_today
 from models.campaign import (
     MessageStep,
     MissingMessageError,
@@ -3528,6 +3528,65 @@ def compute_due_dm_counts(
         "due_dm2_count": due["dm2"],
         "due_dm3_count": due["dm3"],
     }
+
+
+def compute_dm1_sent_cohort_by_date(
+    attio: AttioClient,
+    today: date | None = None,
+    window_business_days: int = 5,
+) -> list[tuple[str, int]]:
+    """DM1-Sent-stage rows grouped by send-date, last N business days.
+
+    Read-only operator-visibility helper for the run-end summary. Counts
+    rows CURRENTLY at DM1_SENT, keyed by the date DM1 went out: ``dm1_sent_at``
+    when present, falling back to ``last_contact_date`` for legacy rows that
+    predate the PR-9a per-step timestamp (for a DM1_SENT-stage row the last
+    contact IS the DM1 send, so the fallback is exact).
+
+    Why this exists: the run-end summary reports ``due_dm{1,2,3}`` (how many
+    are DUE) but not how many were SENT per day, so a healthy daily cohort
+    can be unreadable inside a DM1_SENT stage total that also holds same-day
+    re-prospected duplicates. Bucketing by send-date makes each day's true
+    cohort size legible at a glance.
+
+    Returns ``[(YYYY-MM-DD, count), ...]`` sorted by date ascending, limited
+    to send-dates within the last ``window_business_days`` business days
+    (inclusive of today). Rows with no/unparseable send-date, or a send-date
+    outside the window, are omitted.
+    """
+    today = today or date.today()
+    counts: dict[str, int] = {}
+    skipped_unparseable = 0
+    for attrs in _get_all_entries_parsed(attio):
+        if attrs.get("stage") != PipelineStage.DM1_SENT.value:
+            continue
+        raw = attrs.get("dm1_sent_at") or attrs.get("last_contact_date")
+        if not raw:
+            continue
+        day = str(raw)[:10]
+        try:
+            sent = date.fromisoformat(day)
+        except ValueError:
+            # A DM1_SENT row with a corrupt send-date is itself a data-quality
+            # anomaly AND would silently shrink the very cohort this helper
+            # exists to make legible — count it and surface it below rather
+            # than dropping it without a trace.
+            skipped_unparseable += 1
+            continue
+        # business_days_between counts Mon-Fri strictly after `sent` up to
+        # `today`: 0 for today, 1 for the prior business day, etc. Keep the
+        # most recent `window_business_days` (today included); drop future
+        # dates and anything older than the window.
+        if sent > today or business_days_between(sent, today) >= window_business_days:
+            continue
+        counts[day] = counts.get(day, 0) + 1
+    if skipped_unparseable:
+        click.echo(
+            f"  ⚠ {skipped_unparseable} DM1_SENT row(s) had an unparseable "
+            f"send-date and were excluded from the cohort table.",
+            err=True,
+        )
+    return sorted(counts.items())
 
 
 def check_responses_manual(attio: AttioClient) -> None:

@@ -160,6 +160,7 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
     from models.run_mode import RunMode
     from workflows.audit import AuditLogger
     from workflows.daily_check import (
+        compute_dm1_sent_cohort_by_date,
         compute_due_dm_counts,
         detect_accepted_connections,
         run_connection_requests,
@@ -676,6 +677,26 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                             f"degree_unknown={run_summary['degree_unknown_count']}, "
                             f"signal={run_summary['starvation_signal']}."
                         )
+                        # Read-only cohort visibility: how many rows landed in
+                        # DM1_SENT per send-date over the last business week, so
+                        # a genuine daily cohort is legible against same-day
+                        # re-prospected duplicates inflating the stage total.
+                        dm1_cohort = compute_dm1_sent_cohort_by_date(
+                            _attio_inner_client(crm), today=today
+                        )
+                        if dm1_cohort:
+                            breakdown = ", ".join(
+                                f"{day}={count}" for day, count in dm1_cohort
+                            )
+                            click.echo(
+                                f"  DM1 Sent cohort by send-date (last 5 business "
+                                f"days): {breakdown}."
+                            )
+                        else:
+                            click.echo(
+                                "  DM1 Sent cohort by send-date (last 5 business "
+                                "days): none."
+                            )
 
                     click.echo("\n=== Daily Check Complete ===")
                     click.echo(f"Connections sent: {conn_result.get('sent', 0)}")
