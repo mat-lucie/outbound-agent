@@ -18,21 +18,35 @@ from workflows.daily_check_helpers import _normalize_linkedin_url
 MOD = "workflows.pending_invite_reconciliation"
 
 
+def _url(record_id: str) -> str:
+    return f"https://www.linkedin.com/in/{record_id}"
+
+
 def _entry(suffix: str, *, stage: str = "Prospect",
            experiment_id: str | None = "exp-1",
            frozen_at: str | None = "prospect",
-           record_id: str | None = None) -> dict:
+           record_id: str | None = None,
+           canonical_url: str | None = "__default__") -> dict:
+    rid = record_id or f"rec-{suffix}"
+    # URL comes straight off the list entry's canonical_linkedin_url attribute
+    # (no per-record fetch). Pass canonical_url=None to simulate a legacy row.
+    url = _url(rid) if canonical_url == "__default__" else canonical_url
     return {
         "entry_id": f"ent-{suffix}",
-        "record_id": record_id or f"rec-{suffix}",
+        "record_id": rid,
         "stage": stage,
         "experiment_id": experiment_id,
         "experiment_id_frozen_at": frozen_at,
+        "canonical_linkedin_url": url,
     }
 
 
-def _url(record_id: str) -> str:
-    return f"https://www.linkedin.com/in/{record_id}"
+def _person_with_linkedin(url: str):
+    """A normalized person :class:`Record` carrying a `linkedin` attribute —
+    the shape the fork's CRMProvider.bulk_fetch_persons returns."""
+    from clients.crm.base import Record
+
+    return Record(record_id="", object="people", attributes={"linkedin": url})
 
 
 @contextmanager
@@ -41,12 +55,6 @@ def _harness(entries: list[dict], extras_by_url: dict[str, str],
     """Patch the sweep's collaborators. `extras_by_url` maps a record_id's URL
     to its hasPendingInvitation value; `advance_spy` records flip calls."""
     spy = advance_spy or MagicMock(return_value=True)
-
-    def _cache_get(record_id):
-        return ("Name", "Co", _url(record_id), "", "")
-
-    cache = MagicMock()
-    cache.get.side_effect = _cache_get
 
     def _scrape(pb, scraper_id, urls, **kwargs):
         extras = {
@@ -58,7 +66,6 @@ def _harness(entries: list[dict], extras_by_url: dict[str, str],
 
     with (
         patch(f"{MOD}._get_all_entries_parsed", return_value=entries),
-        patch(f"{MOD}.RecordCache", return_value=cache),
         patch(f"{MOD}._launch_sales_nav_scrape", side_effect=_scrape),
         patch(f"{MOD}.recheck_cache.partition", side_effect=lambda urls: ({}, list(urls))),
         patch(f"{MOD}.recheck_cache.record_many"),
@@ -67,14 +74,21 @@ def _harness(entries: list[dict], extras_by_url: dict[str, str],
         yield spy
 
 
-def _run(**kw):
+def _run(*, persons: dict | None = None, **kw):
     from workflows.pending_invite_reconciliation import run_pending_invite_reconciliation
     base = dict(
         attio=MagicMock(), pb=MagicMock(),
         sales_nav_profile_scraper_id="sn-1", list_id="list-1",
     )
     base.update(kw)
-    return run_pending_invite_reconciliation(**base)
+    # The module wraps the raw client in AttioProvider and calls
+    # crm.bulk_fetch_persons(record_ids). Patch that provider so the bulk read
+    # returns a real {record_id: Record} dict (default empty — never a truthy
+    # MagicMock that would fake a URL for every no-canonical row).
+    provider = MagicMock()
+    provider.bulk_fetch_persons.return_value = persons or {}
+    with patch(f"{MOD}.AttioProvider", return_value=provider):
+        return run_pending_invite_reconciliation(**base)
 
 
 def test_flips_only_pending_rows():
@@ -199,8 +213,6 @@ def test_scrape_config_error_propagates_no_write():
     from workflows.daily_check_helpers import SalesNavConfigError
 
     entries = [_entry("A"), _entry("B")]
-    cache = MagicMock()
-    cache.get.side_effect = lambda rid: ("N", "C", _url(rid), "", "")
     spy = MagicMock(return_value=True)
 
     def _boom(pb, scraper_id, urls, **kwargs):
@@ -208,7 +220,6 @@ def test_scrape_config_error_propagates_no_write():
 
     with (
         patch(f"{MOD}._get_all_entries_parsed", return_value=entries),
-        patch(f"{MOD}.RecordCache", return_value=cache),
         patch(f"{MOD}._launch_sales_nav_scrape", side_effect=_boom),
         patch(f"{MOD}.recheck_cache.partition", side_effect=lambda urls: ({}, list(urls))),
         patch("workflows.daily_check._attio_advance_with_escalation", spy),
@@ -216,3 +227,52 @@ def test_scrape_config_error_propagates_no_write():
     ):
         _run(dry_run=False)
     spy.assert_not_called()
+
+
+def test_rows_with_no_resolvable_url_skipped_loudly():
+    """A row with neither canonical_linkedin_url nor a person `linkedin` field
+    must be COUNTED and skipped — never silently dropped, never flipped."""
+    entries = [
+        _entry("A"),                            # canonical URL, pending
+        _entry("legacy", canonical_url=None),   # no canonical, no person URL
+    ]
+    extras = {_url("rec-A"): "true"}
+    # bulk fetch returns {} → rec-legacy resolves to no URL.
+    with _harness(entries, extras) as spy:
+        summary = _run(dry_run=False)  # persons defaults to {}
+    assert summary["skipped_no_linkedin_url"] == 1
+    assert summary["candidates"] == 1
+    assert summary["flipped"] == 1
+    assert {c.kwargs["entry_id"] for c in spy.call_args_list} == {"ent-A"}
+
+
+def test_value_less_person_linkedin_attribute_resolves_to_no_url():
+    """A person whose `linkedin` attribute is absent/blank must NOT become a
+    truthy non-URL — the row is counted as unresolvable and skipped, not
+    scraped."""
+    from clients.crm.base import Record
+
+    entries = [_entry("legacy", canonical_url=None)]
+    blank = Record(record_id="", object="people", attributes={"linkedin": None})
+    with _harness(entries, {}) as spy:
+        summary = _run(dry_run=False, persons={"rec-legacy": blank})
+    assert summary["skipped_no_linkedin_url"] == 1
+    assert summary["candidates"] == 0
+    spy.assert_not_called()
+
+
+def test_resolves_url_via_person_bulk_fetch_when_no_canonical():
+    """When canonical_linkedin_url is absent (the real PROSPECT case), the URL
+    is resolved from the person record via the bulk fetch, and the row flips."""
+    entries = [_entry("legacy", canonical_url=None)]
+    person_url = "https://www.linkedin.com/in/legacy-person"
+    extras = {person_url: "true"}
+    with _harness(entries, extras) as spy:
+        summary = _run(
+            dry_run=False,
+            persons={"rec-legacy": _person_with_linkedin(person_url)},
+        )
+    assert summary["skipped_no_linkedin_url"] == 0
+    assert summary["candidates"] == 1
+    assert summary["flipped"] == 1
+    assert {c.kwargs["entry_id"] for c in spy.call_args_list} == {"ent-legacy"}
