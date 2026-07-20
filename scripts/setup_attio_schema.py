@@ -5,9 +5,19 @@ Creates 4 list-entry attributes on the LinkedIn Outreach list and 2 record
 attributes on the Companies object, skipping any that already exist (matched
 by api_slug). Safe to re-run.
 
+The optional Follow-up Radar feature (``--feature radar``) provisions the
+warm-account follow-up state attributes (PR-211/214/247). The radar is
+DISABLED by default: a fresh install never touches these attributes, and the
+radar command fails-closed-clean when they are absent. Run the selector only
+once you want the radar (see GETTING_STARTED.md → Follow-up Radar). The
+attribute specs mirror the CRM-agnostic requirement documented there; the
+sole in-code writer is ``workflows.followup_state``.
+
 Usage:
   python3 scripts/setup_attio_schema.py --dry-run
   python3 scripts/setup_attio_schema.py
+  python3 scripts/setup_attio_schema.py --feature radar   # add radar attrs
+  python3 scripts/setup_attio_schema.py --feature all     # core + radar
 """
 from __future__ import annotations
 
@@ -23,7 +33,100 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from clients.attio import AttioClient  # noqa: E402
+from scripts._attio_migration_helpers import ensure_attribute  # noqa: E402
 from workflows.quality_gate import VERDICT_PATHS  # noqa: E402
+
+# ── Follow-up Radar attribute specs (PR-211/214/247) ───────────────────────
+# (slug, source-type, description). Types are the manifest source-side names
+# (`datetime`/`checkbox`/... — ensure_attribute maps to the Attio API type).
+# Sole writer of every attribute below: workflows.followup_state. The radar is
+# OFF by default; these are only provisioned via `--feature radar`.
+#
+# The five followup_* state attrs land on BOTH warm object types (the
+# LinkedIn Outreach list + the deals object); awaiting_reply_* powers the
+# WAITING lane; deals-only extras carry partner attribution + verified touch;
+# people-only is_partner is the operator-seeded partner roster flag.
+_RADAR_SHARED_ATTRS: list[tuple[str, str, str]] = [
+    ("followup_draft_at", "datetime",
+     "When a follow-up review-draft was last generated. A newer real "
+     "last-touch supersedes it (the account was acted on)."),
+    ("followup_draft_id", "text",
+     "Draft id of the last follow-up draft (dedup on re-run + digest link)."),
+    ("followup_snooze_until", "date",
+     "Radar skips this account until this date (inclusive). Operator/skill set."),
+    ("followup_muted", "checkbox",
+     "Permanently exclude from the radar (operator parks stale/irrelevant rows)."),
+    ("followup_callback_date", "date",
+     "Deferral tickler — suppress until this date, then hard-surface."),
+    ("awaiting_reply_since", "date",
+     "Date of the most recent unanswered send to this account (WAITING lane; "
+     "re-stamped on newer sends; 60-day TTL read-side)."),
+    ("awaiting_reply_thread_id", "text",
+     "Advisory email thread id of the unanswered send (skill re-resolves live)."),
+    ("awaiting_reply_note_id", "text",
+     "Id of the one canonical waiting-context note per record (survives clear)."),
+    ("awaiting_reply_nudge_count", "number",
+     "Nudge drafts this waiting cycle (hard max 2; at the ceiling the account "
+     "renders terminal and never auto-drafts again)."),
+]
+
+_RADAR_DEALS_ONLY_ATTRS: list[tuple[str, str, str]] = [
+    ("referred_by", "text",
+     "Referring partner's canonical lowercase email (deal-side partner "
+     "attribution). Stamped by the skill layer when a known partner is found "
+     "among the deal's email thread participants."),
+    ("last_verified_touch", "date",
+     "Skill-layer-verified true last-touch date (Follow-up Radar v2). Highest-"
+     "precedence deal recency source for radar ranking."),
+]
+
+_RADAR_PEOPLE_ONLY_ATTRS: list[tuple[str, str, str]] = [
+    ("is_partner", "checkbox",
+     "Partner roster flag. Seeded MANUALLY by the operator via the CRM UI — no "
+     "engine code writes it. Read by the skill layer to recognize a known "
+     "partner among a deal's email thread participants."),
+]
+
+
+def _provision_radar(client: AttioClient, list_id: str, dry_run: bool) -> None:
+    """Idempotently create the Follow-up Radar attributes (PR-211/214/247).
+
+    The five shared state attrs land on the LinkedIn Outreach list AND the
+    deals object; deals also gets the partner-attribution + verified-touch
+    extras; people gets only the operator-seeded is_partner roster flag.
+    """
+    # (parent_kind, parent_id, label, attrs)
+    plan: list[tuple[str, str, str, list[tuple[str, str, str]]]] = [
+        ("list", list_id, "linkedin_outreach", _RADAR_SHARED_ATTRS),
+        ("object", "deals", "deals", _RADAR_SHARED_ATTRS + _RADAR_DEALS_ONLY_ATTRS),
+        ("object", "people", "people", _RADAR_PEOPLE_ONLY_ATTRS),
+    ]
+    click.echo("\nFollow-up Radar attributes (PR-211/214/247):")
+    created = skipped = failed = 0
+    for parent_kind, parent_id, label, attrs in plan:
+        for slug, type_, description in attrs:
+            target = f"{label}.{slug}"
+            try:
+                action = ensure_attribute(
+                    client, parent_kind, parent_id, slug, type_,  # type: ignore[arg-type]
+                    description=description, dry_run=dry_run,
+                )
+            except Exception as exc:  # noqa: BLE001
+                click.echo(f"  ✗ {target}: FAILED — {exc}", err=True)
+                failed += 1
+                continue
+            if action == "created" or action == "would_create":
+                tag = "[dry-run] would create" if dry_run else "created"
+                click.echo(f"  + {target} ({type_}): {tag}")
+                created += 1
+            else:
+                click.echo(f"  ✓ {target}: exists ({action})")
+                skipped += 1
+    click.echo(
+        f"Radar attributes: created={created}, skipped={skipped}, failed={failed}."
+    )
+    if failed:
+        raise click.ClickException(f"{failed} radar attribute(s) failed to provision.")
 
 
 # Spec: each entry is (parent_kind, parent_id_or_slug, attribute body).
@@ -232,11 +335,26 @@ def _create_option(
 
 @click.command()
 @click.option("--dry-run", is_flag=True, help="List actions without writing.")
-def main(dry_run: bool) -> int:
+@click.option(
+    "--feature",
+    type=click.Choice(["core", "radar", "all"]),
+    default="core",
+    show_default=True,
+    help=(
+        "Which attribute set to provision. 'core' (default) = scorer + "
+        "persistence attrs only. 'radar' = Follow-up Radar attrs only. "
+        "'all' = both. The radar is off by default; provision it only when "
+        "you want the Follow-up Radar (see GETTING_STARTED.md)."
+    ),
+)
+def main(dry_run: bool, feature: str) -> int:
     list_id = os.environ["ATTIO_LIST_ID"]
-    specs = _build_specs(list_id)
+    specs = _build_specs(list_id) if feature in ("core", "all") else []
 
     with AttioClient() as client:
+        if feature == "radar":
+            _provision_radar(client, list_id, dry_run)
+            return 0
         # Cache existing slugs per parent so we make one GET per parent
         cache: dict[tuple[str, str], set[str]] = {}
 
@@ -283,6 +401,9 @@ def main(dry_run: bool) -> int:
             f"\nDone. Attributes: created={created_attrs}, skipped={skipped_attrs}. "
             f"Options: created={created_opts}, skipped={skipped_opts}."
         )
+
+        if feature == "all":
+            _provision_radar(client, list_id, dry_run)
     return 0
 
 

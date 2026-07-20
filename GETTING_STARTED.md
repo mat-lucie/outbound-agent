@@ -107,6 +107,39 @@ If the token is absent or unreadable, the client raises
 `GmailCredentialsMissing` and the email-detection path skips cleanly — never a
 crash. Re-run `python -m clients.gmail` to re-enable.
 
+### (Optional) Follow-up Radar
+
+**Off by default.** The Follow-up Radar (PR-211/214/247) surfaces warm-but-stale
+accounts — replied, call booked, demo'd, or open deal — that went quiet, ranks
+them, and (in the skill layer) drafts review-ready follow-ups (never auto-sent).
+A fresh install never touches its attributes and the `followup-*` commands
+fail-closed-clean without them, so you can ignore this for a first run.
+
+To enable it your CRM needs these attributes provisioned. On the bundled Attio
+adapter, run `python3 scripts/setup_attio_schema.py --feature radar` (idempotent,
+safe to re-run; `--dry-run` previews). On a bring-your-own CRM, add the
+equivalent attributes by hand. Sole in-engine writer of every attribute below is
+`workflows.followup_state`; `is_partner` is operator-seeded by hand.
+
+| Object | Attribute | Type | Purpose |
+|--------|-----------|------|---------|
+| people (LinkedIn Outreach list) **and** deals | `followup_draft_at` | datetime | When a follow-up review-draft was last generated (a newer real touch supersedes it). |
+| people **and** deals | `followup_draft_id` | text | Draft id of the last follow-up draft (dedup + digest link). |
+| people **and** deals | `followup_snooze_until` | date | Radar skips the account until this date (inclusive). |
+| people **and** deals | `followup_muted` | checkbox | Permanently exclude from the radar. |
+| people **and** deals | `followup_callback_date` | date | Deferral tickler — suppress until this date, then hard-surface. |
+| people **and** deals | `awaiting_reply_since` | date | Most recent unanswered send (WAITING lane; 60-day TTL). |
+| people **and** deals | `awaiting_reply_thread_id` | text | Advisory email thread id of the unanswered send. |
+| people **and** deals | `awaiting_reply_note_id` | text | Id of the one canonical waiting-context note per record. |
+| people **and** deals | `awaiting_reply_nudge_count` | number | Nudge drafts this cycle (hard max 2). |
+| deals | `referred_by` | text | Referring partner's canonical lowercase email. |
+| deals | `last_verified_touch` | date | Skill-verified true last-touch (highest-precedence recency source). |
+| people | `is_partner` | checkbox | Partner roster flag — **seeded manually by the operator**, no engine writes. |
+
+Requires Gmail email-response detection (above) for the conversation-ledger
+side; without it the radar still runs on CRM-resident signals and simply skips
+the email sweep.
+
 ---
 
 ## 3. Create the PhantomBuster phantoms
