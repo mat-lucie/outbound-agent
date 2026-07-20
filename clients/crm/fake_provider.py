@@ -168,11 +168,20 @@ class FakeProvider(CRMProvider):
     # ── People records ────────────────────────────────────────
 
     def search_people(
-        self, filter_: dict[str, Any] | None = None, limit: int = 50
+        self,
+        filter_: dict[str, Any] | None = None,
+        limit: int = 50,
+        *,
+        fail_if_truncated: bool = False,
     ) -> list[Record]:
         matched = [
             r for r in self._store("people").values() if _matches(r.attributes, filter_)
         ]
+        if fail_if_truncated and len(matched) > limit:
+            raise ResultTruncatedError(
+                f"people search matched {len(matched)} records but the sweep "
+                f"limit is {limit} — raise the limit so every record is seen"
+            )
         return matched[:limit]
 
     def get_person(self, record_id: str) -> Record | None:
