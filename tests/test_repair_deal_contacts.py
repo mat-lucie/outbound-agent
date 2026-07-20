@@ -68,8 +68,8 @@ class TestExtractionHelpers:
         assert _person_company_uuids(p) == []
 
     def test_person_name_full(self):
-        p = _person("p1", name="Ana Garza")
-        assert _person_name(p) == "Ana Garza"
+        p = _person("p1", name="Ana Cruz")
+        assert _person_name(p) == "Ana Cruz"
 
     def test_person_job_title(self):
         p = _person("p1", title="Plant Director")
@@ -84,8 +84,8 @@ class TestExtractionHelpers:
         assert _deal_company_uuid(d) == ""
 
     def test_deal_name(self):
-        d = _deal("d1", name="Sigma Alimentos")
-        assert _deal_name(d) == "Sigma Alimentos"
+        d = _deal("d1", name="Acme Foods")
+        assert _deal_name(d) == "Acme Foods"
 
     def test_deal_associated_people(self):
         d = _deal("d1", people=["p1", "p2"])
@@ -119,7 +119,7 @@ class TestClassifyCandidate:
         p = _person("p1", name="Ana", title="Plant Director", linkedin="linkedin.com/in/ana")
         # Set location via primary_location since _person_location reads it
         p["values"]["primary_location"] = [{"locality": "Monterrey", "region": "NL", "country_code": "MX"}]
-        persona, band, score, rec, _ = _classify_candidate(p, deal_name="Sigma Alimentos")
+        persona, band, score, rec, _ = _classify_candidate(p, deal_name="Acme Foods")
         # Plant Director is a decision-maker title; score should be above the link threshold.
         assert score > 0
         # We don't assert exact recommendation here — quality_gate scoring can vary —
@@ -128,7 +128,7 @@ class TestClassifyCandidate:
 
     def test_sales_title_gets_skip_disqualified(self):
         p = _person("p1", name="Carlos", title="Director Comercial", linkedin="linkedin.com/in/carlos")
-        persona, band, score, rec, reasons = _classify_candidate(p, deal_name="Sigma Alimentos")
+        persona, band, score, rec, reasons = _classify_candidate(p, deal_name="Acme Foods")
         # quality_gate disqualifies sales/comercial titles outright.
         assert rec == "skip-disqualified"
 
@@ -139,11 +139,11 @@ class TestClassifyCandidate:
 class TestDetectDealContactGaps:
     def test_emits_csv_with_link_and_already_linked_rows(self, tmp_path):
         attio = MagicMock()
-        d1 = _deal("d1", name="Sigma", company_uuid="co-sigma", people=["p1"])
+        d1 = _deal("d1", name="Acme Foods", company_uuid="co-acme", people=["p1"])
         attio.search_deals.return_value = [d1]
-        ana = _person("p1", name="Ana", title="Plant Director", company_uuids=["co-sigma"])
+        ana = _person("p1", name="Ana", title="Plant Director", company_uuids=["co-acme"])
         ana["values"]["primary_location"] = [{"country_code": "MX"}]
-        beto = _person("p2", name="Beto", title="VP Operations", company_uuids=["co-sigma"])
+        beto = _person("p2", name="Beto", title="VP Operations", company_uuids=["co-acme"])
         beto["values"]["primary_location"] = [{"country_code": "MX"}]
         attio.search_people.return_value = [ana, beto]
 
@@ -162,10 +162,10 @@ class TestDetectDealContactGaps:
     def test_only_empty_skips_deals_with_contacts(self, tmp_path):
         attio = MagicMock()
         # d1 has contacts, d2 has none — only d2 should be reported when only_empty=True.
-        d1 = _deal("d1", name="Sigma", company_uuid="co-sigma", people=["p1"])
+        d1 = _deal("d1", name="Acme Foods", company_uuid="co-acme", people=["p1"])
         d2 = _deal("d2", name="Pacasmayo", company_uuid="co-pacasmayo", people=[])
         attio.search_deals.return_value = [d1, d2]
-        p1 = _person("p1", name="Ana", title="Plant Director", company_uuids=["co-sigma"])
+        p1 = _person("p1", name="Ana", title="Plant Director", company_uuids=["co-acme"])
         p1["values"]["primary_location"] = [{"country_code": "MX"}]
         p2 = _person("p2", name="Beto", title="Plant Director", company_uuids=["co-pacasmayo"])
         p2["values"]["primary_location"] = [{"country_code": "PE"}]
@@ -200,16 +200,16 @@ def report_csv(tmp_path):
     out = tmp_path / "report.csv"
     rows = [
         {
-            "deal_id": "d1", "deal_name": "Sigma", "deal_stage": "Lead",
-            "company_uuid": "co-sigma", "current_contact_count": "0",
+            "deal_id": "d1", "deal_name": "Acme Foods", "deal_stage": "Lead",
+            "company_uuid": "co-acme", "current_contact_count": "0",
             "candidate_person_id": "p1", "candidate_name": "Ana",
             "candidate_title": "Plant Director", "candidate_linkedin": "",
             "persona": "operations_leaders", "quality_score": "70",
             "score_band": "60-75", "recommendation": "link", "reasons": "",
         },
         {
-            "deal_id": "d1", "deal_name": "Sigma", "deal_stage": "Lead",
-            "company_uuid": "co-sigma", "current_contact_count": "0",
+            "deal_id": "d1", "deal_name": "Acme Foods", "deal_stage": "Lead",
+            "company_uuid": "co-acme", "current_contact_count": "0",
             "candidate_person_id": "p2", "candidate_name": "Carlos",
             "candidate_title": "Director Comercial", "candidate_linkedin": "",
             "persona": "", "quality_score": "20", "score_band": "<40",
@@ -237,7 +237,7 @@ class TestApplyDealContactBackfill:
         attio = MagicMock()
         # d1 currently has no people; d2 already has p4
         attio.get_deal.side_effect = lambda did: {
-            "d1": _deal("d1", company_uuid="co-sigma", people=[]),
+            "d1": _deal("d1", company_uuid="co-acme", people=[]),
             "d2": _deal("d2", company_uuid="co-pacasmayo", people=["p4"]),
         }[did]
 
@@ -259,7 +259,7 @@ class TestApplyDealContactBackfill:
         attio = MagicMock()
         # Both d1 and d2 already have all the candidates
         attio.get_deal.side_effect = lambda did: {
-            "d1": _deal("d1", company_uuid="co-sigma", people=["p1"]),
+            "d1": _deal("d1", company_uuid="co-acme", people=["p1"]),
             "d2": _deal("d2", company_uuid="co-pacasmayo", people=["p3"]),
         }[did]
 
@@ -275,7 +275,7 @@ class TestApplyDealContactBackfill:
     def test_pretend_does_not_call_update(self, report_csv, tmp_path):
         attio = MagicMock()
         attio.get_deal.side_effect = lambda did: {
-            "d1": _deal("d1", company_uuid="co-sigma", people=[]),
+            "d1": _deal("d1", company_uuid="co-acme", people=[]),
             "d2": _deal("d2", company_uuid="co-pacasmayo", people=["p4"]),
         }[did]
 

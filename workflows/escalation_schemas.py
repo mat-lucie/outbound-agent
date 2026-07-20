@@ -196,7 +196,7 @@ ESCALATION_TYPES: tuple[str, ...] = (
     # and surfaces it for the repair tooling instead of guessing a DM stage.
     "prospect_first_degree_with_depth",
 
-    # ---- Dup-prospect ingest cascade (PR-241 César RCA) ----
+    # ---- Dup-prospect ingest cascade (PR-241 René RCA) ----
     # pre_invite_check quarantines a 1st-degree row that only became a prospect
     # within the last PATTERN_A_QUARANTINE_DAYS — a likely URL-variant
     # duplicate of a person who already ran a full cadence. Skip today's flip,
@@ -1126,7 +1126,7 @@ class ProspectFirstDegreeWithDepthPayload(TypedDict):
     response_received_at_set: bool
 
 
-# ---- Dup-prospect ingest cascade (PR-241 César RCA) ----
+# ---- Dup-prospect ingest cascade (PR-241 René RCA) ----
 
 class PatternASuspectedDuplicatePayload(TypedDict):
     """`pattern_a_suspected_duplicate` — emitted by
@@ -1134,7 +1134,7 @@ class PatternASuspectedDuplicatePayload(TypedDict):
     Pattern-A flip to ACCEPTED only became a prospect within the last
     `PATTERN_A_QUARANTINE_DAYS` (14).
 
-    This is the daily-run half of the PR-241 César cascade: the weekly ingest
+    This is the daily-run half of the PR-241 René cascade: the weekly ingest
     re-created an existing prospect under a new LinkedIn vanity slug, the daily
     run found the "new" prospect already 1st-degree, and the Pattern-A flip
     re-started a cadence on a person who'd already completed a DM3. Recently-
@@ -1162,7 +1162,7 @@ class ManualReplySuppressedSelfEchoPayload(TypedDict):
     fire (`isLastMessageFromMe=true` + `totalMessageCount > expected`) but the
     last message body matches one of OUR OWN DM templates.
 
-    The reply-detection half of the PR-241 César cascade: a duplicate DM1
+    The reply-detection half of the PR-241 René cascade: a duplicate DM1
     (from the re-prospecting) left a thread whose last message was our own copy
     echoed twice, arithmetically indistinguishable from a real reply. The row
     is NOT flipped to Responded; the operator confirms the thread.
@@ -1294,7 +1294,7 @@ ESCALATION_SCHEMAS: dict[str, type] = {
     "stale_connection_sent": StaleConnectionSentPayload,
     # Phase 0 PROSPECT sweep (Defect 2)
     "prospect_first_degree_with_depth": ProspectFirstDegreeWithDepthPayload,
-    # Dup-prospect ingest cascade (PR-241 César RCA)
+    # Dup-prospect ingest cascade (PR-241 René RCA)
     "pattern_a_suspected_duplicate": PatternASuspectedDuplicatePayload,
     "manual_reply_suppressed_self_echo": ManualReplySuppressedSelfEchoPayload,
 }

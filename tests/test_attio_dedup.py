@@ -42,13 +42,13 @@ class TestNormalizeLinkedinUrl:
 
 class TestNormalizeDomain:
     def test_strips_scheme(self):
-        assert normalize_domain("https://sigma-alimentos.com") == "sigma-alimentos.com"
+        assert normalize_domain("https://acme-foods.com") == "acme-foods.com"
 
     def test_strips_www(self):
-        assert normalize_domain("www.sigma-alimentos.com") == "sigma-alimentos.com"
+        assert normalize_domain("www.acme-foods.com") == "acme-foods.com"
 
     def test_strips_path(self):
-        assert normalize_domain("sigma-alimentos.com/about") == "sigma-alimentos.com"
+        assert normalize_domain("acme-foods.com/about") == "acme-foods.com"
 
 
 class TestComparable:
@@ -324,10 +324,10 @@ class TestDetectListEntryConflicts:
 
 
 class TestBucketCompanies:
-    def test_sigma_case(self):
-        """Two Sigma records with the same canonical domain get bucketed."""
-        a = _company("sig-a", "2025-12-01", "sigma-alimentos.com", name="Sigma Alimentos")
-        b = _company("sig-b", "2026-03-15", "www.sigma-alimentos.com", name="Sigma Foods")
+    def test_acme_case(self):
+        """Two Acme Foods records with the same canonical domain get bucketed."""
+        a = _company("sig-a", "2025-12-01", "acme-foods.com", name="Acme Foods")
+        b = _company("sig-b", "2026-03-15", "www.acme-foods.com", name="Acme Grains")
         safe, conflicts = bucket_companies([a, b])
         # different names → conflict
         assert len(safe) == 0

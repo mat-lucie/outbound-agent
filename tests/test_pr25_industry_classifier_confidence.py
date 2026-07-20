@@ -682,7 +682,7 @@ class TestEmitIndustryLowConfidenceExceptionDiscipline:
             side_effect=ImportError("simulated programmer error"),
         ), pytest.raises(ImportError, match="simulated programmer error"):
             _emit_industry_low_confidence(
-                "Sigma Alimentos", "Food & Beverage", 0.55, "ambiguous",
+                "Acme Foods", "Food & Beverage", 0.55, "ambiguous",
             )
 
     def test_type_error_propagates(self):
@@ -697,7 +697,7 @@ class TestEmitIndustryLowConfidenceExceptionDiscipline:
             side_effect=TypeError("escalate() missing positional argument"),
         ), pytest.raises(TypeError, match="missing positional argument"):
             _emit_industry_low_confidence(
-                "Sigma Alimentos", "Food & Beverage", 0.55, None,
+                "Acme Foods", "Food & Beverage", 0.55, None,
             )
 
     def test_attribute_error_propagates(self):
@@ -712,7 +712,7 @@ class TestEmitIndustryLowConfidenceExceptionDiscipline:
             side_effect=AttributeError("'AttioClient' has no attribute 'foo'"),
         ), pytest.raises(AttributeError, match="has no attribute"):
             _emit_industry_low_confidence(
-                "Sigma Alimentos", "Food & Beverage", 0.55, "",
+                "Acme Foods", "Food & Beverage", 0.55, "",
             )
 
     def test_runtime_error_still_swallowed_with_warning(self, caplog):
@@ -731,7 +731,7 @@ class TestEmitIndustryLowConfidenceExceptionDiscipline:
             # Should NOT raise — caught by the generic except branch.
             with caplog.at_level("WARNING"):
                 _emit_industry_low_confidence(
-                    "Sigma Alimentos", "Food & Beverage", 0.55, "",
+                    "Acme Foods", "Food & Beverage", 0.55, "",
                 )
             # Tightened per QA: assert the full formatted record (level +
             # company name + underlying error) so a regression that drops
@@ -740,7 +740,7 @@ class TestEmitIndustryLowConfidenceExceptionDiscipline:
                 rec for rec in caplog.records
                 if rec.levelname == "WARNING"
                 and "escalation emit failed" in rec.getMessage()
-                and "Sigma Alimentos" in rec.getMessage()
+                and "Acme Foods" in rec.getMessage()
                 and "attio 502" in rec.getMessage()
             ]
             assert matching, (
@@ -764,7 +764,7 @@ class TestEmitIndustryLowConfidenceExceptionDiscipline:
             side_effect=EscalationSchemaError("payload missing required field"),
         ), pytest.raises(EscalationSchemaError, match="missing required field"):
             _emit_industry_low_confidence(
-                "Sigma Alimentos", "Food & Beverage", 0.55, "",
+                "Acme Foods", "Food & Beverage", 0.55, "",
             )
 
     def test_unknown_escalation_type_propagates(self):
@@ -781,7 +781,7 @@ class TestEmitIndustryLowConfidenceExceptionDiscipline:
             side_effect=UnknownEscalationType("type='bogus' not in ESCALATION_TYPES"),
         ), pytest.raises(UnknownEscalationType, match="not in ESCALATION_TYPES"):
             _emit_industry_low_confidence(
-                "Sigma Alimentos", "Food & Beverage", 0.55, "",
+                "Acme Foods", "Food & Beverage", 0.55, "",
             )
 
     def test_missing_decision_key_propagates(self):
@@ -797,7 +797,7 @@ class TestEmitIndustryLowConfidenceExceptionDiscipline:
             side_effect=MissingDecisionKey("decision_key required"),
         ), pytest.raises(MissingDecisionKey, match="decision_key required"):
             _emit_industry_low_confidence(
-                "Sigma Alimentos", "Food & Beverage", 0.55, "",
+                "Acme Foods", "Food & Beverage", 0.55, "",
             )
 
 
@@ -838,7 +838,7 @@ class TestEmitCostCeilingBreachedExceptionDiscipline:
             "workflows.escalation.escalate",
             side_effect=ImportError("simulated programmer error"),
         ), pytest.raises(ImportError, match="simulated programmer error"):
-            _emit_cost_ceiling_breached("Sigma Alimentos", self._err())
+            _emit_cost_ceiling_breached("Acme Foods", self._err())
 
     def test_type_error_propagates(self):
         """TypeError signals a call-shape regression (caller passing the
@@ -853,7 +853,7 @@ class TestEmitCostCeilingBreachedExceptionDiscipline:
             "workflows.escalation.escalate",
             side_effect=TypeError("escalate() missing positional argument"),
         ), pytest.raises(TypeError, match="missing positional argument"):
-            _emit_cost_ceiling_breached("Sigma Alimentos", self._err())
+            _emit_cost_ceiling_breached("Acme Foods", self._err())
 
     def test_attribute_error_propagates(self):
         """AttributeError typically signals a refactor that renamed an
@@ -866,7 +866,7 @@ class TestEmitCostCeilingBreachedExceptionDiscipline:
             "workflows.escalation.escalate",
             side_effect=AttributeError("'AttioClient' has no attribute 'foo'"),
         ), pytest.raises(AttributeError, match="has no attribute"):
-            _emit_cost_ceiling_breached("Sigma Alimentos", self._err())
+            _emit_cost_ceiling_breached("Acme Foods", self._err())
 
     def test_unknown_escalation_type_propagates(self):
         """UnknownEscalationType is loud-by-design — silently dropping an
@@ -880,7 +880,7 @@ class TestEmitCostCeilingBreachedExceptionDiscipline:
             "workflows.escalation.escalate",
             side_effect=UnknownEscalationType("type='bogus' not in ESCALATION_TYPES"),
         ), pytest.raises(UnknownEscalationType, match="not in ESCALATION_TYPES"):
-            _emit_cost_ceiling_breached("Sigma Alimentos", self._err())
+            _emit_cost_ceiling_breached("Acme Foods", self._err())
 
     def test_runtime_error_still_swallowed_with_warning(self, caplog):
         """The original log-and-continue behavior for transient runtime
@@ -896,7 +896,7 @@ class TestEmitCostCeilingBreachedExceptionDiscipline:
             side_effect=RuntimeError("attio 502 bad gateway"),
         ):
             with caplog.at_level("WARNING"):
-                _emit_cost_ceiling_breached("Sigma Alimentos", self._err())
+                _emit_cost_ceiling_breached("Acme Foods", self._err())
             # Assert the formatted record carries the company name + the
             # underlying error message so a regression that drops context
             # is caught (mirrors the FU-3 fold-in pattern).
@@ -904,7 +904,7 @@ class TestEmitCostCeilingBreachedExceptionDiscipline:
                 rec for rec in caplog.records
                 if rec.levelname == "WARNING"
                 and "cost_ceiling_breached escalation failed" in rec.getMessage()
-                and "Sigma Alimentos" in rec.getMessage()
+                and "Acme Foods" in rec.getMessage()
                 and "attio 502" in rec.getMessage()
             ]
             assert matching, (
@@ -929,7 +929,7 @@ class TestEmitCostCeilingBreachedExceptionDiscipline:
             "workflows.escalation.escalate",
             side_effect=EscalationSchemaError("payload missing required field"),
         ), pytest.raises(EscalationSchemaError, match="missing required field"):
-            _emit_cost_ceiling_breached("Sigma Alimentos", self._err())
+            _emit_cost_ceiling_breached("Acme Foods", self._err())
 
     def test_missing_decision_key_propagates(self):
         """MissingDecisionKey is loud-by-design per its docstring — same
@@ -948,4 +948,4 @@ class TestEmitCostCeilingBreachedExceptionDiscipline:
             "workflows.escalation.escalate",
             side_effect=MissingDecisionKey("decision_key required"),
         ), pytest.raises(MissingDecisionKey, match="decision_key required"):
-            _emit_cost_ceiling_breached("Sigma Alimentos", self._err())
+            _emit_cost_ceiling_breached("Acme Foods", self._err())

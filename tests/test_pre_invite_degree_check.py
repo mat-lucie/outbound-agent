@@ -490,7 +490,7 @@ class TestPreInviteDegreeCheckCrossBackend:
 
 
 class TestPatternADuplicateFunctions:
-    """Unit tests for the Pattern-A recency-quarantine helper (PR-241 César RCA)."""
+    """Unit tests for the Pattern-A recency-quarantine helper (PR-241 René RCA)."""
 
     def test_recent_committed_is_within_window(self):
         from datetime import date, timedelta

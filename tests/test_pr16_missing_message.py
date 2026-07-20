@@ -272,7 +272,7 @@ class TestCheckMessagesClaims:
         }
         evidence = {
             "OTIF from 85%": {
-                "source": "Sigma 2026Q1 case study",
+                "source": "Acme Foods 2026Q1 case study",
                 "verified_by": "operator@example.com",
                 "verified_at": "2026-04-15",
             },
@@ -394,7 +394,7 @@ class TestCheckMessagesClaims:
         messages = {"operations_leaders": {"dm1": {"en": "Achieve 25% ROI."}}}
         # Two evidence entries differing only in case.
         evidence = {
-            "25% ROI": {"source": "Sigma 2026Q1"},
+            "25% ROI": {"source": "Acme Foods 2026Q1"},
             "25% roi": {"source": "Different 2026Q2"},
         }
         msg_path = tmp_path / "messages.json"

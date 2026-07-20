@@ -79,7 +79,7 @@ class TestNormalizeDealName:
         assert normalize_deal_name(None or "") == ""
 
     def test_preserves_simple_name(self):
-        assert normalize_deal_name("Sigma Alimentos") == "sigma alimentos"
+        assert normalize_deal_name("Acme Foods") == "acme foods"
 
 
 # ── Field extraction helpers ───────────────────────────────────
@@ -99,8 +99,8 @@ class TestFieldExtraction:
         assert deal_stage_title(d) == "In Progress"
 
     def test_deal_name_raw(self):
-        d = _deal("d-1", name="Sigma Alimentos")
-        assert deal_name_raw(d) == "Sigma Alimentos"
+        d = _deal("d-1", name="Acme Foods")
+        assert deal_name_raw(d) == "Acme Foods"
 
     def test_deal_associated_people_returns_uuid_list(self):
         d = _deal("d-1", people=["p-1", "p-2", "p-3"])
@@ -213,14 +213,14 @@ class TestBucketDeals:
         assert len(conflicts) == 0
 
     def test_unique_deal_not_flagged(self):
-        a = _deal("a", name="Sigma", company_uuid="co-sigma", stage="In Progress")
+        a = _deal("a", name="Acme Foods", company_uuid="co-acme", stage="In Progress")
         auto, conflicts = bucket_deals([a])
         assert auto == []
         assert conflicts == []
 
     def test_in_progress_winner_preserved_across_lead_losers(self):
-        a = _deal("a", name="Sigma", company_uuid="co-sigma", stage="In Progress", people=["p1"])
-        b = _deal("b", name="Sigma", company_uuid="co-sigma", stage="Lead", people=["p2"])
+        a = _deal("a", name="Acme Foods", company_uuid="co-acme", stage="In Progress", people=["p1"])
+        b = _deal("b", name="Acme Foods", company_uuid="co-acme", stage="Lead", people=["p2"])
         auto, _ = bucket_deals([a, b])
         assert len(auto) == 1
         assert auto[0]["winner_id"] == "a"

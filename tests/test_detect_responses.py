@@ -917,12 +917,12 @@ class TestSelfEchoGuard:
         from models.campaign import load_messages
         from workflows.detect_responses import _looks_like_self_echo
         template = load_messages()["operations_leaders"]["dm1"]["es"]
-        echoed = template.replace("[Name]", "César").replace("[Company]", "Sigma")
+        echoed = template.replace("[Name]", "René").replace("[Company]", "Acme Foods")
         assert _looks_like_self_echo(echoed) is not None
 
     def test_genuine_short_reply_does_not_match(self):
         from workflows.detect_responses import _looks_like_self_echo
-        assert _looks_like_self_echo("Gracias César, me interesa") is None
+        assert _looks_like_self_echo("Gracias René, me interesa") is None
 
     def test_genuine_longer_reply_does_not_match(self):
         from workflows.detect_responses import _looks_like_self_echo
@@ -952,7 +952,7 @@ class TestSelfEchoGuard:
         try:
             # A body that WOULD match a template if templates loaded — but the
             # load fails, so the guard fails open and returns None.
-            assert dr._looks_like_self_echo("hola cesar me interesa mucho") is None
+            assert dr._looks_like_self_echo("hola rene me interesa mucho") is None
             out = capsys.readouterr()
             combined = out.out + out.err
             assert "self-echo guard offline" in combined

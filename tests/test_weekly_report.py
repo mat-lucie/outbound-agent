@@ -119,16 +119,16 @@ def _deal_record(name: str, stage: str, value: float | None = None,
 
 class TestParseDeal:
     def test_parses_full_record(self):
-        rec = _deal_record("Sigma", "In Progress", value=200_000, country="MX")
+        rec = _deal_record("Acme Foods", "In Progress", value=200_000, country="MX")
         out = AttioClient.parse_deal(rec)
-        assert out["name"] == "Sigma"
+        assert out["name"] == "Acme Foods"
         assert out["stage"] == "In Progress"
         assert out["value"] == 200_000
         assert out["currency"] == "USD"
         assert out["country"] == "MX"
         assert out["company_id"] == "co_x"
         assert out["owner_id"] == "actor_x"
-        assert out["record_id"] == "rec_sigma"
+        assert out["record_id"] == "rec_acme_foods"
 
     def test_parses_blank_value(self):
         rec = _deal_record("Tajin", "In Progress")
@@ -225,7 +225,7 @@ class TestBuildReportHtml:
 
     def test_renders_active_deals_section_with_blanks(self):
         deals = [
-            AttioClient.parse_deal(_deal_record("Sigma", "In Progress")),
+            AttioClient.parse_deal(_deal_record("Acme Foods", "In Progress")),
             AttioClient.parse_deal(_deal_record("Tajin", "In Progress")),
             AttioClient.parse_deal(_deal_record("X", "Lead")),
         ]
@@ -233,7 +233,7 @@ class TestBuildReportHtml:
         html = build_report_html(self._kpis(), active, date(2026, 5, 8))
 
         assert "Active Deals" in html
-        assert "Sigma" in html
+        assert "Acme Foods" in html
         assert "Tajin" in html
         assert "ACV fallback" in html
         assert "missing" in html  # hygiene banner
