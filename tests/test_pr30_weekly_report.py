@@ -100,39 +100,82 @@ class TestDealStalenessRule:
 # -- _parse_deal_activity -----------------------------------------------
 
 
+TODAY = date(2026, 7, 2)
+
+
 class TestParseDealActivity:
-    def test_prefers_last_activity_at(self):
+    """`_parse_deal_activity` delegates to the Follow-up Radar's resolver
+    (PR-218).
+
+    The pre-radar version read `last_activity_at`/`updated_at` — keys
+    `AttioClient.parse_deal` never emitted — so EVERY deal resolved
+    "unknown" (silent bug). Precedence now mirrors
+    `followup_radar._deal_recency`: verified touch > person-interaction
+    join > created_at > None.
+    """
+
+    def test_verified_touch_wins_even_over_newer_interaction(self):
         d = {
-            "last_activity_at": "2026-05-20",
-            "updated_at": "2026-05-15",
+            "last_verified_touch": "2026-03-20",
+            "associated_people": ["p1"],
             "created_at": "2026-01-01",
         }
-        assert _parse_deal_activity(d) == date(2026, 5, 20)
+        interactions = {"p1": date(2026, 6, 30)}
+        assert _parse_deal_activity(d, interactions, TODAY) == date(2026, 3, 20)
 
-    def test_falls_back_to_updated_at(self):
-        d = {"updated_at": "2026-05-15", "created_at": "2026-01-01"}
-        assert _parse_deal_activity(d) == date(2026, 5, 15)
+    def test_interaction_join_when_no_verified_touch(self):
+        d = {"associated_people": ["p1", "p2"], "created_at": "2026-01-01"}
+        interactions = {"p1": date(2026, 5, 1), "p2": date(2026, 6, 2)}
+        assert _parse_deal_activity(d, interactions, TODAY) == date(2026, 6, 2)
 
     def test_falls_back_to_created_at(self):
         d = {"created_at": "2026-01-01"}
-        assert _parse_deal_activity(d) == date(2026, 1, 1)
+        assert _parse_deal_activity(d, {}, TODAY) == date(2026, 1, 1)
 
-    def test_returns_none_when_all_missing(self):
-        assert _parse_deal_activity({}) is None
+    def test_returns_none_when_nothing_datable(self):
+        assert _parse_deal_activity({}, {}, TODAY) is None
 
-    def test_handles_iso_datetime(self):
-        d = {"last_activity_at": "2026-05-22T10:30:00Z"}
-        assert _parse_deal_activity(d) == date(2026, 5, 22)
+    def test_handles_iso_datetime_created_at(self):
+        d = {"created_at": "2026-05-22T10:30:00Z"}
+        assert _parse_deal_activity(d, {}, TODAY) == date(2026, 5, 22)
 
-    def test_returns_none_on_unparseable(self):
-        assert _parse_deal_activity({"last_activity_at": "garbage"}) is None
+    def test_unparseable_verified_touch_falls_to_created_at(self):
+        d = {"last_verified_touch": "garbage", "created_at": "2026-01-01"}
+        assert _parse_deal_activity(d, {}, TODAY) == date(2026, 1, 1)
+
+    def test_future_verified_touch_tomorrow_clamps_to_today(self):
+        # UTC skew: a stamp dated 'tomorrow' is legitimate and clamps.
+        d = {"last_verified_touch": (TODAY + timedelta(days=1)).isoformat()}
+        assert _parse_deal_activity(d, {}, TODAY) == TODAY
+
+    def test_far_future_verified_touch_ignored(self):
+        # Hand-edited future stamp must not hide staleness — falls through.
+        d = {"last_verified_touch": "2027-07-02", "created_at": "2026-01-01"}
+        assert _parse_deal_activity(d, {}, TODAY) == date(2026, 1, 1)
+
+    def test_agrees_with_radar_resolver(self):
+        # The whole point of the fix: the weekly report and the radar must
+        # resolve the SAME deal to the SAME recency date.
+        from workflows.followup_radar import resolve_deal_recency
+
+        deals = [
+            {"last_verified_touch": "2026-03-20", "created_at": "2026-01-01"},
+            {"associated_people": ["p1"], "created_at": "2026-01-01"},
+            {"created_at": "2026-01-01"},
+            {},
+        ]
+        interactions = {"p1": date(2026, 6, 2)}
+        for d in deals:
+            assert _parse_deal_activity(d, interactions, TODAY) == (
+                resolve_deal_recency(d, interactions, TODAY)[0]
+            )
 
 
 # -- compute_active_deals + DealStalenessRule integration ---------------
 
 
 class TestComputeActiveDeals:
-    def test_in_progress_deal_with_stale_activity(self):
+    def test_in_progress_deal_with_stale_verified_touch(self):
         today = date(2026, 5, 22)
         deals = [{
             "name": "Stale Co",
@@ -140,24 +183,55 @@ class TestComputeActiveDeals:
             "currency": "USD",
             "country": "MX",
             "stage": DealStage.IN_PROGRESS.value,
-            "last_activity_at": (today - timedelta(days=60)).isoformat(),
+            "last_verified_touch": (today - timedelta(days=60)).isoformat(),
         }]
         result = compute_active_deals(deals, today=today)
         assert result["in_progress_count"] == 1
         assert result["stale_count"] == 1
         assert result["in_progress"][0]["stale_status"] == "stale"
 
-    def test_in_progress_deal_with_fresh_activity(self):
+    def test_in_progress_deal_with_fresh_verified_touch(self):
         today = date(2026, 5, 22)
         deals = [{
             "name": "Active Co",
             "value": 50_000,
             "stage": DealStage.IN_PROGRESS.value,
-            "last_activity_at": (today - timedelta(days=5)).isoformat(),
+            "last_verified_touch": (today - timedelta(days=5)).isoformat(),
         }]
         result = compute_active_deals(deals, today=today)
         assert result["stale_count"] == 0
         assert result["in_progress"][0]["stale_status"] == "fresh"
+
+    def test_old_deal_with_no_touch_data_is_stale_by_age(self):
+        # Behavior change vs the phantom-key bug: created_at (deal age) now
+        # counts as tier-3 recency, so an untouched old deal reads STALE
+        # instead of silently "unknown".
+        today = date(2026, 5, 22)
+        deals = [{
+            "name": "Aging Co",
+            "value": 25_000,
+            "stage": DealStage.IN_PROGRESS.value,
+            "created_at": (today - timedelta(days=90)).isoformat(),
+        }]
+        result = compute_active_deals(deals, today=today)
+        assert result["in_progress"][0]["stale_status"] == "stale"
+        assert result["stale_count"] == 1
+
+    def test_interactions_join_freshens_deal(self):
+        today = date(2026, 5, 22)
+        deals = [{
+            "name": "Joined Co",
+            "value": 25_000,
+            "stage": DealStage.IN_PROGRESS.value,
+            "associated_people": ["p1"],
+            "created_at": (today - timedelta(days=90)).isoformat(),
+        }]
+        interactions = {"p1": today - timedelta(days=3)}
+        result = compute_active_deals(deals, today=today, interactions=interactions)
+        assert result["in_progress"][0]["stale_status"] == "fresh"
+        # Without the join data the same deal falls back to created_at.
+        result = compute_active_deals(deals, today=today)
+        assert result["in_progress"][0]["stale_status"] == "stale"
 
     def test_in_progress_deal_with_no_activity_metadata(self):
         deals = [{
@@ -186,11 +260,29 @@ class TestComputeActiveDeals:
             "name": "Edge Co",
             "value": 30_000,
             "stage": DealStage.IN_PROGRESS.value,
-            "last_activity_at": (today - timedelta(days=11)).isoformat(),
+            "last_verified_touch": (today - timedelta(days=11)).isoformat(),
         }]
         result = compute_active_deals(deals, today=today, staleness_rule=rule)
         # Threshold tightened to 10d → 11d-old deal is stale.
         assert result["in_progress"][0]["stale_status"] == "stale"
+
+    def test_parse_deal_output_resolves_staleness_end_to_end(self):
+        # Regression guard for the original bug: a REAL parse_deal dict
+        # (not a hand-built one) must resolve to a known staleness.
+        today = date(2026, 5, 22)
+        record = {
+            "id": {"record_id": "rec_e2e"},
+            "created_at": "2026-01-01T09:00:00Z",
+            "values": {
+                "name": [{"value": "E2E Co"}],
+                "stage": [{"status": {"title": DealStage.IN_PROGRESS.value}}],
+                "last_verified_touch": [{"value": (today - timedelta(days=2)).isoformat()}],
+            },
+        }
+        from clients.attio import AttioClient
+        result = compute_active_deals([AttioClient.parse_deal(record)], today=today)
+        assert result["in_progress"][0]["stale_status"] == "fresh"
+        assert result["unknown_count"] == 0
 
     def test_non_in_progress_stages_not_staleness_evaluated(self):
         deals = [
@@ -620,6 +712,88 @@ class TestRunWeeklyReport:
         assert mock_escalate.call_args.kwargs["type"] == "resend_delivery_failed"
         # Sidecar intact: the JSON file was written before the send.
         assert (kpi_dir / "2026-05-18.json").exists()
+
+
+# -- deal_recency_degraded visibility (PR-219) ---------------------------
+
+
+class TestDealRecencyDegradedVisibility:
+    """The person-interaction join degradation must reach the durable
+    record (kpi_snapshot_json sidecar) and the emailed report — not just
+    the CLI scrollback. Deals here HAVE associated_people so the join
+    actually executes (empty id sets short-circuit before the fetch).
+    """
+
+    IN_PROGRESS_DEAL = {
+        "name": "Acme Foods",
+        "stage": DealStage.IN_PROGRESS.value,
+        "associated_people": ["p1"],
+        "created_at": "2026-01-01",
+        "value": 50_000,
+    }
+
+    def _attio(self, deals: list[dict]) -> MagicMock:
+        attio = MagicMock()
+        attio.query_list_entries.return_value = []
+        attio.search_deals.return_value = deals
+        return attio
+
+    def _run(self, attio, *, resend=None, dry_run=True):
+        from clients.attio import AttioClient
+        with patch.object(AttioClient, "parse_deal", side_effect=lambda d: d), \
+             patch.object(AttioClient, "parse_entry",
+                          side_effect=lambda e: {"persona": "ops", "stage": "PROSPECT"}):
+            return run_weekly_report(
+                attio, resend=resend, report_email="operator@example.com",
+                dry_run=dry_run, today=date(2026, 5, 22),
+            )
+
+    def test_degraded_join_lands_in_snapshot_and_sidecar(self, monkeypatch, kpi_dir):
+        monkeypatch.setenv("ATTIO_LIST_ID", "LIST")
+        attio = self._attio([dict(self.IN_PROGRESS_DEAL)])
+        attio.bulk_fetch_persons_by_record_ids.side_effect = RuntimeError("boom")
+
+        result = self._run(attio, dry_run=True)
+
+        # The join executed and degraded.
+        attio.bulk_fetch_persons_by_record_ids.assert_called_once()
+        assert result["deal_recency_degraded"], (
+            "degraded join must be recorded in the KPI snapshot"
+        )
+        # Durable week-over-week record carries the degradation trace.
+        record = json.loads((kpi_dir / "2026-05-18.json").read_text())
+        sidecar_snapshot = json.loads(record["kpi_snapshot_json"])
+        assert sidecar_snapshot["deal_recency_degraded"] == result["deal_recency_degraded"]
+
+    def test_degraded_join_banner_in_report_email(self, monkeypatch, kpi_dir):
+        monkeypatch.setenv("ATTIO_LIST_ID", "LIST")
+        attio = self._attio([dict(self.IN_PROGRESS_DEAL)])
+        attio.bulk_fetch_persons_by_record_ids.side_effect = RuntimeError("boom")
+        resend = MagicMock()
+        resend.send_email.return_value = {"id": "msg-1"}
+
+        self._run(attio, resend=resend, dry_run=False)
+
+        html = resend.send_email.call_args.kwargs["html"]
+        assert "Deal staleness may be overstated" in html
+        assert "person-interaction join" in html
+
+    def test_clean_join_no_degradation_recorded_or_rendered(self, monkeypatch, kpi_dir):
+        monkeypatch.setenv("ATTIO_LIST_ID", "LIST")
+        attio = self._attio([dict(self.IN_PROGRESS_DEAL)])
+        attio.bulk_fetch_persons_by_record_ids.return_value = {
+            "p1": {"values": {"last_interaction": [
+                {"interacted_at": "2026-05-20T10:00:00.000000000Z"},
+            ]}},
+        }
+        resend = MagicMock()
+        resend.send_email.return_value = {"id": "msg-1"}
+
+        result = self._run(attio, resend=resend, dry_run=False)
+
+        assert result["deal_recency_degraded"] == []
+        html = resend.send_email.call_args.kwargs["html"]
+        assert "Deal staleness may be overstated" not in html
 
 
 # -- Registry + manifest invariants -------------------------------------

@@ -105,7 +105,9 @@ def collect_defensive_samples(
             can see which reframe the reactance is pushing back on.
         limit: Max samples to return.
     """
-    raw_entries = attio.query_list_entries(limit=5000)
+    # fail_if_truncated (PR-220): sampling from a silently truncated sweep skews
+    # the defensive-reply pool; fail loudly so the limit gets raised instead.
+    raw_entries = attio.query_list_entries(limit=5000, fail_if_truncated=True)
     parsed = [attio.parse_entry(e) for e in raw_entries]
     # §3.11 soft-delete filter: skip union-merge losers. Their winners
     # carry the response_classification; reading the loser would double-

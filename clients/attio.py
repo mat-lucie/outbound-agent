@@ -656,24 +656,23 @@ class AttioClient:
 
     # ── Company records ──────────────────────────────────────
 
-    def search_companies(self, filter_: dict | None = None, limit: int = 50) -> list[dict]:
-        """Search company records with optional filter. Auto-paginates."""
-        all_records: list[dict] = []
-        page_size = min(limit, 100)
-        offset: int = 0
+    def search_companies(
+        self,
+        filter_: dict | None = None,
+        limit: int = 50,
+        *,
+        fail_if_truncated: bool = False,
+    ) -> list[dict]:
+        """Search company records with optional filter. Auto-paginates.
 
-        while len(all_records) < limit:
-            body: dict = {"limit": page_size, "offset": offset}
-            if filter_:
-                body["filter"] = filter_
-            data = self._request("POST", "/objects/companies/records/query", json=body)
-            records = data.get("data", [])
-            all_records.extend(records)
-            if len(records) < page_size:
-                break
-            offset += len(records)
-
-        return all_records[:limit]
+        Routes through the shared truncation-guarded paginator so a full sweep
+        can opt into ``fail_if_truncated=True`` (PR-220 — a silently truncated
+        company sweep drops the tail past the limit).
+        """
+        return self._query_paginated(
+            "/objects/companies/records/query", filter_, limit,
+            fail_if_truncated=fail_if_truncated,
+        )
 
     def create_company(self, attributes: dict) -> dict:
         """Create a new company record."""

@@ -51,10 +51,11 @@ from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 import click
 
-from clients.attio import AttioClient
+from clients.attio import DEAL_FULL_SCAN_LIMIT, AttioClient
 from clients.resend_client import ResendClient  # noqa: TC001 — runtime type for `resend` param
 from models.pipeline import DealStage, PipelineStage, dm_step_int
 from workflows.escalation import escalate
+from workflows.followup_radar import _fetch_deal_interactions, resolve_deal_recency
 
 if TYPE_CHECKING:
     from clients.crm.base import CRMProvider
@@ -291,6 +292,13 @@ class KPISnapshot(TypedDict):
     CRM daily_run ledger over the report window (see
     `compute_outreach_volume`). Carries a `note` caveat when the window
     includes days where counters were not yet tracked.
+
+    `deal_recency_degraded` — degradation reasons from the
+    person-interaction join (`followup_radar._fetch_deal_interactions`,
+    PR-219). Empty list = clean join. Non-empty means affected deals fell
+    back to creation-date recency, so this week's `stale_count` can be
+    INFLATED — consumers doing week-over-week compares must not read a
+    degraded week's jump as real pipeline rot.
     """
     window: str
     measurement_basis: str
@@ -303,6 +311,7 @@ class KPISnapshot(TypedDict):
     stale_threshold_source: Literal["default", "env", "env_invalid_fell_back_to_default"]
     notes: str
     outreach_volume: dict[str, Any]
+    deal_recency_degraded: list[str]
 
 
 def _count_by_stage(entries: list[dict]) -> dict[str, int]:
@@ -394,6 +403,7 @@ def compute_active_deals(
     *,
     today: date | None = None,
     staleness_rule: DealStalenessRule | None = None,
+    interactions: dict[str, date] | None = None,
 ) -> dict:
     """Aggregate parsed Attio deal records by stage.
 
@@ -406,6 +416,13 @@ def compute_active_deals(
     no activity in `days_threshold` (default 21d, env-overridable)
     surface as `stale_status="stale"` so the report's deal section can
     highlight pipeline-rot risk. `today` defaults to `date.today()`.
+
+    `interactions` is the Follow-up Radar's person-interaction join data
+    ({person_id: last_interaction date}, see
+    `followup_radar._fetch_deal_interactions`) — the tier-2 recency
+    source (PR-218). None/empty is safe: deals then resolve on verified
+    touch or created_at only, which can only read STALER (over-surface,
+    the safe direction).
     """
     # TARGETS is heterogeneous (scalars + range tuples); "acv" is always a
     # scalar — cast so float() below sees a number, not the union.
@@ -414,6 +431,8 @@ def compute_active_deals(
         today = date.today()
     if staleness_rule is None:
         staleness_rule = DealStalenessRule.from_env()
+    if interactions is None:
+        interactions = {}
     in_progress: list[dict] = []
     in_progress_value = 0.0
     blank_value_count = 0
@@ -438,9 +457,9 @@ def compute_active_deals(
             is_fallback = False
         in_progress_value += value
 
-        # Staleness: prefer explicit last_activity_at, fall back to
-        # updated_at, then created_at. Unparseable → unknown.
-        last_activity = _parse_deal_activity(d)
+        # Staleness: radar-shared precedence — verified touch, then
+        # person-interaction join, then created_at. Nothing datable → unknown.
+        last_activity = _parse_deal_activity(d, interactions, today)
         stale_status = staleness_rule.evaluate(last_activity, today)
         if stale_status == "stale":
             stale_count += 1
@@ -473,26 +492,23 @@ def compute_active_deals(
     }
 
 
-def _parse_deal_activity(d: dict) -> date | None:
-    """Best-effort activity-date parsing for `DealStalenessRule`.
+def _parse_deal_activity(
+    d: dict, interactions: dict[str, date], today: date,
+) -> date | None:
+    """Resolve a deal's last-activity date for `DealStalenessRule`.
 
-    Tries `last_activity_at`, then `updated_at`, then `created_at`.
-    Accepts ISO datetime strings (`2026-05-22T10:00:00`) and ISO
-    dates (`2026-05-22`). Returns None when no field is set or
-    parseable — the staleness rule treats None as `"unknown"`
-    (operator can't decide; no flag, no false-stale).
+    Delegates to the Follow-up Radar's shared resolver
+    (`followup_radar.resolve_deal_recency`): `last_verified_touch` >
+    person-interaction join over `associated_people` > `created_at` —
+    so the weekly report and the radar can never disagree about the same
+    deal's staleness (PR-218). (The pre-radar version read
+    `last_activity_at`/`updated_at`, keys `parse_deal` never emitted, so
+    every deal silently resolved "unknown".) Returns None when nothing is
+    datable — the staleness rule treats None as `"unknown"` (operator
+    can't decide; no flag, no false-stale).
     """
-    for key in ("last_activity_at", "updated_at", "created_at"):
-        raw = d.get(key)
-        if not raw:
-            continue
-        if isinstance(raw, date) and not isinstance(raw, datetime):
-            return raw
-        try:
-            return date.fromisoformat(str(raw)[:10])
-        except (TypeError, ValueError):
-            continue
-    return None
+    last_touch, _synthetic, _source = resolve_deal_recency(d, interactions, today)
+    return last_touch
 
 
 def compute_persona_funnels(entries: list[dict]) -> list[PersonaFunnel]:
@@ -1021,6 +1037,7 @@ def build_report_html(
     persona_funnels: list[PersonaFunnel] | None = None,
     prior_period_compare: dict[str, PriorPeriodDelta] | None = None,
     outreach_volume: dict[str, Any] | None = None,
+    deal_recency_degraded: list[str] | None = None,
 ) -> str:
     """Build HTML email for the weekly KPI report.
 
@@ -1076,6 +1093,22 @@ def build_report_html(
             <td style="padding:8px 12px;text-align:right;font-size:14px;color:#374151;font-weight:600;">{value_cell}</td>
         </tr>"""
 
+    # Degraded person-interaction join (PR-219): on a wet run the email is the
+    # artifact the operator actually reads — the stale badges/count above can be
+    # OVERSTATED (creation-date fallback), so the caveat must land here, not
+    # just in CLI scrollback.
+    recency_degraded_banner = ""
+    if deal_recency_degraded:
+        reason_divs = "".join(
+            f'<div style="margin-bottom:4px;">⚠️ {reason}</div>'
+            for reason in deal_recency_degraded
+        )
+        recency_degraded_banner = f"""
+    <div style="margin-bottom:12px;padding:10px 14px;background:#fef3c7;border-left:3px solid #f59e0b;border-radius:4px;font-size:13px;color:#92400e;">
+      <div style="font-weight:600;margin-bottom:4px;">Deal staleness may be overstated this week</div>
+      {reason_divs}
+    </div>"""
+
     if active_deals["blank_value_count"] > 0:
         hygiene_banner = f"""
     <div style="margin-bottom:12px;padding:10px 14px;background:#fef3c7;border-left:3px solid #f59e0b;border-radius:4px;font-size:13px;color:#92400e;">
@@ -1087,6 +1120,7 @@ def build_report_html(
     if active_deals["in_progress_count"] > 0:
         active_section = f"""
     <h2 style="font-size:16px;color:#111827;margin:0 0 12px;">Active Deals</h2>
+    {recency_degraded_banner}
     {hygiene_banner}
     <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;margin-bottom:12px;">
       <thead>
@@ -1255,8 +1289,15 @@ def run_weekly_report(
     click.echo("Querying Attio pipeline...")
     # Fix-1 (audit): raised from 500 to 50_000 to match daily_check_helpers and
     # prevent silent truncation on a pipeline that already exceeds 500 entries.
-    entries = attio.query_list_entries(list_id=list_id, limit=50_000)
-    raw_deals = attio.search_deals(limit=500)
+    # PR-220: fail loudly rather than silently drop the tail past the ceiling.
+    entries = attio.query_list_entries(
+        list_id=list_id, limit=50_000, fail_if_truncated=True,
+    )
+    # Full sweep, same ceiling as the Follow-up Radar — the old limit=500
+    # silently dropped every deal past #500 (PR-218 review). Fail loudly if hit.
+    raw_deals = attio.search_deals(
+        limit=DEAL_FULL_SCAN_LIMIT, fail_if_truncated=True,
+    )
     deals = [AttioClient.parse_deal(d) for d in raw_deals]
 
     # Fix-2 (audit): drop soft-deleted duplicate entries whose union-merge winner
@@ -1266,7 +1307,23 @@ def run_weekly_report(
 
     kpis = compute_kpis(entries)
     staleness_rule, stale_threshold_source = DealStalenessRule.from_env_with_source()
-    active = compute_active_deals(deals, today=today, staleness_rule=staleness_rule)
+    # Follow-up Radar tier-2 join data (PR-218): ONE bulk person fetch for the
+    # deals the staleness rule actually evaluates (In-Progress only). Fail-open-
+    # soft — a degraded fetch means affected deals fall back to created_at and
+    # can only read STALER (over-surface, the safe direction).
+    join_person_ids = {
+        pid
+        for d in deals
+        if d.get("stage") == DealStage.IN_PROGRESS.value
+        for pid in d.get("associated_people") or []
+    }
+    deal_interactions, join_degraded = _fetch_deal_interactions(attio, join_person_ids)
+    for reason in join_degraded:
+        click.echo(f"  ⚠ deal-recency join degraded: {reason}")
+    active = compute_active_deals(
+        deals, today=today, staleness_rule=staleness_rule,
+        interactions=deal_interactions,
+    )
     persona_funnels = compute_persona_funnels(entries)
     report_date = today
 
@@ -1334,6 +1391,10 @@ def run_weekly_report(
         "stale_threshold_source": stale_threshold_source,
         "notes": "",
         "outreach_volume": outreach_volume,
+        # A degraded join inflates stale_count (creation-date fallback reads
+        # staler) — the durable record must carry the trace so week-over-week
+        # readers can discount a degraded week's stale jump (PR-219).
+        "deal_recency_degraded": list(join_degraded),
     }
 
     click.echo(f"\n--- Weekly KPIs ({report_date.isoformat()}) ---")
@@ -1419,6 +1480,7 @@ def run_weekly_report(
         persona_funnels=persona_funnels,
         prior_period_compare=prior_period_compare,
         outreach_volume=outreach_volume,
+        deal_recency_degraded=join_degraded,
     )
     subject = (
         f"Outbound Agent — {report_date.isoformat()} | "
