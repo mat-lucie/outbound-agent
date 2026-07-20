@@ -206,6 +206,12 @@ ESCALATION_TYPES: tuple[str, ...] = (
     # detect_responses suppressed a "manual reply" that was actually our own
     # duplicate DM echoed back (dup-DM1 case) — do NOT flip to Responded.
     "manual_reply_suppressed_self_echo",
+
+    # ---- Follow-up Radar: WAITING lane (PR-247) ----
+    # A WAITING-lane cycle ended — the prospect replied to a send the radar was
+    # tracking. Emitted by `followup-await --clear --resolved` before the attrs
+    # are cleared, carrying the reply-latency learning signal.
+    "awaiting_reply_resolved",
 )
 
 ESCALATION_TYPES_SET: frozenset[str] = frozenset(ESCALATION_TYPES)
@@ -754,6 +760,25 @@ class ResendDeliveryFailedPayload(TypedDict):
     kpi_snapshot_week_starting: NotRequired[str]
 
 
+class AwaitingReplyResolvedPayload(TypedDict):
+    """`awaiting_reply_resolved` — a WAITING-lane cycle ended: the prospect
+    replied to a send the radar was tracking (awaiting_reply_since) (PR-247).
+
+    Emitter: the `followup-await --clear --resolved` CLI path, BEFORE the
+    attrs are cleared (clearing first would destroy the latency data).
+    Idempotency key is `f"awaiting-resolved|{record_id}|{resolved}"`. This is
+    the reply-latency learning signal — how long prospects take to answer,
+    and whether nudges (nudge_count > 0) preceded the reply — for the future
+    nudge-timing feed. `latency_days` = resolved − awaiting_reply_since.
+    """
+    record_id: str
+    object: str
+    awaiting_reply_since: str
+    resolved: str
+    latency_days: int
+    nudge_count: int
+
+
 class MissingLanguagePayload(TypedDict):
     """`missing_language` — emitted by consumers of
     `models.resolution.resolve_language` when the Attio `language`
@@ -1290,6 +1315,7 @@ class StaleConnectionSentPayload(TypedDict):
 # coverage as downstream PRs add their own TypedDicts.
 ESCALATION_SCHEMAS: dict[str, type] = {
     "configuration_decision": ConfigurationDecisionPayload,
+    "awaiting_reply_resolved": AwaitingReplyResolvedPayload,
     "attio_write_failed": AttioWriteFailedPayload,
     "mcp_scope_insufficient": McpScopeInsufficientPayload,
     "dedup_review": DedupReviewPayload,

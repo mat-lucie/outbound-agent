@@ -1425,3 +1425,172 @@ attributes:
     status: shipped
     write_owner_module: scripts.data_quality_report.write_report
     note: "Pre-rendered human-readable report. Operator reads this in the Attio row UI without running the script."
+
+  # ---------- Follow-up Radar state (PR-211/214/247) ----------
+  # Sole writer: workflows.followup_state. The five followup_* attrs land on
+  # both warm object types (the linkedin_outreach list + the deals object);
+  # deals carries the partner-attribution + verified-touch extras; the WAITING
+  # lane adds awaiting_reply_* on both. Provisioned by
+  # `scripts/setup_attio_schema.py --feature radar` (off by default). The
+  # operator-seeded people.is_partner roster flag is intentionally NOT tracked
+  # here — no engine code writes it (documented in GETTING_STARTED.md).
+  - object: linkedin_outreach
+    slug: followup_draft_at
+    type: datetime
+    options: null
+    pr_id: PR-211
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "When a follow-up review-draft was last generated. A newer real last-touch supersedes it (the account was acted on)."
+  - object: linkedin_outreach
+    slug: followup_draft_id
+    type: text
+    options: null
+    pr_id: PR-211
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Draft id of the last follow-up draft (dedup on re-run + digest link)."
+  - object: linkedin_outreach
+    slug: followup_snooze_until
+    type: date
+    options: null
+    pr_id: PR-211
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Radar skips this account until this date (inclusive). Operator/skill set."
+  - object: linkedin_outreach
+    slug: followup_muted
+    type: checkbox
+    options: null
+    pr_id: PR-211
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Permanently exclude from the radar (operator parks stale/irrelevant records)."
+  - object: linkedin_outreach
+    slug: followup_callback_date
+    type: date
+    options: null
+    pr_id: PR-211
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Deferral tickler — suppress until this date, then hard-surface."
+  - object: deals
+    slug: followup_draft_at
+    type: datetime
+    options: null
+    pr_id: PR-211
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Deal-side twin of linkedin_outreach.followup_draft_at."
+  - object: deals
+    slug: followup_draft_id
+    type: text
+    options: null
+    pr_id: PR-211
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Deal-side twin of linkedin_outreach.followup_draft_id."
+  - object: deals
+    slug: followup_snooze_until
+    type: date
+    options: null
+    pr_id: PR-211
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Deal-side twin of linkedin_outreach.followup_snooze_until."
+  - object: deals
+    slug: followup_muted
+    type: checkbox
+    options: null
+    pr_id: PR-211
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Deal-side twin of linkedin_outreach.followup_muted."
+  - object: deals
+    slug: followup_callback_date
+    type: date
+    options: null
+    pr_id: PR-211
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Deal-side twin of linkedin_outreach.followup_callback_date."
+  - object: deals
+    slug: referred_by
+    type: text
+    options: null
+    pr_id: PR-214
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Referring partner's canonical lowercase email (deal-side partner attribution). Stamped by the skill layer via workflows.followup_state.stamp_referred_by."
+  - object: deals
+    slug: last_verified_touch
+    type: date
+    options: null
+    pr_id: PR-214
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Skill-verified true last-touch date. Highest-precedence deal recency source for radar ranking. Stamped via workflows.followup_state.stamp_verified_touch."
+  - object: linkedin_outreach
+    slug: awaiting_reply_since
+    type: date
+    options: null
+    pr_id: PR-247
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Date of the most recent unanswered send to this account (WAITING lane; re-stamped on newer sends; 60-day TTL read-side)."
+  - object: linkedin_outreach
+    slug: awaiting_reply_thread_id
+    type: text
+    options: null
+    pr_id: PR-247
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Advisory email thread id of the unanswered send (skill re-resolves the live thread at draft time)."
+  - object: linkedin_outreach
+    slug: awaiting_reply_note_id
+    type: text
+    options: null
+    pr_id: PR-247
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Id of the one canonical waiting-context note per record (survives clear so a re-opened cycle reuses the note)."
+  - object: linkedin_outreach
+    slug: awaiting_reply_nudge_count
+    type: number
+    options: null
+    pr_id: PR-247
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Nudge drafts this waiting cycle. Hard max 2 (enforced in the writer); at the ceiling the account renders terminal and never auto-drafts again."
+  - object: deals
+    slug: awaiting_reply_since
+    type: date
+    options: null
+    pr_id: PR-247
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Deal-side twin of linkedin_outreach.awaiting_reply_since. Co-stamped with last_verified_touch in the same write so resolve_deal_recency stays coherent."
+  - object: deals
+    slug: awaiting_reply_thread_id
+    type: text
+    options: null
+    pr_id: PR-247
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Deal-side twin of linkedin_outreach.awaiting_reply_thread_id."
+  - object: deals
+    slug: awaiting_reply_note_id
+    type: text
+    options: null
+    pr_id: PR-247
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Deal-side twin of linkedin_outreach.awaiting_reply_note_id."
+  - object: deals
+    slug: awaiting_reply_nudge_count
+    type: number
+    options: null
+    pr_id: PR-247
+    status: shipped
+    write_owner_module: workflows.followup_state
+    note: "Deal-side twin of linkedin_outreach.awaiting_reply_nudge_count."

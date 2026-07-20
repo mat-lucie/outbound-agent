@@ -791,6 +791,22 @@ class AttioClient:
                 return None
             raise
 
+    def get_list_entry(self, entry_id: str, list_id: str | None = None) -> dict | None:
+        """Get a single list entry by its entry ID. Returns None if not found.
+
+        Used by the Follow-up Radar WAITING-lane CLI (``followup-await``) to
+        read the current awaiting_reply_* state off one entry before a
+        clear/nudge write (PR-247).
+        """
+        lid = list_id or os.environ.get("ATTIO_LIST_ID", "")
+        try:
+            data = self._request("GET", f"/lists/{lid}/entries/{entry_id}")
+            return data.get("data", data)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+
     def create_deal(self, attributes: dict) -> dict:
         """Create a new deal record. Mirrors ``create_company``.
 
