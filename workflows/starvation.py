@@ -105,8 +105,15 @@ def _pool_metrics(entries: list[dict], today: date) -> dict[str, Any]:
     # commit-tracked.
     _TRACKED = (None, InviteExclusionReason.NOT_PROSPECT,
                 InviteExclusionReason.QUARANTINED)
+    # strict=False on purpose (PR-217): this is a read-only observability pass,
+    # so one corrupt quality_score must never crash the whole starvation
+    # monitor. strict=True would raise from int(score) on a malformed non-None
+    # non-numeric score; instead we get MALFORMED_QUALITY_SCORE, which — like
+    # the pre-refactor code — is neither a pool member nor commit-tracked (not
+    # in _TRACKED, not None, not QUARANTINED), so the row is silently skipped.
+    # This restores byte-identical pre-refactor behavior for that input class.
     for attrs in entries:
-        reason = invite_slice_reason(attrs, today)
+        reason = invite_slice_reason(attrs, today, strict=False)
         if reason in _TRACKED:
             _track_commit(attrs)
         if reason is None:
