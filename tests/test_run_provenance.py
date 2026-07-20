@@ -219,8 +219,109 @@ class TestStagedJsonlStamping:
                 code_provenance=prov,
             )
 
-        staged = list(tmp_path.glob("weekly_borderline_*.jsonl"))
+        staged = [
+            p for p in tmp_path.glob("weekly_borderline_*.jsonl")
+            if not p.name.endswith("_compact.jsonl")
+        ]
         assert len(staged) == 1
         rows = [json.loads(line) for line in staged[0].read_text().splitlines()]
         assert rows, "expected at least one staged borderline row"
         assert all(r["code_version"] == prov for r in rows)
+
+        # Compact-staging artifacts (PR-257): the per-lane prompt file + the
+        # agent-facing compact JSONL ship alongside the forensic main file,
+        # which no longer duplicates the system prompt per row.
+        assert all("qualification_prompt" not in r for r in rows)
+        compact = list(tmp_path.glob("weekly_borderline_*_compact.jsonl"))
+        assert len(compact) == 1
+        compact_rows = [
+            json.loads(line) for line in compact[0].read_text().splitlines()
+        ]
+        assert len(compact_rows) == len(rows)
+        for main_row, compact_row in zip(rows, compact_rows, strict=True):
+            assert compact_row["linkedin_url"] == main_row["linkedin_url"]
+            assert set(compact_row) == {
+                "linkedin_url", "persona", "language", "score",
+                "scoring_lane", "user",
+            }
+            assert compact_row["user"], "compact row lost its user payload"
+        prompts_files = list(tmp_path.glob("weekly_borderline_*_prompts.json"))
+        assert len(prompts_files) == 1
+        lane_prompts = json.loads(prompts_files[0].read_text())
+        staged_lanes = {r["scoring_lane"] or "default" for r in rows}
+        assert set(lane_prompts) == staged_lanes
+        assert all(isinstance(p, str) and p for p in lane_prompts.values())
+
+
+class TestWriteBorderlineArtifacts:
+    """Unit tests for the multi-lane prompt dedup in the staging writer (PR-257)."""
+
+    @staticmethod
+    def _entry(url: str, lane: str | None, system: str, user: str = "u") -> dict:
+        return {
+            "linkedin_url": url,
+            "prospect_data": {"name": url},
+            "raw_csv_row": {"fullName": url},
+            "persona": "operations_leaders",
+            "language": "es",
+            "score": 70,
+            "qualification_prompt": {"system": system, "user": user},
+            "score_breakdown": {},
+            "scoring_lane": lane,
+        }
+
+    def test_multi_lane_prompts_deduped_by_lane(self, tmp_path, monkeypatch, capsys):
+        import json as _json
+
+        from workflows import weekly_prospect as wp
+
+        monkeypatch.setattr(wp, "EXPORTS_DIR", tmp_path)
+        stage = [
+            self._entry("u1", "enterprise_mode", "LANE A RUBRIC"),
+            self._entry("u2", "target_company_mode", "LANE B RUBRIC"),
+            self._entry("u3", "enterprise_mode", "LANE A RUBRIC"),
+        ]
+        lane_prompts = wp._write_borderline_artifacts(stage, "2026-01-02", None)
+
+        assert lane_prompts == {
+            "enterprise_mode": "LANE A RUBRIC", "target_company_mode": "LANE B RUBRIC",
+        }
+        on_disk = _json.loads(
+            (tmp_path / "weekly_borderline_2026-01-02_prompts.json").read_text()
+        )
+        assert on_disk == lane_prompts
+        assert "conflicting system prompts" not in capsys.readouterr().err
+        main_rows = [
+            _json.loads(line) for line in
+            (tmp_path / "weekly_borderline_2026-01-02.jsonl").read_text().splitlines()
+        ]
+        assert all("qualification_prompt" not in r for r in main_rows)
+        assert all(r["prospect_data"] and r["raw_csv_row"] for r in main_rows)
+
+    def test_intra_lane_conflict_warns_and_keeps_first(self, tmp_path, monkeypatch, capsys):
+        from workflows import weekly_prospect as wp
+
+        monkeypatch.setattr(wp, "EXPORTS_DIR", tmp_path)
+        stage = [
+            self._entry("u1", "enterprise_mode", "PROMPT A"),
+            self._entry("u2", "enterprise_mode", "PROMPT B"),
+        ]
+        lane_prompts = wp._write_borderline_artifacts(stage, "2026-01-02", None)
+
+        assert lane_prompts == {"enterprise_mode": "PROMPT A"}
+        assert "conflicting system prompts" in capsys.readouterr().err
+
+    def test_none_lane_falls_back_to_default_key(self, tmp_path, monkeypatch):
+        import json as _json
+
+        from workflows import weekly_prospect as wp
+
+        monkeypatch.setattr(wp, "EXPORTS_DIR", tmp_path)
+        stage = [self._entry("u1", None, "RUBRIC", user="the payload")]
+        wp._write_borderline_artifacts(stage, "2026-01-02", None)
+
+        compact = _json.loads(
+            (tmp_path / "weekly_borderline_2026-01-02_compact.jsonl").read_text()
+        )
+        assert compact["scoring_lane"] == "default"
+        assert compact["user"] == "the payload"
