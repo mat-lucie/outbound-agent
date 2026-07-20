@@ -95,6 +95,7 @@ def _empty_counts() -> dict:
         "defensive": 0,
         "auto_generated_skipped": 0,
         "already_processed": 0,
+        "no_start_timestamp": 0,
         "gmail_errors": 0,
         "attio_update_failures": 0,
         "classifier_llm": 0,
@@ -181,6 +182,11 @@ def detect_email_responses(
             or _first_value(values, "email_campaign_last_sent")
         )
         if not started_str:
+            # A prospect in a reply-scan stage with NO campaign-start
+            # timestamp can't be date-bounded, so it's silently unscannable —
+            # count it so the run rollup surfaces the data gap instead of
+            # dropping it invisibly.
+            counts["no_start_timestamp"] += 1
             continue
         try:
             after = date.fromisoformat(started_str[:10])

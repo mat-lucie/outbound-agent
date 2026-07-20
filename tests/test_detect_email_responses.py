@@ -109,6 +109,20 @@ def test_skips_already_processed_person():
     gmail.search_inbound.assert_not_called()
 
 
+def test_missing_start_timestamp_counted_not_dropped_silently():
+    """A prospect in a scan stage with no email_campaign_started/last_sent is
+    unscannable (can't be date-bounded). It must be COUNTED in the rollup, not
+    dropped invisibly."""
+    person = _person()
+    person["values"]["email_campaign_started"] = []  # no start timestamp at all
+    attio = _attio_with([person])
+    gmail = _gmail_with("no thanks")
+    counts, *_ = _run(attio, gmail)
+    assert counts["no_start_timestamp"] == 1
+    assert counts["detected"] == 0
+    gmail.search_inbound.assert_not_called()
+
+
 # ── Stage routing ───────────────────────────────────────────────────
 
 

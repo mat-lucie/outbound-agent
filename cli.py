@@ -556,10 +556,11 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                                 ("gmail_errors", "Gmail error(s) — affected prospects retry next run"),
                                 ("attio_update_failures", "CRM write failure(s) — see stderr / attio_write_failed queue"),
                                 ("auto_generated_skipped", "auto-reply/bounce message(s) skipped"),
+                                ("no_start_timestamp", "prospect(s) unscannable — no email_campaign_started/last_sent timestamp"),
                             ):
                                 _n = email_resp.get(_key, 0)
                                 if _n:
-                                    click.echo(f"  ⚠ {_n} {_label}", err=_key != "auto_generated_skipped")
+                                    click.echo(f"  ⚠ {_n} {_label}", err=_key not in ("auto_generated_skipped", "no_start_timestamp"))
                             click.echo("")
 
                     # Pipeline-starvation check (PR-43).
