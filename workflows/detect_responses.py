@@ -27,6 +27,7 @@ from models.campaign import (
     MissingMessageError,
     Persona,
     get_message,
+    load_messages,
     personalize,
 )
 from models.pipeline import STAGE_RANK, PipelineStage
@@ -539,6 +540,129 @@ def _normalize_name(name: str) -> str:
         if unicodedata.category(ch) not in ("Mn", "Cf")
     )
     return " ".join(ascii_only.lower().strip().split())
+
+
+_SELF_ECHO_MIN_OVERLAP = 0.75
+
+
+def _normalize_for_echo(text: str) -> list[str]:
+    """Normalize a message body for self-echo token comparison.
+
+    Lowercase, accent-fold (NFKD + strip combining marks), drop the greeting
+    up to the first comma (so "Hola [Name], ..." and "Hola César, ..." align),
+    strip the [Name]/[Company] template placeholders, and split into tokens.
+    """
+    if "," in text:
+        text = text.split(",", 1)[1]
+    text = text.replace("[Name]", " ").replace("[Company]", " ")
+    decomposed = unicodedata.normalize("NFKD", text)
+    ascii_only = "".join(
+        ch for ch in decomposed
+        if unicodedata.category(ch) not in ("Mn", "Cf")
+    )
+    return [t for t in "".join(
+        c if c.isalnum() or c.isspace() else " " for c in ascii_only.lower()
+    ).split() if t]
+
+
+# Self-echo guard template cache. `load_messages` is an unguarded open+json.load;
+# calling it per manual-reply candidate meant a missing/corrupt messages.json
+# crashed ALL of detect_responses. We tokenize every template ONCE and cache the
+# (template_id, token_set) list. `None` is a cached sentinel meaning "load failed
+# this run" — the guard then fails OPEN (see below).
+_UNSET = object()
+_SELF_ECHO_TEMPLATES: object = _UNSET
+_SELF_ECHO_WARNED = False
+
+
+def _reset_self_echo_template_cache() -> None:
+    """Clear the memoized template token sets (test hook / long-lived procs)."""
+    global _SELF_ECHO_TEMPLATES, _SELF_ECHO_WARNED
+    _SELF_ECHO_TEMPLATES = _UNSET
+    _SELF_ECHO_WARNED = False
+
+
+def _self_echo_templates() -> list[tuple[str, frozenset[str]]] | None:
+    """Load + tokenize every DM template ONCE. Returns None on load failure.
+
+    Cached across the run so `load_messages()` (an unguarded file read) is hit
+    at most once, not once per manual-reply candidate. On failure we cache
+    `None` and return it — the caller fails OPEN and warns once.
+    """
+    global _SELF_ECHO_TEMPLATES
+    if _SELF_ECHO_TEMPLATES is not _UNSET:
+        return _SELF_ECHO_TEMPLATES  # type: ignore[return-value]
+    try:
+        messages = load_messages()
+    except Exception:  # noqa: BLE001 — degrade OPEN, do not crash detection
+        _SELF_ECHO_TEMPLATES = None
+        return None
+    built: list[tuple[str, frozenset[str]]] = []
+    for persona, steps in messages.items():
+        if not isinstance(steps, dict):
+            continue
+        for step, langs in steps.items():
+            if not isinstance(langs, dict):
+                continue
+            for lang, template in langs.items():
+                if not isinstance(template, str):
+                    continue
+                tokens = frozenset(_normalize_for_echo(template))
+                if not tokens:
+                    continue
+                built.append((f"{persona}/{step}/{lang}", tokens))
+    _SELF_ECHO_TEMPLATES = built
+    return built
+
+
+def _looks_like_self_echo(last_body: str) -> str | None:
+    """Return a matched template id if `last_body` echoes one of OUR templates.
+
+    The SN Inbox Scraper exposes no per-message senders — a thread of N messages
+    all from us (the PR-241 dup-DM1 case) is arithmetically indistinguishable
+    from (N-1)-ours + 1-theirs. Before the count heuristic flips a prospect to
+    Responded, compare the last message body against every DM template: a
+    token-overlap ratio ≥ `_SELF_ECHO_MIN_OVERLAP` against any template means
+    the "reply" is actually our own copy echoed back.
+
+    Returns the matching template id (``"{persona}/{step}/{lang}"``) or None.
+
+    Fails OPEN: if the template set can't load (missing/corrupt messages.json),
+    warn LOUDLY once and return None so manual-reply flips proceed WITHOUT the
+    self-echo check this run. Crashing the whole run to stay closed is worse;
+    the warning makes the degraded state visible.
+    """
+    body_tokens = set(_normalize_for_echo(last_body))
+    if not body_tokens:
+        return None
+    templates = _self_echo_templates()
+    if templates is None:
+        global _SELF_ECHO_WARNED
+        if not _SELF_ECHO_WARNED:
+            _SELF_ECHO_WARNED = True
+            click.echo(
+                "  ⚠ self-echo guard offline: could not load DM templates "
+                "(missing/corrupt messages.json) — manual-reply flips proceed "
+                "WITHOUT the self-echo check this run.",
+                err=True,
+            )
+        return None
+
+    best_id: str | None = None
+    best_ratio = 0.0
+    for template_id, tmpl_tokens in templates:
+        # Fraction of the TEMPLATE reproduced in the body. An echo is our full
+        # template → ratio ≈ 1.0; a short genuine reply reproduces few template
+        # tokens → low ratio. Denominator is the template (not the shorter set)
+        # so a 2-word reply can't trivially score 1.0 against a long template.
+        overlap = len(body_tokens & tmpl_tokens)
+        ratio = overlap / len(tmpl_tokens)
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_id = template_id
+    if best_ratio >= _SELF_ECHO_MIN_OVERLAP:
+        return best_id
+    return None
 
 
 def _reconstruct_opener(
@@ -1206,6 +1330,52 @@ def detect_responses(
                 total_messages = 0
             # Missing data or unknown stage → fall back to skip (safe default).
             if expected is None or total_messages <= expected:
+                continue
+            # Self-echo guard (PR-241 César RCA). The count heuristic can't tell
+            # a real reply from our own duplicate DM echoed back — the scraper
+            # exposes no per-message senders. If the last body matches one of
+            # OUR templates, it's a self-echo (the dup-DM1 case): do NOT flip to
+            # Responded. A genuine reply body won't match and falls through to
+            # _handle_manual_reply unchanged.
+            matched_template_id = _looks_like_self_echo(last_body)
+            if matched_template_id is not None:
+                click.echo(
+                    f"  ⚠ Suppressed manual-reply flip for {participant_name}: "
+                    f"last message matches our own template "
+                    f"{matched_template_id!r} (suspected self-echo from a "
+                    f"duplicate DM, not a reply). NOT moving to Responded; "
+                    f"escalating for operator review.",
+                    err=True,
+                )
+                counts.setdefault("self_echo_suppressed", 0)
+                counts["self_echo_suppressed"] += 1
+                _primary = actionable[0]
+                try:
+                    escalate(
+                        type="manual_reply_suppressed_self_echo",
+                        idempotency_key=(
+                            f"{_primary.get('entry_id') or ''}"
+                            f"|{date.today().isoformat()}"
+                        ),
+                        payload={
+                            "record_id": str(_primary.get("record_id") or ""),
+                            "entry_id": str(_primary.get("entry_id") or ""),
+                            "name": participant_name,
+                            "stage": str(_primary.get("stage") or ""),
+                            "total_messages": total_messages,
+                            "expected": expected,
+                            "matched_template_id": matched_template_id,
+                        },
+                        attio=attio,
+                    )
+                except Exception as esc_exc:  # noqa: BLE001 — never block detection
+                    click.echo(
+                        f"  ⚠ escalate(manual_reply_suppressed_self_echo) failed "
+                        f"for {participant_name} "
+                        f"[{type(esc_exc).__name__}]: {esc_exc}. Row still held "
+                        f"out of the Responded flip; continuing.",
+                        err=True,
+                    )
                 continue
             # (b) — manual reply. Move to RESPONDED + note for human triage.
             _handle_manual_reply(

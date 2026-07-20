@@ -82,8 +82,13 @@ class TestSlugInventory:
         #     reconcile alarm — a CONNECTION_SENT row the SN scrape reports as
         #     invite-resolved (hasPendingInvitation=false) but still not
         #     1st-degree; the operator cross-references against LinkedIn).
-        # New count: 89 + 1 + 2 + 1 = 93.
-        assert len(ESCALATION_TYPES) == 93
+        # feat/port-reliability-primitives (port of upstream #241) added 2 more:
+        #   - pattern_a_suspected_duplicate (pre_invite_check quarantines a
+        #     1st-degree row committed <14d — suspected URL-variant duplicate).
+        #   - manual_reply_suppressed_self_echo (detect_responses suppresses a
+        #     manual-reply flip whose last message is our own DM echoed back).
+        # New count: 89 + 1 + 2 + 1 + 2 = 95.
+        assert len(ESCALATION_TYPES) == 95
 
     def test_no_duplicate_slugs(self):
         assert len(ESCALATION_TYPES) == len(ESCALATION_TYPES_SET)
@@ -144,6 +149,43 @@ class TestPayloadValidation:
                 "error_class": "AttioPermanentError",
                 "error_msg": "...",
                 "retry_count": 5,
+            },
+        )
+
+    def test_pattern_a_suspected_duplicate_schema(self):
+        # Registered → missing fields raise; complete payload validates.
+        with pytest.raises(EscalationSchemaError, match="missing required fields"):
+            escalation._validate_payload_against_typeddict(
+                "pattern_a_suspected_duplicate", {"record_id": "rec"}
+            )
+        escalation._validate_payload_against_typeddict(
+            "pattern_a_suspected_duplicate",
+            {
+                "record_id": "rec",
+                "entry_id": "ent",
+                "linkedin_url": "https://linkedin.com/in/x",
+                "name": "César",
+                "company": "Sigma",
+                "prospect_committed_at": "2026-06-28",
+                "degree": "1st",
+            },
+        )
+
+    def test_manual_reply_suppressed_self_echo_schema(self):
+        with pytest.raises(EscalationSchemaError, match="missing required fields"):
+            escalation._validate_payload_against_typeddict(
+                "manual_reply_suppressed_self_echo", {"record_id": "rec"}
+            )
+        escalation._validate_payload_against_typeddict(
+            "manual_reply_suppressed_self_echo",
+            {
+                "record_id": "rec",
+                "entry_id": "ent",
+                "name": "César",
+                "stage": "DM1 Sent",
+                "total_messages": 3,
+                "expected": 1,
+                "matched_template_id": "operations_leaders/dm1/es",
             },
         )
 

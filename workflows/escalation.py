@@ -223,8 +223,8 @@ def escalate(
     """Open or refresh an Operator Review Queue row.
 
     Args:
-        type: One of `ESCALATION_TYPES` (79 typed slugs). Raises
-            `UnknownEscalationType` on miss.
+        type: One of `ESCALATION_TYPES` (`len(ESCALATION_TYPES)` typed slugs).
+            Raises `UnknownEscalationType` on miss.
         idempotency_key: Caller-provided dedup key. Re-calling with the
             same `(type, idempotency_key)` (or
             `(type, decision_key, idempotency_key)` when

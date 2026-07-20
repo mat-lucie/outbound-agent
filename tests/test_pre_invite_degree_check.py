@@ -145,6 +145,50 @@ class TestPreInviteDegreeCheck:
         assert len(still) == 2
         assert {row["entry_id"] for row in still} == {"ent-B", "ent-C"}
 
+    def test_recent_first_degree_quarantined_not_flipped(self, _pb_args, _sheet):
+        """PR-241: a 1st-degree row committed <14d ago is a suspected URL-
+        variant duplicate — it must NOT flip to ACCEPTED and NOT stay in the
+        invite queue; it is escalated (pattern_a_suspected_duplicate) instead.
+        An old-committed 1st-degree row still flips as before."""
+        from datetime import date, timedelta
+
+        today = date(2026, 7, 2)
+        batch = self._make_batch()
+        batch[0]["prospect_committed_at"] = (today - timedelta(days=6)).isoformat()   # alice: recent → quarantine
+        batch[1]["prospect_committed_at"] = (today - timedelta(days=90)).isoformat()  # bob: old → flips
+
+        attio = MagicMock()
+        pb = MagicMock()
+        pb.download_result_csv.return_value = _csv([
+            {"url": "https://www.linkedin.com/in/alice", "degree": "1st"},
+            {"url": "https://www.linkedin.com/in/bob", "degree": "1st"},
+            {"url": "https://www.linkedin.com/in/carol", "degree": "2nd"},
+        ])
+
+        with patch("workflows.pre_invite_check.escalate") as escalate_mock:
+            still, already = _pre_invite_degree_check(
+                batch, pb, "scraper-id", attio, "list-id", today=today,
+            )
+
+        # alice quarantined: not flipped, not in invite queue.
+        assert "ent-A" not in {r["entry_id"] for r in already}
+        assert "ent-A" not in {r["entry_id"] for r in still}
+        # bob (old) still flips to ACCEPTED; carol (2nd) stays in queue.
+        assert {r["entry_id"] for r in already} == {"ent-B"}
+        assert {r["entry_id"] for r in still} == {"ent-C"}
+        # alice's row was NOT written; the escalate carries the dup type.
+        ent_a_writes = [
+            c for c in attio.update_list_entry.call_args_list
+            if c.kwargs.get("entry_id") == "ent-A"
+        ]
+        assert ent_a_writes == []
+        dup_calls = [
+            c for c in escalate_mock.call_args_list
+            if c.kwargs.get("type") == "pattern_a_suspected_duplicate"
+        ]
+        assert len(dup_calls) == 1
+        assert dup_calls[0].kwargs["payload"]["record_id"] == "rec-A"
+
     def test_all_second_degree_no_partition_no_attio_writes(self, _pb_args, _sheet):
         attio = MagicMock()
         pb = MagicMock()
@@ -443,3 +487,80 @@ class TestPreInviteDegreeCheckCrossBackend:
         assert still == []
         assert already == []
         attio.update_list_entry.assert_not_called()
+
+
+class TestPatternADuplicateFunctions:
+    """Unit tests for the Pattern-A recency-quarantine helper (PR-241 César RCA)."""
+
+    def test_recent_committed_is_within_window(self):
+        from datetime import date, timedelta
+
+        from workflows.pre_invite_check import (
+            PATTERN_A_QUARANTINE_DAYS,
+            _prospect_committed_within_days,
+        )
+        today = date(2026, 7, 2)
+        recent = (today - timedelta(days=6)).isoformat()
+        assert _prospect_committed_within_days(
+            recent, today=today, days=PATTERN_A_QUARANTINE_DAYS
+        ) is True
+
+    def test_old_committed_outside_window(self):
+        from datetime import date, timedelta
+
+        from workflows.pre_invite_check import (
+            PATTERN_A_QUARANTINE_DAYS,
+            _prospect_committed_within_days,
+        )
+        today = date(2026, 7, 2)
+        old = (today - timedelta(days=30)).isoformat()
+        assert _prospect_committed_within_days(
+            old, today=today, days=PATTERN_A_QUARANTINE_DAYS
+        ) is False
+
+    def test_missing_timestamp_not_quarantined(self):
+        from datetime import date
+
+        from workflows.pre_invite_check import _prospect_committed_within_days
+        assert _prospect_committed_within_days(None, today=date(2026, 7, 2), days=14) is False
+        assert _prospect_committed_within_days("", today=date(2026, 7, 2), days=14) is False
+
+    def test_unparseable_timestamp_not_quarantined(self):
+        from datetime import date
+
+        from workflows.pre_invite_check import _prospect_committed_within_days
+        assert _prospect_committed_within_days(
+            "not-a-date", today=date(2026, 7, 2), days=14
+        ) is False
+
+    def test_accepts_datetime_iso(self):
+        from datetime import date
+
+        from workflows.pre_invite_check import _prospect_committed_within_days
+        assert _prospect_committed_within_days(
+            "2026-06-28T09:30:00Z", today=date(2026, 7, 2), days=14
+        ) is True
+
+    def test_unparseable_present_value_warns(self, capsys):
+        # A PRESENT-but-unparseable timestamp still returns False (not
+        # quarantined) but must be observable — warn naming the raw value so
+        # it's distinguishable from an absent timestamp (which is silent).
+        from datetime import date
+
+        from workflows.pre_invite_check import _prospect_committed_within_days
+        assert _prospect_committed_within_days(
+            "garbage-value", today=date(2026, 7, 2), days=14
+        ) is False
+        combined = capsys.readouterr()
+        assert "garbage-value" in (combined.out + combined.err)
+
+    def test_absent_value_is_silent(self, capsys):
+        # An absent timestamp must NOT warn — only a present-but-unparseable one.
+        from datetime import date
+
+        from workflows.pre_invite_check import _prospect_committed_within_days
+        assert _prospect_committed_within_days(
+            None, today=date(2026, 7, 2), days=14
+        ) is False
+        combined = capsys.readouterr()
+        assert (combined.out + combined.err).strip() == ""

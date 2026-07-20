@@ -195,6 +195,16 @@ ESCALATION_TYPES: tuple[str, ...] = (
     # cadence depth (Pattern-A regression). The sweep leaves it at PROSPECT
     # and surfaces it for the repair tooling instead of guessing a DM stage.
     "prospect_first_degree_with_depth",
+
+    # ---- Dup-prospect ingest cascade (PR-241 César RCA) ----
+    # pre_invite_check quarantines a 1st-degree row that only became a prospect
+    # within the last PATTERN_A_QUARANTINE_DAYS — a likely URL-variant
+    # duplicate of a person who already ran a full cadence. Skip today's flip,
+    # escalate for operator triage.
+    "pattern_a_suspected_duplicate",
+    # detect_responses suppressed a "manual reply" that was actually our own
+    # duplicate DM echoed back (dup-DM1 case) — do NOT flip to Responded.
+    "manual_reply_suppressed_self_echo",
 )
 
 ESCALATION_TYPES_SET: frozenset[str] = frozenset(ESCALATION_TYPES)
@@ -1116,6 +1126,59 @@ class ProspectFirstDegreeWithDepthPayload(TypedDict):
     response_received_at_set: bool
 
 
+# ---- Dup-prospect ingest cascade (PR-241 César RCA) ----
+
+class PatternASuspectedDuplicatePayload(TypedDict):
+    """`pattern_a_suspected_duplicate` — emitted by
+    `workflows.pre_invite_check` when a 1st-degree row that would normally
+    Pattern-A flip to ACCEPTED only became a prospect within the last
+    `PATTERN_A_QUARANTINE_DAYS` (14).
+
+    This is the daily-run half of the PR-241 César cascade: the weekly ingest
+    re-created an existing prospect under a new LinkedIn vanity slug, the daily
+    run found the "new" prospect already 1st-degree, and the Pattern-A flip
+    re-started a cadence on a person who'd already completed a DM3. Recently-
+    created + already-1st-degree is the URL-variant-duplicate fingerprint. The
+    row is NOT flipped and NOT invited; the operator confirms or dismisses.
+
+    A missing/unparseable `prospect_committed_at` is NOT quarantined (old
+    records must keep flipping — the legitimate silent-acceptance Pattern-A
+    case), so this row only fires when recency is provable.
+
+    Idempotency key: `record_id`.
+    """
+    record_id: str
+    entry_id: str
+    linkedin_url: str
+    name: str
+    company: str
+    prospect_committed_at: str
+    degree: str
+
+
+class ManualReplySuppressedSelfEchoPayload(TypedDict):
+    """`manual_reply_suppressed_self_echo` — emitted by
+    `workflows.detect_responses` when the manual-reply count heuristic would
+    fire (`isLastMessageFromMe=true` + `totalMessageCount > expected`) but the
+    last message body matches one of OUR OWN DM templates.
+
+    The reply-detection half of the PR-241 César cascade: a duplicate DM1
+    (from the re-prospecting) left a thread whose last message was our own copy
+    echoed twice, arithmetically indistinguishable from a real reply. The row
+    is NOT flipped to Responded; the operator confirms the thread.
+
+    A body that doesn't match any template passes through unchanged (a real
+    reply still flips). Idempotency key: `entry_id|date`.
+    """
+    record_id: str
+    entry_id: str
+    name: str
+    stage: str
+    total_messages: int
+    expected: int
+    matched_template_id: str
+
+
 # ---- audit-silent-skip-escalations TypedDicts ----
 
 
@@ -1231,6 +1294,9 @@ ESCALATION_SCHEMAS: dict[str, type] = {
     "stale_connection_sent": StaleConnectionSentPayload,
     # Phase 0 PROSPECT sweep (Defect 2)
     "prospect_first_degree_with_depth": ProspectFirstDegreeWithDepthPayload,
+    # Dup-prospect ingest cascade (PR-241 César RCA)
+    "pattern_a_suspected_duplicate": PatternASuspectedDuplicatePayload,
+    "manual_reply_suppressed_self_echo": ManualReplySuppressedSelfEchoPayload,
 }
 
 
