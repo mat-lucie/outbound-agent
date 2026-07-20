@@ -281,6 +281,23 @@ class TestCostCeilingPath:
         monkeypatch.setattr(ld, "is_dispatch_enabled", lambda: True)
         assert classify_company_hq("Bimbo") is None
 
+    def test_budget_ledger_unavailable_returns_none(self, monkeypatch):
+        """A budget-ledger infra outage (PR-216 incident) must degrade
+        exactly like any dispatch failure — return None so the sweep
+        retries next run — instead of crashing on a raw httpx error.
+        LLMBudgetLedgerUnavailable subclasses LLMDispatchFailed so the
+        existing catch tuple covers it; this test locks the family in."""
+        from workflows import llm_dispatch as ld
+
+        def _raise_ledger(**kwargs):
+            raise ld.LLMBudgetLedgerUnavailable(
+                "company_hq_classifier", RuntimeError("Attio 400"),
+            )
+
+        monkeypatch.setattr(ld, "request_llm_dispatch", _raise_ledger)
+        monkeypatch.setattr(ld, "is_dispatch_enabled", lambda: True)
+        assert classify_company_hq("Bimbo") is None
+
 
 # -- Backfill sweep ------------------------------------------------------
 

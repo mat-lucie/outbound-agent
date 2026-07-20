@@ -6,6 +6,7 @@ from datetime import date
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from workflows.llm_budget import (
@@ -164,6 +165,163 @@ class TestTryReserveExistingRow:
         assert exc_info.value.cap == Decimal("2.00")
         assert exc_info.value.consumed == Decimal("1.90")
         writer.apply.assert_not_called()
+
+
+class TestCurrencyPrecisionFourDecimalPlaces:
+    """PR-216 production regression: Attio currency attributes accept at
+    most 4 decimal places. `quality_gate_haiku`'s estimated cost is $0.00065
+    (5 dp), so every create/patch 400'd and the ledger never wrote a row —
+    weekly dispatches degraded to `borderline_llm_error`.
+
+    Contract: every currency value serialized to the CRM (`consumed`,
+    `cap_remaining_this_week`, `cost_usd_actual`) has ≤4 decimal places and
+    plain (non-scientific) notation. Rounding is pessimistic for the budget
+    gate: spend rounds UP, remaining budget rounds DOWN.
+    """
+
+    CURRENCY_SLUGS = ("consumed", "cap_remaining_this_week", "cost_usd_actual")
+
+    @staticmethod
+    def _assert_attio_safe(raw: str) -> Decimal:
+        value = Decimal(raw)
+        exponent = value.as_tuple().exponent
+        assert exponent >= -4, f"{raw!r} has more than 4 decimal places"
+        assert "e" not in raw.lower(), f"{raw!r} uses scientific notation"
+        return value
+
+    def test_create_quantizes_production_cost(self, attio_no_existing_row):
+        """Exact production repro: quality_gate_haiku estimate = $0.00065."""
+        attio, writer = attio_no_existing_row
+        LLMBudgetLedger.try_reserve(
+            "quality_gate_haiku",
+            0.00065,
+            attio=attio,
+            writer=writer,
+            today=date(2026, 6, 29),  # Monday of the failing run week
+        )
+        create_values = attio._request.call_args_list[1].kwargs["json"]["data"]["values"]
+        for slug in self.CURRENCY_SLUGS:
+            self._assert_attio_safe(create_values[slug])
+        # Spend rounds UP: 0.00065 → 0.0007 (never under-counts against cap).
+        assert Decimal(create_values["consumed"]) == Decimal("0.0007")
+        assert Decimal(create_values["cost_usd_actual"]) == Decimal("0.0007")
+        # Remaining rounds DOWN: 5.00 - 0.0007 = 4.9993 (never overstates).
+        assert Decimal(create_values["cap_remaining_this_week"]) == Decimal("4.9993")
+
+    def test_patch_quantizes_production_cost(self, attio_with_existing_row):
+        attio, writer = attio_with_existing_row("0.0007")
+        LLMBudgetLedger.try_reserve(
+            "quality_gate_haiku",
+            0.00065,
+            attio=attio,
+            writer=writer,
+            today=date(2026, 6, 29),
+        )
+        writer.apply.assert_called_once()
+        updates = writer.apply.call_args[0][0].updates
+        for slug in self.CURRENCY_SLUGS:
+            self._assert_attio_safe(updates[slug])
+        # Stored consumed (0.0007) + quantized cost (0.0007) = 0.0014.
+        assert Decimal(updates["consumed"]) == Decimal("0.0014")
+        assert Decimal(updates["cap_remaining_this_week"]) == Decimal("4.9986")
+        assert Decimal(updates["cost_usd_actual"]) == Decimal("0.0007")
+
+    def test_tiny_estimate_never_scientific_notation(self, attio_no_existing_row):
+        """An adversarially tiny estimate must not serialize as '6.5E-7'."""
+        attio, writer = attio_no_existing_row
+        LLMBudgetLedger.try_reserve(
+            "quality_gate_haiku",
+            0.00000065,
+            attio=attio,
+            writer=writer,
+            today=date(2026, 6, 29),
+        )
+        create_values = attio._request.call_args_list[1].kwargs["json"]["data"]["values"]
+        for slug in self.CURRENCY_SLUGS:
+            self._assert_attio_safe(create_values[slug])
+        # ROUND_UP floors positive spend at the smallest representable unit.
+        assert Decimal(create_values["consumed"]) == Decimal("0.0001")
+
+    def test_cap_check_counts_quantized_cost(self, attio_with_existing_row):
+        """The cap comparison must use the same quantized cost that gets
+        persisted — otherwise consumed drifts from what the check saw."""
+        attio, writer = attio_with_existing_row("4.9994")
+        # 4.9994 + quantize_up(0.00065)=0.0007 → 5.0001 > 5.00 cap → refuse.
+        with pytest.raises(CostCeilingExhausted) as exc_info:
+            LLMBudgetLedger.try_reserve(
+                "quality_gate_haiku",
+                0.00065,
+                attio=attio,
+                writer=writer,
+                today=date(2026, 6, 29),
+            )
+        assert exc_info.value.consumed == Decimal("4.9994")
+        writer.apply.assert_not_called()
+
+
+class TestLedgerUnavailable:
+    """Ledger infra I/O failures must surface as the typed
+    `LLMBudgetLedgerUnavailable` (a subclass of `LLMDispatchFailed`) so:
+      - every dispatch caller that already degrades on LLMDispatchFailed
+        degrades gracefully instead of crashing on a raw httpx error, and
+      - the quality gate can distinguish "ledger down" (fail open to the
+        agent staging path) from "cap exhausted" (fail closed).
+    PR-216 incident: raw HTTPStatusError leaked into the generic
+    LLM-failure bucket and borderlines were rejected with no artifact.
+    """
+
+    def _http_error(self) -> httpx.HTTPStatusError:
+        req = httpx.Request("POST", "https://api.attio.com/v2/objects/llm_budget_ledger/records")
+        return httpx.HTTPStatusError(
+            "Client error '400 Bad Request'", request=req,
+            response=httpx.Response(400, request=req),
+        )
+
+    def test_query_error_raises_typed_unavailable(self):
+        from workflows.llm_dispatch import LLMBudgetLedgerUnavailable, LLMDispatchFailed
+        attio = MagicMock()
+        attio._request.side_effect = self._http_error()
+        with pytest.raises(LLMBudgetLedgerUnavailable) as exc_info:
+            LLMBudgetLedger.try_reserve(
+                "quality_gate_haiku", 0.00065,
+                attio=attio, writer=MagicMock(), today=date(2026, 6, 29),
+            )
+        assert isinstance(exc_info.value, LLMDispatchFailed)
+        assert exc_info.value.step == "quality_gate_haiku"
+
+    def test_create_error_raises_typed_unavailable(self):
+        from workflows.llm_dispatch import LLMBudgetLedgerUnavailable
+        attio = MagicMock()
+        attio._request.side_effect = [
+            {"data": []},        # find query succeeds, no row
+            self._http_error(),  # create 400s
+        ]
+        with pytest.raises(LLMBudgetLedgerUnavailable):
+            LLMBudgetLedger.try_reserve(
+                "quality_gate_haiku", 0.00065,
+                attio=attio, writer=MagicMock(), today=date(2026, 6, 29),
+            )
+
+    def test_patch_error_raises_typed_unavailable(self, attio_with_existing_row):
+        from clients.attio_writer import AttioWriteFailed
+        from workflows.llm_dispatch import LLMBudgetLedgerUnavailable
+        attio, writer = attio_with_existing_row("0.0007")
+        writer.apply.side_effect = AttioWriteFailed("max_attempts")
+        with pytest.raises(LLMBudgetLedgerUnavailable):
+            LLMBudgetLedger.try_reserve(
+                "quality_gate_haiku", 0.00065,
+                attio=attio, writer=writer, today=date(2026, 6, 29),
+            )
+
+    def test_cap_exhausted_is_not_wrapped(self, attio_with_existing_row):
+        """CostCeilingExhausted must keep its type — it is a fail-closed
+        budget verdict, not an infra failure."""
+        attio, writer = attio_with_existing_row("4.9999")
+        with pytest.raises(CostCeilingExhausted):
+            LLMBudgetLedger.try_reserve(
+                "quality_gate_haiku", 0.00065,
+                attio=attio, writer=writer, today=date(2026, 6, 29),
+            )
 
 
 class TestTryReserveDisabledEnv:

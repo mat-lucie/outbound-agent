@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -59,6 +59,25 @@ STEP_WEEKLY_CAP_USD: dict[str, Decimal] = {
 
 # Sentinel for "no configured cap" — never refuses.
 _UNLIMITED_CAP = Decimal("Infinity")
+
+# Attio currency attributes accept at most 4 decimal places; values with
+# more precision are rejected with 400 (PR-216 incident: the
+# quality_gate_haiku estimate $0.00065 has 5 dp, so every ledger create
+# failed and weekly dispatches degraded to borderline_llm_error).
+_USD_QUANT = Decimal("0.0001")
+
+
+def _quantize_spend(value: Decimal) -> Decimal:
+    """Quantize a spend amount (consumed / cost_usd_actual) to the Attio
+    4-dp limit, rounding UP so the ledger never under-counts against the
+    cap. A positive sub-unit estimate floors at $0.0001 rather than 0."""
+    return value.quantize(_USD_QUANT, rounding=ROUND_UP)
+
+
+def _quantize_remaining(value: Decimal) -> Decimal:
+    """Quantize a remaining-budget amount to the Attio 4-dp limit,
+    rounding DOWN so the ledger never overstates what's left."""
+    return value.quantize(_USD_QUANT, rounding=ROUND_DOWN)
 
 
 # ============================================================
@@ -206,7 +225,9 @@ class LLMBudgetLedger:
         if cap == _UNLIMITED_CAP:
             return None
 
-        cost = Decimal(str(estimated_cost_usd))
+        # Quantize once at entry so the cap check, the created row, and the
+        # PATCH increments all use the same 4-dp value Attio will store.
+        cost = _quantize_spend(Decimal(str(estimated_cost_usd)))
         week = _monday_of(today)
 
         # Allow tests to disable the Attio round-trip entirely via env var.
@@ -271,37 +292,56 @@ class LLMBudgetLedger:
             from clients.attio_writer import AttioWriter as _AttioWriter
             writer = _AttioWriter(attio=attio)
 
-        existing = _find_ledger_row(attio, step=step, week_starting=week)
+        # Ledger I/O failures are wrapped in the typed
+        # LLMBudgetLedgerUnavailable (PR-216 incident: a raw
+        # HTTPStatusError from the 400ing create leaked into the generic
+        # LLM-failure bucket and borderlines were silently rejected).
+        # CostCeilingExhausted is raised inside this block and must keep
+        # its type — it is a budget verdict, not an infra failure.
+        import httpx
 
-        if existing is None:
-            current_consumed = Decimal("0")
-            new_consumed = cost
+        from clients.attio_writer import AttioError
+        from workflows.llm_dispatch import LLMBudgetLedgerUnavailable
+
+        try:
+            existing = _find_ledger_row(attio, step=step, week_starting=week)
+
+            if existing is None:
+                current_consumed = Decimal("0")
+                new_consumed = cost
+                if new_consumed > cap:
+                    raise CostCeilingExhausted(step, cap, current_consumed)
+                _create_ledger_row(
+                    attio,
+                    step=step,
+                    week_starting=week,
+                    cap=cap,
+                    consumed=new_consumed,
+                )
+                return None
+
+            current_consumed = _parse_decimal(existing.get("values"), "consumed")
+            new_consumed = current_consumed + cost
             if new_consumed > cap:
                 raise CostCeilingExhausted(step, cap, current_consumed)
-            _create_ledger_row(
-                attio,
-                step=step,
-                week_starting=week,
-                cap=cap,
+
+            record_id = existing.get("id", {}).get("record_id", "")
+            cap_remaining = cap - new_consumed
+            _patch_ledger_row(
+                writer,
+                record_id=record_id,
                 consumed=new_consumed,
+                cap_remaining=cap_remaining,
+                cost_usd_actual=cost,
             )
             return None
-
-        current_consumed = _parse_decimal(existing.get("values"), "consumed")
-        new_consumed = current_consumed + cost
-        if new_consumed > cap:
-            raise CostCeilingExhausted(step, cap, current_consumed)
-
-        record_id = existing.get("id", {}).get("record_id", "")
-        cap_remaining = cap - new_consumed
-        _patch_ledger_row(
-            writer,
-            record_id=record_id,
-            consumed=new_consumed,
-            cap_remaining=cap_remaining,
-            cost_usd_actual=cost,
-        )
-        return None
+        except (
+            httpx.HTTPStatusError,
+            httpx.RequestError,
+            httpx.TimeoutException,
+            AttioError,
+        ) as err:
+            raise LLMBudgetLedgerUnavailable(step, err) from err
 
 
 # ============================================================
@@ -421,14 +461,19 @@ def _create_ledger_row(
     Direct POST (not via AttioWriter) — the new record has no id to PATCH
     against. Mirrors the diagnostic_run create path (PR-34 precedent).
     """
+    # Attio currency attrs reject values with >4 decimal places (400) —
+    # quantize defensively at the serialization boundary even though
+    # try_reserve already quantized `consumed`. Plain-notation str() is
+    # guaranteed at exponent -4 (Decimal only uses scientific notation
+    # for much smaller exponents).
     body = {
         "data": {
             "values": {
                 "step": step,
                 "week_starting": week_starting.isoformat(),
-                "consumed": str(consumed),
-                "cap_remaining_this_week": str(cap - consumed),
-                "cost_usd_actual": str(consumed),
+                "consumed": str(_quantize_spend(consumed)),
+                "cap_remaining_this_week": str(_quantize_remaining(cap - consumed)),
+                "cost_usd_actual": str(_quantize_spend(consumed)),
             }
         }
     }
@@ -462,13 +507,15 @@ def _patch_ledger_row(
         object=LLM_BUDGET_LEDGER_OBJECT,
         record_id=record_id,
         updates={
-            "consumed": str(consumed),
-            "cap_remaining_this_week": str(cap_remaining),
+            # 4-dp quantization mirrors _create_ledger_row — Attio currency
+            # attrs 400 on more precision.
+            "consumed": str(_quantize_spend(consumed)),
+            "cap_remaining_this_week": str(_quantize_remaining(cap_remaining)),
             # cost_usd_actual is per-call; we record THIS call's cost here
             # so the row's aggregate semantics differ from `consumed`. In
             # practice operators look at `consumed` for the running total
             # and `cost_usd_actual` for spot-checks.
-            "cost_usd_actual": str(cost_usd_actual),
+            "cost_usd_actual": str(_quantize_spend(cost_usd_actual)),
         },
         writer_module=WRITER_MODULE,
     ))

@@ -1,6 +1,6 @@
 """Tests for workflows/quality_gate.py — rule-based scoring."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from workflows.quality_gate import classify_response, render_qualification_prompt, score_prospect
 
@@ -852,6 +852,111 @@ class TestHybridHaikuGate:
         )
         assert result["verdict_path"] == "borderline_reject"
         assert result["pass"] is False
+
+
+class TestLedgerUnavailableRouting:
+    """PR-216 incident follow-up: a budget-ledger INFRA failure (Attio
+    error while reserving) is not a prospect-quality signal and must not
+    silently reject borderlines. When the caller supports the agent
+    staging path (agent_gate=True — the weekly flow), fail OPEN to
+    staging: the prospect lands in weekly_borderline_<date>.jsonl and the
+    operator qualifies it via the existing weekly-finalize loop. No LLM
+    dispatch happens without a reservation, so §3.7 is not bypassed.
+
+    Cap exhaustion (CostCeilingExhausted) stays fail-closed — unchanged.
+    Generic dispatch failures (timeout, subagent error) keep the
+    borderline_llm_error contract — unchanged.
+    """
+
+    ENTERPRISE_PERSONA = {
+        "key": "operations_leaders",
+        "enterprise_mode": True,
+    }
+    # Plant Manager @ 200-emp subsidiary → borderline band (40-75), score < 60.
+    BORDERLINE_PROSPECT = {
+        "name": "x",
+        "title": "Plant Manager",
+        "company": "Subsidiary",
+        "location": "Mexico City, Mexico",
+        "employee_count": 200,
+    }
+
+    def _ledger_unavailable(self):
+        from workflows.llm_dispatch import LLMBudgetLedgerUnavailable
+        return LLMBudgetLedgerUnavailable(
+            "quality_gate_haiku", RuntimeError("Attio 400 on ledger create"),
+        )
+
+    def test_agent_gate_stages_on_ledger_unavailable(self, monkeypatch):
+        monkeypatch.setenv("OUTBOUND_USE_LLM_DISPATCH", "1")
+        with patch(
+            "workflows.llm_dispatch.request_llm_dispatch",
+            side_effect=self._ledger_unavailable(),
+        ):
+            result = score_prospect(
+                dict(self.BORDERLINE_PROSPECT),
+                persona_config=self.ENTERPRISE_PERSONA,
+                agent_gate=True,
+            )
+        assert result["needs_agent_qualification"] is True
+        assert result["pass"] is None
+        assert result["ledger_unavailable"] is True
+        qp = result["qualification_prompt"]
+        assert qp["system"] and qp["user"]
+        # verdict_path stays None until the agent fills it in (staging contract).
+        assert result.get("verdict_path") is None
+
+    def test_no_agent_gate_keeps_llm_error_contract(self, monkeypatch):
+        """Callers without a staging path keep the pre-existing behavior:
+        deterministic fallback + retryable borderline_llm_error verdict."""
+        monkeypatch.setenv("OUTBOUND_USE_LLM_DISPATCH", "1")
+        with patch(
+            "workflows.llm_dispatch.request_llm_dispatch",
+            side_effect=self._ledger_unavailable(),
+        ):
+            result = score_prospect(
+                dict(self.BORDERLINE_PROSPECT),
+                persona_config=self.ENTERPRISE_PERSONA,
+                agent_gate=False,
+            )
+        assert result["verdict_path"] == "borderline_llm_error"
+        assert result["pass"] is (result["score"] >= 60)
+
+    def test_generic_dispatch_failure_not_staged(self, monkeypatch):
+        """A non-ledger dispatch failure (e.g. subagent timeout at the
+        parent) keeps borderline_llm_error even with agent_gate=True —
+        the fail-open is scoped to ledger infra failures only."""
+        from workflows.llm_dispatch import LLMDispatchFailed
+        monkeypatch.setenv("OUTBOUND_USE_LLM_DISPATCH", "1")
+        with patch(
+            "workflows.llm_dispatch.request_llm_dispatch",
+            side_effect=LLMDispatchFailed("quality_gate_haiku", "abc123", "subagent died"),
+        ):
+            result = score_prospect(
+                dict(self.BORDERLINE_PROSPECT),
+                persona_config=self.ENTERPRISE_PERSONA,
+                agent_gate=True,
+            )
+        assert result.get("needs_agent_qualification") is None
+        assert result["verdict_path"] == "borderline_llm_error"
+
+    def test_cost_exhausted_stays_fail_closed(self, monkeypatch):
+        """CostCeilingExhausted keeps its own verdict path and never stages."""
+        from decimal import Decimal as _D
+
+        from workflows.llm_dispatch import CostCeilingExhausted as _CCE
+        monkeypatch.setenv("OUTBOUND_USE_LLM_DISPATCH", "1")
+        with patch(
+            "workflows.llm_dispatch.request_llm_dispatch",
+            side_effect=_CCE("quality_gate_haiku", _D("5.00"), _D("5.00")),
+        ):
+            result = score_prospect(
+                dict(self.BORDERLINE_PROSPECT),
+                persona_config=self.ENTERPRISE_PERSONA,
+                agent_gate=True,
+            )
+        assert result.get("needs_agent_qualification") is None
+        assert result["verdict_path"] == "borderline_cost_exhausted"
 
 
 class TestEnterpriseBandsCorrection:

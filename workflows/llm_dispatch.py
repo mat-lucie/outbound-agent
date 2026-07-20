@@ -166,6 +166,40 @@ class LLMDispatchFailed(Exception):
         )
 
 
+class LLMBudgetLedgerUnavailable(LLMDispatchFailed):
+    """Raised when the CRM-backed budget ledger cannot be read or
+    written for INFRA reasons (HTTP error, network failure, AttioWriter
+    exhaustion) while reserving budget for a dispatch.
+
+    Semantics (PR-216 incident follow-up):
+      - The dispatch is still REFUSED — no LLM call runs without a
+        reservation, so §3.7 is never bypassed.
+      - Distinct from ``CostCeilingExhausted`` (cap known-exceeded →
+        fail closed) and ``LLMBudgetLedgerNotInitialized``
+        (misconfiguration → fail loud).
+      - Subclasses ``LLMDispatchFailed`` so every caller that already
+        degrades gracefully on dispatch failure (response classifier,
+        HQ classifier, synthetic prescreen) handles ledger outages the
+        same way instead of crashing on a raw httpx error.
+      - The quality gate catches this subclass explicitly to fail OPEN
+        to the agent staging path when ``agent_gate=True``.
+
+    Defined here (not in workflows.llm_budget) because the parent class
+    lives in this module and llm_budget already lazy-imports from it.
+    """
+
+    def __init__(self, step: str, cause: BaseException) -> None:
+        self.cause = cause
+        super().__init__(
+            step=step,
+            dispatch_id="<budget-ledger>",
+            error=(
+                f"budget ledger unavailable ({type(cause).__name__}: {cause}); "
+                "dispatch refused — reservation could not be recorded"
+            ),
+        )
+
+
 @dataclass
 class LLMDispatchRequest:
     """The structured handoff payload the engine writes to the inbox file.
@@ -424,6 +458,7 @@ __all__ = [
     "TOKEN_ESTIMATES",
     "CostCeilingExhausted",
     "LLMBudgetLedger",
+    "LLMBudgetLedgerUnavailable",
     "LLMDispatchFailed",
     "LLMDispatchRequest",
     "LLMDispatchResult",
