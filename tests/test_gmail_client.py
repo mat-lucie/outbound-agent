@@ -7,6 +7,7 @@ extra is never imported. All identities are synthetic (example.com).
 from __future__ import annotations
 
 import base64
+import builtins
 from datetime import date
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +16,7 @@ import pytest
 from clients.gmail import (
     GmailClient,
     GmailCredentialsMissing,
+    GmailDependencyMissing,
     is_auto_generated,
     strip_quoted_history,
 )
@@ -54,6 +56,38 @@ def test_from_credentials_raises_on_zero_byte_token(tmp_path):
         pytest.raises(GmailCredentialsMissing),
     ):
         GmailClient.from_credentials()
+
+
+def test_from_credentials_lib_missing_with_valid_token(tmp_path):
+    """Valid token BUT the [gmail] extra not installed → GmailDependencyMissing
+    (a GmailCredentialsMissing subclass), NOT a raw ModuleNotFoundError.
+
+    This is the branch-12 review bug: _is_valid_token passes on the on-disk
+    JSON (no Google lib needed), then the lazy import blows up. Consumers only
+    guard `except GmailCredentialsMissing`, so a bare ModuleNotFoundError would
+    escape and hard-crash the daily run mid-flight. Re-raised as the subclass,
+    it degrades to the same visible skip as a missing token.
+    """
+    token = tmp_path / "gmail-authorized-user.json"
+    token.write_text('{"refresh_token": "fake-refresh-token"}')
+
+    real_import = builtins.__import__
+
+    def _blow_up_google_imports(name, *args, **kwargs):
+        if name.startswith(("google.oauth2", "googleapiclient")):
+            raise ModuleNotFoundError(f"No module named '{name}'")
+        return real_import(name, *args, **kwargs)
+
+    with (
+        patch("clients.gmail.GMAIL_AUTHORIZED_USER", str(token)),
+        patch("clients.gmail.GMAIL_AUTHORIZED_USER_BACKUP", str(token) + ".bak"),
+        patch.object(builtins, "__import__", side_effect=_blow_up_google_imports),
+        pytest.raises(GmailDependencyMissing) as excinfo,
+    ):
+        GmailClient.from_credentials()
+    # Caught by the existing base-class guard, and carries the install hint.
+    assert isinstance(excinfo.value, GmailCredentialsMissing)
+    assert ".[gmail]" in str(excinfo.value)
 
 
 # ── search_inbound ─────────────────────────────────────────────────
