@@ -2026,6 +2026,31 @@ def test_gmail_sweep_degrades_to_skip_without_credentials():
     assert cand.email_reply_seen is False  # untouched
 
 
+def test_gmail_sweep_degrades_to_skip_when_gmail_extra_not_installed():
+    """The [gmail] optional extra is NOT installed but a valid token IS present.
+
+    ``from_credentials`` raises ``GmailDependencyMissing`` (a
+    ``GmailCredentialsMissing`` subclass). This must degrade to the SAME visible
+    skip as a missing token — NOT hard-crash the radar run mid-flight. Regression
+    guard for the branch-12 review bug where a bare ``ModuleNotFoundError``
+    escaped the ``except GmailCredentialsMissing`` guard.
+    """
+    from clients.gmail import GmailDependencyMissing
+    from workflows.followup_radar import sweep_gmail_conversations
+
+    cand = _waiting_email_candidate(email="hot@acme.test")
+
+    def _lib_missing():
+        raise GmailDependencyMissing("pip install -e '.[gmail]'")
+
+    degraded = sweep_gmail_conversations(
+        [cand], today=TODAY, lookback_days=90, client_factory=_lib_missing,
+    )
+    assert len(degraded) == 1
+    assert "no Gmail credentials" in degraded[0]  # caught by the base-class guard
+    assert cand.email_reply_seen is False  # untouched, no crash
+
+
 def test_gmail_sweep_collects_per_candidate_errors_without_raising():
     from workflows.followup_radar import sweep_gmail_conversations
 
