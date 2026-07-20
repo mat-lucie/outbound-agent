@@ -129,7 +129,7 @@ class TestScoreProspect:
         assert result["verdict_path"] != "deterministic_reject_sales_role"
 
     def test_production_coordinator_at_large_manufacturer_rejected(self):
-        # The bug pattern: pre-PR-23, "Production Coordinator at Sigma Foods"
+        # The bug pattern: pre-PR-23, "Production Coordinator at Acme Foods Foods"
         # would have scored size +28 + role +24 (domain influencer) + competitor
         # +20 + industry +12 = 84 → deterministic_pass before the junior/IC guard
         # was added.  Post-PR-23, the ops_in_industrial joint case would give
@@ -141,7 +141,7 @@ class TestScoreProspect:
         result = score_prospect({
             "name": "Maria González",
             "title": "Production Coordinator",
-            "company": "Sigma Alimentos",
+            "company": "Acme Foods",
             "location": "Monterrey, Mexico",
             "employee_count": 30000,
             "industry": "Food & Beverage",
@@ -161,7 +161,7 @@ class TestScoreProspect:
             result = score_prospect({
                 "name": "Test",
                 "title": title,
-                "company": "Sigma Alimentos",
+                "company": "Acme Foods",
                 "location": "Monterrey, Mexico",
                 "employee_count": 30000,
                 "industry": "Food & Beverage",
@@ -182,7 +182,7 @@ class TestScoreProspect:
             result = score_prospect({
                 "name": "Test",
                 "title": title,
-                "company": "Sigma Alimentos",
+                "company": "Acme Foods",
                 "location": "Monterrey, Mexico",
                 "employee_count": 30000,
                 "industry": "Food & Beverage",
@@ -1372,7 +1372,7 @@ class TestRoleIndustryOrthogonality:
             {
                 "name": "Test",
                 "title": "Director de Manufactura",
-                "company": "Sigma Alimentos",
+                "company": "Acme Foods",
                 "location": "Monterrey, Mexico",
                 "employee_count": 800,
                 "industry": "Food & Beverage",

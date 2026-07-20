@@ -210,12 +210,22 @@ class AttioProvider(CRMProvider):
     # ── People records ────────────────────────────────────────
 
     def search_people(
-        self, filter_: dict[str, Any] | None = None, limit: int = 50
+        self,
+        filter_: dict[str, Any] | None = None,
+        limit: int = 50,
+        *,
+        fail_if_truncated: bool = False,
     ) -> list[Record]:
-        return [
-            self._to_record(r, "people")
-            for r in self._attio.search_people(filter_=filter_, limit=limit)
-        ]
+        # Map the vendor-native truncation signal to the neutral contract
+        # exception so callers catch ResultTruncatedError, not an Attio type
+        # (same mapping query_list_entries does).
+        try:
+            raw = self._attio.search_people(
+                filter_=filter_, limit=limit, fail_if_truncated=fail_if_truncated
+            )
+        except AttioResultTruncated as exc:
+            raise ResultTruncatedError(str(exc)) from exc
+        return [self._to_record(r, "people") for r in raw]
 
     def get_person(self, record_id: str) -> Record | None:
         raw = self._attio.get_person(record_id)

@@ -131,9 +131,15 @@ class _StatefulAttioClient:
 
     # People
     def search_people(
-        self, filter_: dict[str, Any] | None = None, limit: int = 50
+        self,
+        filter_: dict[str, Any] | None = None,
+        limit: int = 50,
+        *,
+        fail_if_truncated: bool = False,
     ) -> list[dict[str, Any]]:
-        return self._search("people", filter_, limit)
+        return self._search(
+            "people", filter_, limit, fail_if_truncated=fail_if_truncated
+        )
 
     def get_person(self, record_id: str) -> dict[str, Any] | None:
         return self._store("people").get(record_id)
@@ -219,7 +225,12 @@ class _StatefulAttioClient:
         return self._search("deals", filter_, limit)
 
     def _search(
-        self, object_: str, filter_: dict[str, Any] | None, limit: int
+        self,
+        object_: str,
+        filter_: dict[str, Any] | None,
+        limit: int,
+        *,
+        fail_if_truncated: bool = False,
     ) -> list[dict[str, Any]]:
         rows = list(self._store(object_).values())
         if filter_:
@@ -231,6 +242,12 @@ class _StatefulAttioClient:
                     for k, v in filter_.items()
                 )
             ]
+        if fail_if_truncated and len(rows) > limit:
+            from clients.attio import AttioResultTruncated
+
+            raise AttioResultTruncated(
+                f"{object_} search matched {len(rows)} past limit {limit}"
+            )
         return rows[:limit]
 
     # List entries
@@ -525,6 +542,27 @@ class TestPersonRoundTrip:
         assert found is not None and found.object == "people"
         assert provider.search_person_by_linkedin("https://li/in/none") is None
         assert provider.search_person_by_linkedin("") is None
+
+    def test_search_people_fail_if_truncated_raises(
+        self, provider: CRMProvider
+    ) -> None:
+        """PR-234 symmetry: like ``query_list_entries``, a ``search_people``
+        sweep that hits its limit with records remaining raises the neutral
+        ``ResultTruncatedError`` rather than returning a silently capped set."""
+        from clients.crm.exceptions import ResultTruncatedError
+
+        for i in range(3):
+            provider.create_person({"name": f"P{i}"})
+        with pytest.raises(ResultTruncatedError):
+            provider.search_people(limit=1, fail_if_truncated=True)
+
+    def test_search_people_fail_if_truncated_ok_within_limit(
+        self, provider: CRMProvider
+    ) -> None:
+        for i in range(3):
+            provider.create_person({"name": f"P{i}"})
+        people = provider.search_people(limit=1000, fail_if_truncated=True)
+        assert len(people) == 3
 
 
 class TestUpsertIdempotency:

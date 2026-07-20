@@ -549,7 +549,7 @@ def _normalize_for_echo(text: str) -> list[str]:
     """Normalize a message body for self-echo token comparison.
 
     Lowercase, accent-fold (NFKD + strip combining marks), drop the greeting
-    up to the first comma (so "Hola [Name], ..." and "Hola César, ..." align),
+    up to the first comma (so "Hola [Name], ..." and "Hola René, ..." align),
     strip the [Name]/[Company] template placeholders, and split into tokens.
     """
     if "," in text:
@@ -1331,7 +1331,7 @@ def detect_responses(
             # Missing data or unknown stage → fall back to skip (safe default).
             if expected is None or total_messages <= expected:
                 continue
-            # Self-echo guard (PR-241 César RCA). The count heuristic can't tell
+            # Self-echo guard (PR-241 René RCA). The count heuristic can't tell
             # a real reply from our own duplicate DM echoed back — the scraper
             # exposes no per-message senders. If the last body matches one of
             # OUR templates, it's a self-echo (the dup-DM1 case): do NOT flip to

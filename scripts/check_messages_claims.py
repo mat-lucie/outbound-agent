@@ -41,7 +41,7 @@ operational copy without false positives.
 `content/evidence_refs.json` is a flat dict:
 
   {
-    "OTIF 85% to 97%": {"source": "Sigma 2026Q1 case study",
+    "OTIF 85% to 97%": {"source": "Acme Foods 2026Q1 case study",
                          "verified_by": "operator@example.com",
                          "verified_at": "2026-04-15"},
     ...

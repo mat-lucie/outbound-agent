@@ -77,7 +77,9 @@ class TestPeopleReads:
 
         result = provider.search_people(filter_={"linkedin": "x"}, limit=10)
 
-        inner.search_people.assert_called_once_with(filter_={"linkedin": "x"}, limit=10)
+        inner.search_people.assert_called_once_with(
+            filter_={"linkedin": "x"}, limit=10, fail_if_truncated=False
+        )
         assert len(result) == 1
         rec = result[0]
         assert isinstance(rec, Record)

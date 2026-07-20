@@ -2136,7 +2136,7 @@ def _build_invite_send_data(
             #                 `experiment_id_frozen_at: str | None`.
             "experiment_id": attrs.get("experiment_id"),
             "experiment_id_frozen_at": attrs.get("experiment_id_frozen_at"),
-            # PR-241 César RCA: origin timestamp for the Pattern-A recency
+            # PR-241 René RCA: origin timestamp for the Pattern-A recency
             # quarantine in pre_invite_check. Fall back to the list-entry
             # creation time when the forensic attr is absent.
             "prospect_committed_at": (

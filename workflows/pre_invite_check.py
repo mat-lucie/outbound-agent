@@ -181,7 +181,7 @@ def _check_experiment_id_immutability(
 STRICT_PRE_INVITE_DEGREE_CHECK_ENV = "STRICT_PRE_INVITE_DEGREE_CHECK"
 
 # ---------------------------------------------------------------------------
-# Pattern-A recency quarantine (PR-241 César RCA)
+# Pattern-A recency quarantine (PR-241 René RCA)
 # ---------------------------------------------------------------------------
 
 # A 1st-degree row that only became a prospect within this window is a
@@ -888,7 +888,7 @@ def _pre_invite_degree_check(
     still_to_invite: list[dict] = []
     already_connected: list[dict] = []
     failed_to_flip: list[dict] = []
-    # PR-241 César RCA: 1st-degree rows quarantined out of the Pattern-A flip
+    # PR-241 René RCA: 1st-degree rows quarantined out of the Pattern-A flip
     # because they only became prospects within PATTERN_A_QUARANTINE_DAYS
     # (suspected URL-variant duplicates). Surfaced in the summary.
     pattern_a_quarantined: list[dict] = []
@@ -914,7 +914,7 @@ def _pre_invite_degree_check(
         norm = _normalize_linkedin_url(row["linkedInUrl"])
         degree = degree_lookup.get(norm, "")
         if degree == "1st":
-            # Pattern-A recency quarantine (PR-241 César RCA). A 1st-degree row
+            # Pattern-A recency quarantine (PR-241 René RCA). A 1st-degree row
             # that only became a prospect within PATTERN_A_QUARANTINE_DAYS is a
             # suspected URL-variant duplicate — flipping it to ACCEPTED would
             # re-start a cadence on someone who already completed one. Skip

@@ -205,6 +205,39 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 # ---------------------------------------------------------------------------
+# PII deny-list — known upstream incident identities
+# ---------------------------------------------------------------------------
+# This repo is PUBLIC and CRM-agnostic. A prior port carried real prospect,
+# founder, and company identities from the private upstream into fixtures,
+# docstrings, and comments. Those were scrubbed to synthetic acme-style names;
+# this deny-list makes sure they can never silently reappear (a re-port, a
+# copy-paste from private notes, or a merge from an unscrubbed branch).
+#
+# Keep this list append-only and specific: add a name only when it is a real
+# person/company from an actual PII incident — never a generic English word.
+# Matching is whole-word and case-insensitive (accents count as word chars).
+#
+# NOTE: the repo LICENSE legitimately names the copyright holder (a real
+# person, "López-Therese") — it is exempted via EXCLUDED_FILES below rather
+# than by dropping the name here, so the guard still fires everywhere else.
+NAMES_DENYLIST = (
+    "césar", "cesar",               # César de la Garza (Sigma exec)
+    "garza",
+    "mariano", "rozada",            # Mariano Rozada (Molinos exec)
+    "molinos",
+    "sigma",                        # Sigma Alimentos
+    "therese",                      # López-Therese (founder surname)
+    "pepe",                         # nickname carried in a dedup fixture
+    "bachoco", "suzano", "canela",  # other real companies from private notes
+)
+
+for _name in NAMES_DENYLIST:
+    SECRET_PATTERNS.append((
+        f"PII: known upstream incident identity ({_name!r})",
+        re.compile(r'\b' + re.escape(_name) + r'\b', re.IGNORECASE),
+    ))
+
+# ---------------------------------------------------------------------------
 # File extensions to scan (source code, config, data)
 # ---------------------------------------------------------------------------
 SCAN_EXTENSIONS = {
@@ -229,6 +262,7 @@ EXCLUDED_FILES = {
     "scripts/check_no_secrets.py",          # this file
     "tests/test_no_secrets_gate.py",        # companion test (may plant examples)
     ".env.example",                          # empty placeholders
+    "LICENSE",                               # legitimately names the copyright holder
 }
 
 
