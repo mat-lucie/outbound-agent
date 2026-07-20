@@ -63,6 +63,32 @@ os.environ["OUTBOUND_CONFIG_DIR"] = str(_REPO_ROOT / "examples" / "acme" / "conf
 
 
 @pytest.fixture(autouse=True)
+def _isolate_run_provenance(monkeypatch):
+    """Pin the PR-228 checkout-staleness preflight to a current/clean stub.
+
+    ``assert_checkout_current`` (wired into the ``daily`` / ``send-dms`` /
+    ``weekly`` CLI entrypoints) runs real git against the developer's
+    checkout — including a network ``git fetch`` on wet paths. Without this
+    stub, every CLI-level wet test aborts with StaleCheckoutError whenever
+    the checkout happens to be behind origin/main (and dials the network
+    from inside the suite). Tests that exercise the preflight itself
+    (test_run_provenance.py) stack their own patch of
+    ``collect_run_provenance`` — or patch ``_git`` and call the real
+    function via their direct import, which this module-attr setattr does
+    not rebind.
+    """
+    from workflows import run_provenance
+
+    monkeypatch.setattr(
+        run_provenance, "collect_run_provenance",
+        lambda **kwargs: {
+            "sha": "testsha00000", "branch": "test",
+            "dirty": False, "behind_origin_main": False,
+        },
+    )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_anthropic_api_key(monkeypatch):
     """Guarantee no test ever hits the real Anthropic API.
 

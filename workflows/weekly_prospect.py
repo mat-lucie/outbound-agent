@@ -2121,6 +2121,7 @@ def run_weekly_prospecting(
     search_export_id: str,
     batch_size: int = 100,
     dry_run: bool = False,
+    code_provenance: dict | None = None,
 ) -> dict:
     """Execute the weekly prospecting workflow across all saved searches.
 
@@ -2134,6 +2135,10 @@ def run_weekly_prospecting(
         search_export_id: PhantomBuster agent ID for LinkedIn Search Export.
         batch_size: Max prospects to export per search.
         dry_run: If True, score but don't write to Attio or launch PhantomBuster.
+        code_provenance: Optional {sha, branch, dirty, behind_origin_main}
+            from workflows.run_provenance — stamped into every staged
+            borderline entry and the summary so a stale-code run is
+            detectable post-hoc (PR-228).
 
     Returns:
         Summary dict with counts.
@@ -2285,6 +2290,11 @@ def run_weekly_prospecting(
         borderline_path.parent.mkdir(parents=True, exist_ok=True)
         with borderline_path.open("w") as f:
             for entry in borderline_stage:
+                if code_provenance:
+                    # PR-228: each staged row records the code that scored it —
+                    # a stale-checkout run is otherwise only diagnosable by
+                    # forensic fingerprinting of these files.
+                    entry["code_version"] = code_provenance
                 f.write(json.dumps(entry) + "\n")
         click.echo(f"  Staged {len(borderline_stage)} borderlines → {borderline_path}")
 
@@ -2296,6 +2306,9 @@ def run_weekly_prospecting(
 
     # Summary
     click.echo("--- Weekly Prospecting Summary ---")
+    if code_provenance:
+        from workflows.run_provenance import format_provenance
+        click.echo(f"Code:       {format_provenance(code_provenance)}")
     click.echo(f"Searches:   {len(searches)}")
     click.echo(f"Exported:   {summary['exported']}")
     click.echo(f"Scored:     {summary['scored']}")
