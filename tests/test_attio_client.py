@@ -643,3 +643,61 @@ class TestSearchLimitTruncationGuard:
             side_effect=[self._page(2), self._page(1)],
         ), pytest.raises(AttioResultTruncated):
             attio.query_list_entries(list_id="l1", limit=2, fail_if_truncated=True)
+
+
+class TestRequestWithRetry:
+    """`request_with_retry` — bounded jittered retry around `_request` for
+    transient 5xx / connection errors (PR-259). 4xx propagate immediately."""
+
+    def test_returns_first_success(self, attio: AttioClient) -> None:
+        from clients.attio import request_with_retry
+        with patch.object(attio, "_request", return_value={"data": "ok"}) as mock_req:
+            assert request_with_retry(attio, "POST", "/x", json={}) == {"data": "ok"}
+        mock_req.assert_called_once()
+
+    def test_retries_5xx_then_succeeds(self, attio: AttioClient) -> None:
+        from clients.attio import request_with_retry
+        req = httpx.Request("POST", "https://api.attio.com/v2/x")
+        err = httpx.HTTPStatusError("500", request=req, response=httpx.Response(500, request=req))
+        with (
+            patch.object(attio, "_request", side_effect=[err, {"data": "ok"}]) as mock_req,
+            patch("clients.attio.time.sleep") as mock_sleep,
+        ):
+            assert request_with_retry(attio, "POST", "/x") == {"data": "ok"}
+        assert mock_req.call_count == 2
+        mock_sleep.assert_called_once()
+
+    def test_4xx_propagates_without_retry(self, attio: AttioClient) -> None:
+        from clients.attio import request_with_retry
+        req = httpx.Request("POST", "https://api.attio.com/v2/x")
+        err = httpx.HTTPStatusError("400", request=req, response=httpx.Response(400, request=req))
+        with (
+            patch.object(attio, "_request", side_effect=err) as mock_req,
+            pytest.raises(httpx.HTTPStatusError),
+        ):
+            request_with_retry(attio, "POST", "/x")
+        mock_req.assert_called_once()
+
+    def test_recheck_short_circuits_before_retry(self, attio: AttioClient) -> None:
+        from clients.attio import request_with_retry
+        req = httpx.Request("POST", "https://api.attio.com/v2/x")
+        err = httpx.HTTPStatusError("500", request=req, response=httpx.Response(500, request=req))
+        # First attempt 500s; the recheck finds the landed row → no re-POST.
+        with (
+            patch.object(attio, "_request", side_effect=err) as mock_req,
+            patch("clients.attio.time.sleep"),
+        ):
+            result = request_with_retry(
+                attio, "POST", "/x", recheck=lambda: {"data": "landed"},
+            )
+        assert result == {"data": "landed"}
+        mock_req.assert_called_once()  # never re-issued the write
+
+    def test_transport_error_retried(self, attio: AttioClient) -> None:
+        from clients.attio import request_with_retry
+        err = httpx.ConnectError("boom")
+        with (
+            patch.object(attio, "_request", side_effect=[err, {"data": "ok"}]),
+            patch("clients.attio.time.sleep"),
+        ):
+            assert request_with_retry(attio, "POST", "/x") == {"data": "ok"}

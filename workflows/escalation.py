@@ -60,6 +60,9 @@ import typing
 from datetime import UTC, date, datetime
 from typing import Any
 
+import httpx
+
+from clients.attio import request_with_retry
 from clients.crm.attio_provider import AttioProvider
 from clients.crm.base import CRMProvider
 from workflows.escalation_schemas import (
@@ -307,6 +310,21 @@ def escalate(
     )
 
 
+def _inner_attio(crm: CRMProvider) -> AttioClient | None:
+    """The inner :class:`AttioClient` when ``crm`` is Attio-backed, else None.
+
+    PR-259 routes the operator_review_queue transport writes through
+    ``request_with_retry`` over the raw client so a transient 500 (which the
+    generic provider methods do NOT retry — a create's 500 is ambiguous) no
+    longer crashes the run. This is a scoped transport-semantics escape hatch
+    (see clients/crm/CONTRACT.md); a non-Attio provider returns None and keeps
+    the vendor-neutral generic path.
+    """
+    if isinstance(crm, AttioProvider):
+        return crm.inner_client
+    return None
+
+
 def _find_existing_row(crm: CRMProvider, lookup_key: str) -> dict | None:
     """Look up an existing queue row by its uniqueness_key text attribute.
 
@@ -317,13 +335,25 @@ def _find_existing_row(crm: CRMProvider, lookup_key: str) -> dict | None:
     queue ever grows past ~10k open rows, a follow-up should add a
     composite-key custom object or move the dedup to a local SQLite cache.
     """
-    # P1c-5: query via the vendor-neutral generic object-record API.
-    # Operator Review Queue is a custom object; `query_object_records`
-    # builds the same `{"filter": ..., "limit": 1}` body the raw call used
-    # and passes the filter through as Attio's native query body (the
-    # documented filter-shape leak). Return the UNTOUCHED vendor payload
-    # (``Record.raw``) so the existing-row identity + `["values"]` indexing
-    # the F-PR-3 contract relies on are byte-for-byte preserved.
+    # PR-259: transient Attio 500s on the operator_review_queue query crashed
+    # the daily run mid-Part-A. When the CRM is Attio-backed, route the read
+    # through `request_with_retry` over the inner transport (retried reads are
+    # trivially safe — no recheck needed). Non-Attio providers keep the
+    # vendor-neutral generic path (their adapter owns its own transient
+    # handling). Either way the UNTOUCHED vendor row is returned so the F-PR-3
+    # `["values"]` indexing + existing-row identity are byte-for-byte preserved.
+    inner = _inner_attio(crm)
+    if inner is not None:
+        body = {
+            "filter": {"uniqueness_key": {"$eq": lookup_key}},
+            "limit": 1,
+        }
+        data = request_with_retry(
+            inner, "POST",
+            f"/objects/{OPERATOR_REVIEW_QUEUE_SLUG}/records/query", json=body,
+        )
+        records = data.get("data", [])
+        return records[0] if records else None
     records = crm.query_object_records(
         OPERATOR_REVIEW_QUEUE_SLUG,
         filters={"uniqueness_key": {"$eq": lookup_key}},
@@ -359,24 +389,52 @@ def _create_row(
     if deadline is not None:
         attrs["deadline"] = deadline.isoformat()
 
-    # P1c-6b: open the row through the CRM seam. The READ side
-    # (`_find_existing_row`) migrated onto `query_object_records` at P1c-5;
-    # the CREATE side now follows onto `create_object_record`, completing the
-    # operator-review-queue migration. The inner-client escape hatch is gone
-    # from this module.
-    #
-    # Behavior preservation: `create_object_record` issues the SAME
-    # `POST /objects/<slug>/records {"data": {"values": attrs}}` body via the
-    # inner `_request` (identical retry / transport) the pre-6b `_create_row`
-    # did, then normalizes the response via `_to_record`. We return
-    # `record.raw` — the UNTOUCHED vendor payload — so for the well-formed
-    # dict body that every escalate caller (and the F-PR-3 contract's
-    # `["values"]` indexing / existing-row identity) relies on, the return is
-    # byte-for-byte identical to the pre-6b `data.get("data", data)`.
-    # `_to_record` was hardened at 6a to tolerate empty / non-dict / malformed
-    # create bodies without raising (e.g. detect-responses doubles that stub
-    # `_request` → `{"data": []}`): such a body degrades to `record.raw == {}`
-    # where the pre-6b code returned `[]`. That divergence is unobservable —
-    # no escalate caller or test reads the create return as a list — and no
-    # full-suite test exercises this degenerate create path (3318 still pass).
-    return crm.create_object_record(OPERATOR_REVIEW_QUEUE_SLUG, attrs).raw
+    body = {"data": {"values": attrs}}
+
+    # PR-259: bounded jittered retry on transient 5xx/connection errors for the
+    # Attio-backed create. The generic `create_object_record` retries
+    # 429/502/503 via `_request` but NOT 500 (a create's 500 is ambiguous — the
+    # write may have committed), so a transient 500 crashed the run mid-Part-A.
+    # The recheck below makes the retried create idempotent in effect: if the
+    # failed POST landed, the uniqueness_key probe returns the existing row
+    # instead of re-creating it (uniqueness_key has no server-side unique
+    # constraint). Non-Attio providers keep the vendor-neutral generic path.
+    inner = _inner_attio(crm)
+    if inner is None:
+        return crm.create_object_record(OPERATOR_REVIEW_QUEUE_SLUG, attrs).raw
+
+    def _landed_row() -> dict | None:
+        """Did a lost-response POST actually commit server-side?
+
+        A 500/timeout on the create is ambiguous — Attio may have written the
+        row before the response was lost, and `uniqueness_key` is a plain text
+        attribute with NO server-side unique constraint, so blindly re-POSTing
+        would duplicate it. Probe by uniqueness_key before each retry. Single
+        non-retried request: under a hard outage the probe fails fast and the
+        create retry proceeds (duplicate risk accepted only in that corner — an
+        operator annoyance, not a §3.1 violation).
+        """
+        probe_body = {
+            "filter": {"uniqueness_key": {"$eq": attrs["uniqueness_key"]}},
+            "limit": 1,
+        }
+        try:
+            probe = inner._request(
+                "POST",
+                f"/objects/{OPERATOR_REVIEW_QUEUE_SLUG}/records/query",
+                retries=1,
+                json=probe_body,
+            )
+        except (httpx.HTTPStatusError, httpx.TransportError):
+            return None
+        records = probe.get("data", [])
+        return {"data": records[0]} if records else None
+
+    data = request_with_retry(
+        inner,
+        "POST",
+        f"/objects/{OPERATOR_REVIEW_QUEUE_SLUG}/records",
+        recheck=_landed_row,
+        json=body,
+    )
+    return data.get("data", data)

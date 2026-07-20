@@ -2,6 +2,7 @@
 
 import logging
 import os
+import random
 import time
 from collections.abc import Callable
 from typing import Any
@@ -12,6 +13,83 @@ import httpx
 from models.pipeline import STAGE_RANK, PipelineStage
 
 logger = logging.getLogger(__name__)
+
+
+# request_with_retry backoff shape: min(BASE * 2^attempt, MAX) scaled by a
+# uniform jitter factor in [0.5, 1.5) — so an individual sleep can reach
+# 1.5 × _RETRY_MAX_WAIT. Jitter survives the cap on purpose (no thundering herd
+# of synchronized retries against an already-struggling Attio).
+_RETRY_BASE_WAIT = 1.0
+_RETRY_MAX_WAIT = 30.0
+
+
+def request_with_retry(
+    attio: "AttioClient",
+    method: str,
+    path: str,
+    *,
+    attempts: int = 5,
+    recheck: Callable[[], dict | None] | None = None,
+    **kwargs,
+) -> dict:
+    """Bounded jittered-exponential retry around ``attio._request``.
+
+    ``_request`` already retries 429/502/503 and connection errors internally,
+    but a transient **500** raises on the first attempt (unless a caller opts
+    into ``retry_500`` — the operator_review_queue writes deliberately do NOT,
+    they route through this wrapper instead so the recheck below can guard the
+    non-idempotent create). That class crashed the daily run mid-Part-A three
+    times on operator_review_queue writes (PR-259), each time before any
+    invites were sent, forcing full re-runs. This wrapper covers 500s and also
+    survives ``_request`` exhausting its own inner retries.
+
+    Retries ONLY on transient failure classes:
+      - ``httpx.HTTPStatusError`` with a 5xx status
+      - ``httpx.TransportError`` (connection/read/timeout errors)
+    4xx and non-httpx exceptions propagate immediately — retrying a caller bug
+    can't fix it and would mask it.
+
+    ``recheck``: optional zero-arg callable invoked before each RETRY (never
+    before the first attempt). If it returns a non-None dict, that value is
+    returned instead of re-issuing the request. This is the safety valve for
+    non-idempotent writes: a create whose response was lost to a 500/timeout
+    may still have committed server-side, and blindly re-POSTing would
+    duplicate it — the recheck lets the caller probe for the landed write first
+    (escalation._create_row passes a uniqueness_key lookup).
+
+    Module-level rather than a method deliberately: escalation tests drive a
+    bare ``MagicMock()`` client, which would silently auto-mock a
+    ``request_with_retry`` METHOD (returning a MagicMock, bypassing the retry
+    logic and ``_request`` entirely). As a free function the real retry loop
+    always runs, exercised against the mocked ``_request``.
+    """
+    if attempts < 1:
+        raise ValueError(f"attempts must be >= 1, got {attempts}")
+    for attempt in range(attempts):
+        if attempt and recheck is not None:
+            found = recheck()
+            if found is not None:
+                return found
+        try:
+            return attio._request(method, path, **kwargs)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500 or attempt == attempts - 1:
+                raise
+            status = str(exc.response.status_code)
+        except httpx.TransportError as exc:
+            if attempt == attempts - 1:
+                raise
+            status = type(exc).__name__
+        wait = min(_RETRY_BASE_WAIT * (2 ** attempt), _RETRY_MAX_WAIT) * (
+            0.5 + random.random()
+        )
+        logger.warning(
+            "request_with_retry: %s %s failed with %s "
+            "(attempt %d/%d) — retrying in %.1fs",
+            method, path, status, attempt + 1, attempts, wait,
+        )
+        time.sleep(wait)
+    raise AssertionError("unreachable: loop always returns or raises")
 
 
 class AttioResultTruncated(RuntimeError):
