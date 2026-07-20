@@ -73,6 +73,128 @@ class TestDeleteListEntry:
             assert attio.delete_list_entry("missing", list_id="list-xyz") is False
 
 
+def _response(status: int, json_body: dict | None = None) -> httpx.Response:
+    request = httpx.Request("POST", "https://api.attio.com/v2/x")
+    return httpx.Response(
+        status, request=request,
+        json=json_body if json_body is not None else {"data": []},
+    )
+
+
+class TestRequest500Retry:
+    """Opt-in 500 retry (PR-256 weekly-finalize crash loop).
+
+    500 stays fatal by default: on a non-idempotent POST (note/record create)
+    the write may have committed server-side, so a blanket retry risks
+    double-writes. Idempotent call sites opt in via retry_500=True.
+    """
+
+    def test_500_fatal_by_default(self, attio: AttioClient) -> None:
+        with (
+            patch.object(attio._client, "request", return_value=_response(500)) as mock_req,
+            pytest.raises(httpx.HTTPStatusError),
+        ):
+            attio._request("POST", "/objects/people/records", json={})
+        mock_req.assert_called_once()
+
+    def test_500_retried_when_opted_in(self, attio: AttioClient) -> None:
+        responses = [_response(500), _response(200, {"data": [{"id": "r1"}]})]
+        with patch.object(attio._client, "request", side_effect=responses) as mock_req, \
+                patch("clients.attio.time.sleep") as mock_sleep:
+            data = attio._request("POST", "/objects/people/records/query", json={}, retry_500=True)
+        assert data == {"data": [{"id": "r1"}]}
+        assert mock_req.call_count == 2
+        mock_sleep.assert_called_once()
+
+    def test_500_raises_after_retries_exhausted(self, attio: AttioClient) -> None:
+        with (
+            patch.object(attio._client, "request", return_value=_response(500)) as mock_req,
+            patch("clients.attio.time.sleep"),
+            pytest.raises(httpx.HTTPStatusError),
+        ):
+            attio._request("POST", "/x", retries=3, retry_500=True)
+        assert mock_req.call_count == 3
+
+    def test_502_still_retried_by_default(self, attio: AttioClient) -> None:
+        responses = [_response(502), _response(200, {"data": []})]
+        with patch.object(attio._client, "request", side_effect=responses) as mock_req, \
+                patch("clients.attio.time.sleep"):
+            data = attio._request("POST", "/x")
+        assert data == {"data": []}
+        assert mock_req.call_count == 2
+
+    def test_query_paginated_survives_transient_500(self, attio: AttioClient) -> None:
+        responses = [_response(500), _response(200, {"data": [{"id": "r1"}]})]
+        with patch.object(attio._client, "request", side_effect=responses), \
+                patch("clients.attio.time.sleep"):
+            records = attio._query_paginated("/objects/people/records/query", None, limit=10)
+        assert records == [{"id": "r1"}]
+
+    def test_create_person_500_stays_fatal(self, attio: AttioClient) -> None:
+        with (
+            patch.object(attio._client, "request", return_value=_response(500)) as mock_req,
+            pytest.raises(httpx.HTTPStatusError),
+        ):
+            attio.create_person({"name": "X"})
+        mock_req.assert_called_once()
+
+    def test_no_sleep_after_final_attempt(self, attio: AttioClient) -> None:
+        with (
+            patch.object(attio._client, "request", return_value=_response(500)),
+            patch("clients.attio.time.sleep") as mock_sleep,
+            pytest.raises(httpx.HTTPStatusError),
+        ):
+            attio._request("POST", "/x", retries=3, retry_500=True)
+        assert mock_sleep.call_count == 2  # sleeps between attempts, not before the raise
+
+    # Pin the per-method opt-ins: a future edit dropping retry_500=True from one
+    # of these silently regresses the PR-256 crash-loop fix while the suite
+    # stays green.
+    def test_get_person_retries_500_by_default(self, attio: AttioClient) -> None:
+        responses = [_response(500), _response(200, {"data": {"id": "p1"}})]
+        with patch.object(attio._client, "request", side_effect=responses) as mock_req, \
+                patch("clients.attio.time.sleep"):
+            assert attio.get_person("p1") == {"id": "p1"}
+        assert mock_req.call_count == 2
+
+    def test_get_person_opt_out_fails_fast(self, attio: AttioClient) -> None:
+        with (
+            patch.object(attio._client, "request", return_value=_response(500)) as mock_req,
+            pytest.raises(httpx.HTTPStatusError),
+        ):
+            attio.get_person("p1", retry_500=False)
+        mock_req.assert_called_once()
+
+    def test_bulk_fetch_fails_fast_on_systemic_500(self, attio: AttioClient) -> None:
+        with patch.object(attio._client, "request", return_value=_response(500)) as mock_req, \
+                patch("clients.attio.time.sleep") as mock_sleep:
+            result = attio.bulk_fetch_persons_by_record_ids({"p1", "p2"}, max_workers=2)
+        assert result == {}  # fail-open: records dropped, not raised
+        assert mock_req.call_count == 2  # one attempt per record, no retries
+        mock_sleep.assert_not_called()
+
+    def test_get_company_retries_500(self, attio: AttioClient) -> None:
+        responses = [_response(500), _response(200, {"data": {"id": "c1"}})]
+        with patch.object(attio._client, "request", side_effect=responses) as mock_req, \
+                patch("clients.attio.time.sleep"):
+            assert attio.get_company("c1") == {"id": "c1"}
+        assert mock_req.call_count == 2
+
+    def test_update_person_retries_500(self, attio: AttioClient) -> None:
+        responses = [_response(500), _response(200, {"data": {"id": "p1"}})]
+        with patch.object(attio._client, "request", side_effect=responses) as mock_req, \
+                patch("clients.attio.time.sleep"):
+            assert attio.update_person("p1", {"name": "X"}) == {"id": "p1"}
+        assert mock_req.call_count == 2
+
+    def test_native_put_upsert_retries_500(self, attio: AttioClient) -> None:
+        responses = [_response(500), _response(200, {"data": {"id": "p1"}})]
+        with patch.object(attio._client, "request", side_effect=responses) as mock_req, \
+                patch("clients.attio.time.sleep"):
+            assert attio.upsert_person("email_addresses", {"email_addresses": "x@y.z"}) == {"id": "p1"}
+        assert mock_req.call_count == 2
+
+
 class TestLinkedInUrlCanonicalization:
     """URL-encoded, www, and trailing-slash variants all collapse to one form.
 
@@ -440,7 +562,7 @@ class TestBulkFetchPersonsByRecordIds:
             "rec-2": {"id": {"record_id": "rec-2"}, "values": {"name": [{"full_name": "B"}]}},
             "rec-3": {"id": {"record_id": "rec-3"}, "values": {"name": [{"full_name": "C"}]}},
         }
-        with patch.object(attio, "get_person", side_effect=lambda rid: people_by_id.get(rid)) as mock_get:
+        with patch.object(attio, "get_person", side_effect=lambda rid, **kw: people_by_id.get(rid)) as mock_get:
             result = attio.bulk_fetch_persons_by_record_ids({"rec-1", "rec-3"})
 
         # Each requested id triggers one get_person call.
@@ -461,7 +583,7 @@ class TestBulkFetchPersonsByRecordIds:
         """If get_person returns None for a record (404 / deleted), the dict
         simply omits it. Phase code falls back to per-record GETs for cache
         misses, so a missing record self-heals."""
-        def fake_get(rid: str):
+        def fake_get(rid: str, **kw):
             return {"id": {"record_id": "rec-1"}, "values": {}} if rid == "rec-1" else None
 
         with patch.object(attio, "get_person", side_effect=fake_get):

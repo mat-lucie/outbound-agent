@@ -285,13 +285,27 @@ class AttioClient:
         """
         return self._field_mapping.get(engine_field, engine_field)
 
-    def _request(self, method: str, path: str, retries: int = 3, **kwargs) -> dict:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        retries: int = 3,
+        *,
+        retry_500: bool = False,
+        **kwargs,
+    ) -> dict:
+        # retry_500 is OPT-IN and only for idempotent call sites (reads,
+        # linkedin-keyed assert upserts): Attio 500s are transient in practice
+        # (PR-256 weekly-finalize crash loop), but a 500 on a non-idempotent
+        # POST (note/record create) may have committed server-side, so blanket
+        # retry would risk double-writes.
+        retryable = (429, 500, 502, 503) if retry_500 else (429, 502, 503)
         for attempt in range(retries):
             try:
                 resp = self._client.request(method, path, **kwargs)
-                if resp.status_code in (429, 502, 503):
-                    wait = 2 ** attempt * 5
-                    time.sleep(wait)
+                if resp.status_code in retryable:
+                    if attempt < retries - 1:
+                        time.sleep(2 ** attempt * 5)
                     continue
                 resp.raise_for_status()
                 return resp.json() if resp.content else {}
@@ -332,7 +346,7 @@ class AttioClient:
             body: dict = {"limit": page_size, "offset": offset}
             if filter_:
                 body["filter"] = filter_
-            data = self._request("POST", path, json=body)
+            data = self._request("POST", path, json=body, retry_500=True)
             records = data.get("data", [])
             all_records.extend(records)
             if len(records) < page_size:
@@ -351,7 +365,7 @@ class AttioClient:
                 body = {"limit": page_size, "offset": offset}
                 if filter_:
                     body["filter"] = filter_
-                probe = self._request("POST", path, json=body)
+                probe = self._request("POST", path, json=body, retry_500=True)
                 truncated = bool(probe.get("data", []))
             if truncated:
                 raise AttioResultTruncated(
@@ -374,10 +388,15 @@ class AttioClient:
             fail_if_truncated=fail_if_truncated,
         )
 
-    def get_person(self, record_id: str) -> dict | None:
-        """Get a person record by its record ID. Returns None if not found."""
+    def get_person(self, record_id: str, *, retry_500: bool = True) -> dict | None:
+        """Get a person record by its record ID. Returns None if not found.
+
+        ``retry_500=False`` opts back out of transient-500 retry — the
+        fail-open bulk fetch uses it so a systemic Attio outage fails fast per
+        record instead of blocking hours in backoff sleeps.
+        """
         try:
-            data = self._request("GET", f"/objects/people/records/{record_id}")
+            data = self._request("GET", f"/objects/people/records/{record_id}", retry_500=retry_500)
             return data.get("data", data)
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
@@ -410,7 +429,13 @@ class AttioClient:
             metrics.bulk_fetch_records_requested += len(ids)
         result: dict[str, dict] = {}
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_to_id = {pool.submit(self.get_person, rid): rid for rid in ids}
+            # retry_500=False: this path is fail-open per record, so under a
+            # systemic 500 outage retrying would burn the full backoff budget
+            # per record (hours across a weekly sweep) and still end in the
+            # same degraded result — fail fast and let the metrics surface it.
+            future_to_id = {
+                pool.submit(self.get_person, rid, retry_500=False): rid for rid in ids
+            }
             for future in as_completed(future_to_id):
                 rid = future_to_id[future]
                 try:
@@ -469,7 +494,8 @@ class AttioClient:
 
     def update_person(self, record_id: str, attributes: dict) -> dict:
         """Update an existing person record."""
-        data = self._request("PATCH", f"/objects/people/records/{record_id}", json={"data": {"values": attributes}})
+        # Same-values PATCH is idempotent — safe to retry a transient 500.
+        data = self._request("PATCH", f"/objects/people/records/{record_id}", json={"data": {"values": attributes}}, retry_500=True)
         return data.get("data", {})
 
     def upsert_person(self, matching_attribute: str, attributes: dict) -> dict:
@@ -501,11 +527,13 @@ class AttioClient:
                     return self.update_person(record_id, attributes)
             return self.create_person(attributes)
         # Fallback: use the native PUT upsert for truly unique attributes (email, record_id)
+        # The native upsert is assert-by-key (idempotent) — safe to retry a 500.
         data = self._request(
             "PUT",
             "/objects/people/records",
             params={"matching_attribute": matching_attribute},
             json={"data": {"values": attributes}},
+            retry_500=True,
         )
         return data.get("data", {})
 
@@ -548,7 +576,7 @@ class AttioClient:
     def get_company(self, record_id: str) -> dict | None:
         """Get a company record by its record ID. Returns None if not found."""
         try:
-            data = self._request("GET", f"/objects/companies/records/{record_id}")
+            data = self._request("GET", f"/objects/companies/records/{record_id}", retry_500=True)
             return data.get("data", data)
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:

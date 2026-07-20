@@ -115,7 +115,7 @@ class TestBulkFetchPerRecordIsolation:
 
         attio = AttioClient.__new__(AttioClient)
 
-        def _get_person(rid: str):
+        def _get_person(rid: str, **kw):
             if rid == "boom":
                 request = httpx.Request("GET", "https://api.attio.test/x")
                 response = httpx.Response(503, request=request)
@@ -141,7 +141,7 @@ class TestBulkFetchPerRecordIsolation:
 
         attio = AttioClient.__new__(AttioClient)
 
-        def _get_person(rid: str):
+        def _get_person(rid: str, **kw):
             raise ValueError("programmer error — should propagate")
 
         attio.get_person = _get_person  # type: ignore[method-assign]
@@ -153,7 +153,7 @@ class TestBulkFetchPerRecordIsolation:
         from clients.attio import AttioClient
 
         attio = AttioClient.__new__(AttioClient)
-        attio.get_person = lambda rid: {"id": {"record_id": rid}, "values": {}}  # type: ignore[method-assign]
+        attio.get_person = lambda rid, **kw: {"id": {"record_id": rid}, "values": {}}  # type: ignore[method-assign]
 
         result = attio.bulk_fetch_persons_by_record_ids(
             {"r1", "r2", "r3"}, max_workers=2,
@@ -166,7 +166,7 @@ class TestBulkFetchPerRecordIsolation:
         from clients.attio import AttioClient
 
         attio = AttioClient.__new__(AttioClient)
-        attio.get_person = lambda rid: None if rid == "missing" else {  # type: ignore[method-assign]
+        attio.get_person = lambda rid, **kw: None if rid == "missing" else {  # type: ignore[method-assign]
             "id": {"record_id": rid}, "values": {},
         }
 
@@ -179,7 +179,7 @@ class TestBulkFetchPerRecordIsolation:
         from clients.attio import AttioClient
 
         attio = AttioClient.__new__(AttioClient)
-        attio.get_person = lambda rid: {"id": {"record_id": rid}, "values": {}}  # type: ignore[method-assign]
+        attio.get_person = lambda rid, **kw: {"id": {"record_id": rid}, "values": {}}  # type: ignore[method-assign]
 
         assert attio.bulk_fetch_persons_by_record_ids(set()) == {}
 
@@ -194,7 +194,7 @@ class TestBulkFetchPerRecordIsolation:
 
         attio = AttioClient.__new__(AttioClient)
 
-        def _get_person(rid: str):
+        def _get_person(rid: str, **kw):
             if rid == "boom":
                 request = httpx.Request("GET", "https://api.attio.test/x")
                 response = httpx.Response(503, request=request)
