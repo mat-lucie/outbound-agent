@@ -152,13 +152,14 @@ def cli():
 @click.option("--sales-nav-profile-scraper-id", default=lambda: load_pb_config().sales_nav_profile_scraper_id or None, help="PhantomBuster Sales Navigator Profile Scraper agent ID, sales_nav backend (the default) (default: config/phantombuster.yaml → PB_SALES_NAV_PROFILE_SCRAPER_ID)")
 @click.option("--inbox-scraper-id", default=lambda: load_pb_config().inbox_scraper_id or None, help="PhantomBuster Inbox Scraper agent ID (default: config/phantombuster.yaml → PB_INBOX_SCRAPER_ID)")
 @click.option("--skip-dms", is_flag=True, help="Skip Part B DM sequencing (connections only)")
+@click.option("--skip-followups", is_flag=True, help="Skip Phase C (warm follow-up radar). Phase C is read-only detection; it never sends. Fails-closed-clean when the radar schema is absent, so a schemaless install runs it as a no-op regardless.")
 @click.option("--force-weekend", is_flag=True, help="Override the Mon-Fri-only outreach rule")
 @click.option(
     "--allow-stale", is_flag=True,
     help="Proceed with a wet run even when the checkout is behind origin/main "
          "(the staleness is still stamped into the run's provenance).",
 )
-def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profile_scraper_id, sales_nav_profile_scraper_id, inbox_scraper_id, skip_dms, force_weekend, allow_stale):
+def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profile_scraper_id, sales_nav_profile_scraper_id, inbox_scraper_id, skip_dms, skip_followups, force_weekend, allow_stale):
     """Daily check: send connections, queue DMs, detect responses."""
     from clients.phantombuster import PhantomBusterClient
     from models.business_calendar import is_send_day, operator_today
@@ -719,6 +720,37 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                     total_dms = dm_result.get("dm1", 0) + dm_result.get("dm2", 0) + dm_result.get("dm3", 0)
                     click.echo(f"DMs sent: {total_dms}")
                     click.echo(f"Code: {format_provenance(code_provenance)}")
+
+                    # Phase C: warm follow-up radar (read-only detection, PR-211).
+                    # STRICTLY downstream of Phase A/B and fully isolated: any
+                    # failure here degrades to a WARN and never fails invites/DMs
+                    # or the daily run's exit code. Fails-closed-clean on a
+                    # schemaless install (the engine's schema probes degrade to a
+                    # digest, never crash), so the radar is inert until the
+                    # operator provisions its attributes (--feature radar). The
+                    # skill layer turns this digest into drafts — the CLI only
+                    # surfaces it.
+                    if not skip_followups:
+                        click.echo("\n--- Phase C: Follow-up Radar ---")
+                        try:
+                            from workflows.followup_radar import run_followup_radar
+                            fu = run_followup_radar(crm, today=today)
+                            click.echo(fu["digest"])
+                            click.echo(
+                                f"  ({fu['surfaced']} surfaced"
+                                f"{_followup_lane_counts(fu)})"
+                            )
+                        except Exception as exc:  # noqa: BLE001 — never break the daily run
+                            import traceback
+                            # Swallow the control flow (Phase C must not fail
+                            # A/B) but NOT the diagnostics — a bare type+message
+                            # is undebuggable when the failure is 3 calls deep.
+                            click.echo(
+                                f"  ⚠ Phase C (follow-up radar) errored and was "
+                                f"skipped: {type(exc).__name__}: {exc}\n"
+                                f"{traceback.format_exc()}",
+                                err=True,
+                            )
             except MalformedDailyRunRow as exc:
                 # The pre-open same-day scan (multi-row incident guard)
                 # fails closed on a prior row with a corrupt counter.
@@ -2577,6 +2609,70 @@ def sales_finalize_borderline_cmd(ctx, batch: str, dry_run: bool) -> None:
     )
     if out["finalize_result"] is not None:
         click.echo(f"finalize_result: {out['finalize_result']}")
+
+
+# ── Follow-up Radar (Phase C) ──────────────────────────────────────────────
+def _followup_lane_counts(summary: dict) -> str:
+    """Lane-count suffix for the radar footer, mirroring render_digest's
+    split-count convention: partner → owed → waiting → LinkedIn-warm → nudge,
+    with zero-count lanes omitted so an empty lane doesn't add noise."""
+    parts = []
+    if summary["partner"]:
+        parts.append(f"{summary['partner']} partner intro")
+    if summary["owed"]:
+        parts.append(f"{summary['owed']} owed")
+    if summary.get("waiting"):
+        parts.append(f"{summary['waiting']} waiting")
+    if summary["linkedin_warm"]:
+        parts.append(f"{summary['linkedin_warm']} LinkedIn-warm")
+    if summary["nudge"]:
+        parts.append(f"{summary['nudge']} nudge")
+    return "".join(f" · {p}" for p in parts)
+
+
+@cli.command("followup")
+@click.option("--dry-run", is_flag=True, help="No effect on this command — detection is read-only; kept for interface parity with the daily run.")
+@click.option("--limit", type=int, default=0, help="Cap the number of surfaced candidates (0 = all). The skill layer drafts for the top-N; keep this small when drafting.")
+@click.option("--json", "json_out", is_flag=True, help="Emit the candidate list as JSON for the skill layer to consume (in addition to the human digest).")
+@click.option("--full", is_flag=True, help="Show the entire Nudge lane instead of a top-3 preview.")
+def followup_cmd(dry_run, limit, json_out, full):
+    """Follow-up Radar: detect warm-but-stale accounts and render a ranked digest.
+
+    Read-only. Detects accounts that engaged (replied, call booked, demo'd,
+    open deal) then went quiet, ranks them Owed-first, and prints a digest.
+    The skill layer (Phase C) consumes ``--json`` to verify last-touch and
+    draft follow-ups; this command never sends or writes. Fails-closed-clean
+    when the radar schema is absent (the engine degrades to an inert digest),
+    so a schemaless install runs it as a no-op.
+    """
+    import json as _json
+
+    from workflows.followup_radar import run_followup_radar
+
+    click.echo("=== Follow-up Radar ===\n")
+    # Standalone diagnostic command: unlike Phase C (firewalled inside the
+    # daily run), a bad ATTIO_LIST_ID or a CRM outage here should print a
+    # clean error and exit 1 rather than dump a raw traceback at the operator.
+    try:
+        with _crm_provider() as crm:
+            summary = run_followup_radar(crm, limit=(limit or None), full=full)
+    except Exception as exc:  # noqa: BLE001 — operator-facing diagnostic
+        import traceback
+        click.echo(
+            f"ERROR: follow-up radar failed: {type(exc).__name__}: {exc}\n"
+            f"{traceback.format_exc()}",
+            err=True,
+        )
+        raise SystemExit(1) from exc
+
+    click.echo(summary["digest"])
+    click.echo(
+        f"\n({summary['surfaced']} of {summary['total']} surfaced"
+        f"{_followup_lane_counts(summary)})"
+    )
+    if json_out:
+        click.echo("\n--- candidates (json) ---")
+        click.echo(_json.dumps(summary["candidates"], indent=2))
 
 
 if __name__ == "__main__":
