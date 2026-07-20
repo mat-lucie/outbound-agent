@@ -218,15 +218,15 @@ def _normalize_person_name(name: str) -> str:
     """Normalize a person name for the name+company duplicate gate.
 
     URL-keyed dedup can't catch a re-created prospect under a different
-    LinkedIn vanity slug (same human, new URL — the PR-241 César case).
+    LinkedIn vanity slug (same human, new URL — the PR-241 René case).
     This normalizer feeds the secondary name+company gate so those get caught.
 
     Steps:
       1. Strip anything after a SPACE-ANCHORED decorative separator (" - ",
-         " | ") — LinkedIn names carry a title/company suffix ("César - CEO",
-         "César | Sigma"). Separators are space-anchored so a compound surname
-         ("López-Therese") and a parenthetical nickname ("César (Pepe) de la
-         Garza") are NOT truncated.
+         " | ") — LinkedIn names carry a title/company suffix ("René - CEO",
+         "René | Acme Foods"). Separators are space-anchored so a compound surname
+         ("Núñez-Vidal") and a parenthetical nickname ("René (Beto) de la
+         Cruz") are NOT truncated.
       2. Diacritic fold + lowercase + whitespace collapse — delegated to
          `identity_match.normalize_for_match`, the canonical accent-fold for
          this codebase, so this does not add yet another near-duplicate
@@ -257,8 +257,8 @@ def _build_name_index(crm: CRMProvider, existing_entries: list[Entry]) -> NameIn
 
     Why a LOCAL index and not a live search (empirically verified upstream):
     Attio's `search_people(name $contains ...)` is accent-SENSITIVE, so a
-    suffixed ASCII needle ("Mariano Rozada - Managing Director") does NOT match
-    the stored accented "Mariano Rozada" — the exact suffix/accent variant this
+    suffixed ASCII needle ("Sam Rivera - Managing Director") does NOT match
+    the stored accented "Sam Rivera" — the exact suffix/accent variant this
     gate exists to catch. Applying `_normalize_person_name` to BOTH sides at
     build time bridges accents AND suffixes by construction, and the per-
     candidate check becomes an O(1) dict lookup with no network call.
@@ -276,10 +276,12 @@ def _build_name_index(crm: CRMProvider, existing_entries: list[Entry]) -> NameIn
     if not record_ids:
         return index
     persons = crm.bulk_fetch_persons(record_ids)
+    extract_failures = 0
     for rid, record in persons.items():
         try:
             info = crm.extract_person_info(record)
         except Exception as exc:  # noqa: BLE001 — degrade open, skip this record
+            extract_failures += 1
             logger.warning(
                 "name_index: could not extract info for record_id=%r (%s: %s) "
                 "— left out of the dedup gate",
@@ -291,6 +293,18 @@ def _build_name_index(crm: CRMProvider, existing_entries: list[Entry]) -> NameIn
             continue
         canonical = _canonical_linkedin_url(info.linkedin_url) if info.linkedin_url else ""
         index.setdefault(norm_name, []).append((rid, canonical, info.company or ""))
+    # Aggregate alarm for PARTIAL systemic degradation: the per-record warnings
+    # above scatter, and the "index empty" alarm below only fires on TOTAL
+    # emptiness. A non-trivial fraction of records silently dropped still
+    # weakens the dedup gate (each dropped record can't be a dedup hit), so
+    # surface the count once as a single summary line.
+    if extract_failures:
+        logger.warning(
+            "name_index: %d of %d fetched record(s) skipped on "
+            "extract_person_info failure — the name+company dedup gate is "
+            "weaker this run (each skipped record can't be a dedup hit)",
+            extract_failures, len(persons),
+        )
     if existing_entries and not index:
         logger.warning(
             "name_index empty: %d entries scanned, 0 resolved to a person "
@@ -2018,7 +2032,7 @@ def _process_prospects(
                 })
             continue
 
-        # Secondary dedup gate (PR-241 César RCA): URL-keyed dedup above cannot
+        # Secondary dedup gate (PR-241 René RCA): URL-keyed dedup above cannot
         # catch a re-created prospect under a DIFFERENT LinkedIn vanity slug
         # (same human, new URL). Look the candidate up in the run-start name
         # index (normalized on both sides so accents + LinkedIn suffixes bridge
@@ -2220,7 +2234,7 @@ def run_weekly_prospecting(
     in_list_canonical_urls = _load_in_list_canonical_urls(crm, existing_entries)
     click.echo(f"  {len(in_list_canonical_urls)} canonical URLs resolved for dedup.\n")
 
-    # Run-start name index for the name+company duplicate gate (PR-241 César
+    # Run-start name index for the name+company duplicate gate (PR-241 René
     # RCA). Built ONCE from the pipeline's person records so the per-candidate
     # check is an O(1) local lookup — a live Attio name search is accent-
     # SENSITIVE and misses the suffix/accent variants this gate exists to catch.
