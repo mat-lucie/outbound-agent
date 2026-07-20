@@ -39,6 +39,7 @@ from workflows.daily_run import (
     ConcurrentRunInAttio,
     DailyRun,
     MalformedDailyRunRow,
+    _archive_stray_rows,
     derive_machine_id,
     open_daily_run,
 )
@@ -73,6 +74,127 @@ def mock_crm():
     crm.update_object_record.return_value = _record("rec_test")
     crm.query_object_records.return_value = []
     return crm
+
+
+def _stray_record(
+    record_id: str,
+    status: str = "failed",
+    messages_sent: int = 0,
+    connections_sent: int = 0,
+    visits_sent: int = 0,
+    failure_details: str | None = None,
+    uniqueness_key: str | None = None,
+    run_date: str = "2026-06-09",
+    machine_id: str = "laptop-A",
+) -> Record:
+    """A terminal daily_run ``Record`` with flat (provider-normalized) attrs."""
+    attributes: dict = {
+        "status": status,
+        "run_date": run_date,
+        "machine_id": machine_id,
+        "messages_sent": messages_sent,
+        "connections_sent": connections_sent,
+        "visits_sent": visits_sent,
+        "started_at": "2026-06-09T08:00:00Z",
+    }
+    if failure_details is not None:
+        attributes["failure_details"] = failure_details
+    if uniqueness_key is not None:
+        attributes["uniqueness_key"] = uniqueness_key
+    return Record(
+        record_id=record_id,
+        object="daily_run",
+        attributes=attributes,
+        raw={"id": {"record_id": record_id}, "values": attributes},
+    )
+
+
+# ── _archive_stray_rows (open + attach share it) ─────────────────────────────
+
+
+def test_archive_marks_terminal_stray_and_releases_key():
+    crm = MagicMock()
+    rows = [_stray_record("rec_stray", status="failed", messages_sent=5)]
+    marked = _archive_stray_rows(crm, rows, active_record_id="rec_active")
+    assert marked == 1
+    obj, rid, values = crm.update_object_record.call_args[0]
+    assert obj == "daily_run"
+    assert rid == "rec_stray"
+    assert "[superseded]" in values["failure_details"]
+    # Row held the 2-part lock (no released key in fixture) → re-keyed.
+    assert values["uniqueness_key"] == "failed|2026-06-09|laptop-A|rec_stray"
+
+
+def test_archive_never_touches_active_or_completed_rows():
+    crm = MagicMock()
+    rows = [
+        _stray_record("rec_active", status="failed"),     # active → skip
+        _stray_record("rec_done", status="completed"),    # completed → skip
+        _stray_record("rec_running", status="running"),   # running → skip
+    ]
+    assert _archive_stray_rows(crm, rows, active_record_id="rec_active") == 0
+    crm.update_object_record.assert_not_called()
+
+
+def test_archive_is_idempotent_on_already_marked_row():
+    crm = MagicMock()
+    rows = [
+        _stray_record(
+            "rec_stray",
+            status="failed",
+            failure_details="boom\n[superseded] auto-marked earlier",
+        )
+    ]
+    assert _archive_stray_rows(crm, rows, active_record_id="rec_active") == 0
+    crm.update_object_record.assert_not_called()
+
+
+def test_archive_skips_rekey_when_already_released():
+    crm = MagicMock()
+    rows = [
+        _stray_record(
+            "rec_stray",
+            status="aborted",
+            uniqueness_key="aborted|2026-06-09|laptop-A|rec_stray",
+        )
+    ]
+    assert _archive_stray_rows(crm, rows, active_record_id="rec_active") == 1
+    values = crm.update_object_record.call_args[0][2]
+    assert "failure_details" in values
+    assert "uniqueness_key" not in values  # already released → no churn
+
+
+def test_archive_is_best_effort_on_write_failure():
+    """A transient CRM error while marking a stray must NOT abort the caller —
+    the janitor logs + continues (the counters invariant holds regardless)."""
+    crm = MagicMock()
+    crm.update_object_record.side_effect = httpx.HTTPStatusError(
+        "500", request=httpx.Request("PATCH", "https://x"), response=httpx.Response(500),
+    )
+    rows = [_stray_record("rec_stray", status="failed")]
+    # Does not raise; simply reports 0 marked.
+    assert _archive_stray_rows(crm, rows, active_record_id="rec_active") == 0
+
+
+def test_open_daily_run_auto_marks_stray_and_keeps_baseline(mock_crm):
+    """A prior failed stray gets [superseded] via update_object_record, AND its
+    counters still feed the baseline so the caps do not reset (LOAD-BEARING
+    INVARIANT)."""
+    stray = _stray_record("rec_stray", status="failed", messages_sent=5)
+    mock_crm.query_object_records.return_value = [stray]
+    mock_crm.create_object_record.return_value = _record("rec_today")
+    with open_daily_run(
+        mock_crm, run_id="run-x", run_date=date(2026, 6, 9), machine_id="laptop-A",
+    ) as run:
+        # Baseline preserved: stray's 5 messages still count against the cap.
+        assert run.remaining("messages") == MAX_MESSAGES_PER_DAY - 5
+    # The stray was marked [superseded] via the provider write layer.
+    marked = [
+        c for c in mock_crm.update_object_record.call_args_list
+        if c[0][1] == "rec_stray"
+    ]
+    assert len(marked) == 1
+    assert "[superseded]" in marked[0][0][2]["failure_details"]
 
 
 # ── machine_id derivation ────────────────────────────────────────────────────
@@ -774,9 +896,16 @@ def test_open_daily_run_seeded_baseline_not_persisted_to_new_row(mock_crm):
         run.record_send("connections", 3)
         # Cap math: 22 baseline + 3 own.
         assert run.remaining("connections") == MAX_CONNECTIONS_PER_DAY - 25
-    # The counter write carries own 3, NOT the seeded 25.
-    counter_values = mock_crm.update_object_record.call_args_list[0][0][2]
-    assert counter_values["connections_sent"] == 3
+    # The counter write carries own 3, NOT the seeded 25. Target the new
+    # row's write specifically — a prior terminal row now also gets an
+    # update_object_record call (the [superseded] auto-mark), so index 0 is
+    # no longer guaranteed to be the counter write.
+    counter_writes = [
+        c for c in mock_crm.update_object_record.call_args_list
+        if c[0][1] == "rec_retry" and "connections_sent" in c[0][2]
+    ]
+    assert counter_writes
+    assert counter_writes[0][0][2]["connections_sent"] == 3
     # The create also wrote 0s (the row's own ledger starts empty).
     create_values = mock_crm.create_object_record.call_args[0][1]
     assert create_values["connections_sent"] == 0

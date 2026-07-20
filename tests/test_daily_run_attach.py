@@ -445,10 +445,73 @@ def test_attach_incident_day_binds_completed_row_and_reads_reply_status(mock_crm
         assert run.record_id == "rec_completed"
         assert run.get_reply_detection_status() == "ok"
         assert run.remaining("connections") == MAX_CONNECTIONS_PER_DAY - 22
-    # First write is the reopen — it must target the completed row.
-    obj, rid, values = mock_crm.update_object_record.call_args_list[0][0]
-    assert rid == "rec_completed"
-    assert values["status"] == "running"
+    # The reopen must target the completed row (flip to running). Target it by
+    # record_id — the aborted sibling now also gets an update_object_record call
+    # (the [superseded] auto-mark), so it is no longer necessarily first.
+    reopen_writes = [
+        c for c in mock_crm.update_object_record.call_args_list
+        if c[0][1] == "rec_completed" and c[0][2].get("status") == "running"
+    ]
+    assert reopen_writes
+    # The aborted sibling is auto-marked [superseded], never flipped to running.
+    aborted_writes = [
+        c for c in mock_crm.update_object_record.call_args_list
+        if c[0][1] == "rec_aborted"
+    ]
+    assert len(aborted_writes) == 1
+    assert "[superseded]" in aborted_writes[0][0][2]["failure_details"]
+
+
+def test_attach_auto_marks_stray_sibling_not_active_row(mock_crm):
+    """On an aborted-then-retried day, attach binds the canonical (completed)
+    row and auto-marks the failed SIBLING [superseded] — never the active row.
+    The sibling's counters still feed the baseline (caps do not reset)."""
+    active = _row(record_id="rec_active", status="completed", messages_sent=4)
+    stray = _row(
+        record_id="rec_stray", status="failed", messages_sent=3,
+        reply_detection_status=None,
+    )
+    mock_crm.query_object_records.return_value = [active, stray]
+    with attach_daily_run(
+        mock_crm, run_id="dm-1", run_date=date(2026, 6, 9), machine_id="laptop-A",
+    ) as run:
+        assert run.record_id == "rec_active"
+        # Baseline includes the sibling's 3 messages → cap does NOT reset.
+        assert run.remaining("messages") == MAX_MESSAGES_PER_DAY - 4 - 3
+    # The stray was marked; the active row was NOT marked [superseded].
+    marked = [
+        c for c in mock_crm.update_object_record.call_args_list
+        if c[0][1] == "rec_stray"
+    ]
+    assert len(marked) == 1
+    assert "[superseded]" in marked[0][0][2]["failure_details"]
+    active_superseded = [
+        c for c in mock_crm.update_object_record.call_args_list
+        if c[0][1] == "rec_active"
+        and "[superseded]" in str(c[0][2].get("failure_details", ""))
+    ]
+    assert active_superseded == []
+
+
+def test_attach_stray_archive_idempotent_on_rerun(mock_crm):
+    """A sibling already carrying [superseded] is not re-marked — no second
+    write on a repeat attach."""
+    active = _row(record_id="rec_active", status="completed", messages_sent=4)
+    stray = _row(
+        record_id="rec_stray", status="failed", messages_sent=3,
+        reply_detection_status=None,
+    )
+    stray.attributes["failure_details"] = "boom\n[superseded] earlier"
+    mock_crm.query_object_records.return_value = [active, stray]
+    with attach_daily_run(
+        mock_crm, run_id="dm-1", run_date=date(2026, 6, 9), machine_id="laptop-A",
+    ):
+        pass
+    marked = [
+        c for c in mock_crm.update_object_record.call_args_list
+        if c[0][1] == "rec_stray"
+    ]
+    assert marked == []
 
 
 def test_attach_merges_counters_across_duplicate_rows(mock_crm):
