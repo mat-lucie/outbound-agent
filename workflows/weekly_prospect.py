@@ -18,7 +18,12 @@ import click
 import httpx
 
 from clients.attio import AttioClient, _canonical_linkedin_url, first_option_title
-from clients.pb_config import li_session_cookie, li_user_agent_raw
+from clients.pb_config import (
+    li_session_cookie,
+    li_user_agent_raw,
+    scrape_max_wait,
+    scrape_profile_cap,
+)
 from models.business_calendar import add_business_days
 from models.campaign import load_personas
 from models.experiment import get_current_experiment_id
@@ -456,7 +461,9 @@ def _launch_and_download(
         "numberOfResultsPerSearch": batch_size,
         "numberOfLinesPerLaunch": batch_size,
         "removeDuplicateProfiles": True,
-        "numberOfProfiles": 200,
+        # PR-252: must track batch_size — a fixed cap below it silently clips
+        # deep scrapes back to the recycled top-of-search window.
+        "numberOfProfiles": scrape_profile_cap(batch_size),
         "csvName": csv_name,
         "identities": [{
             "sessionCookie": li_cookie,
@@ -466,7 +473,11 @@ def _launch_and_download(
     launch = pb.launch_agent(search_export_id, launch_args)
 
     click.echo("  Waiting for export to complete...")
-    pb.wait_for_completion(launch, poll_interval=15, max_wait=600)
+    # PR-252: scale so deeper scrapes don't hit a timeout sized for the old
+    # 100-row default.
+    pb.wait_for_completion(
+        launch, poll_interval=15, max_wait=scrape_max_wait(batch_size)
+    )
 
     # F-PR-5: CSV keyed to launch.container_id, not "latest". The per-launch
     # csvName MUST be passed here too, or the agent-scoped fallback fetches a

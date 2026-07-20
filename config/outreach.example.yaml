@@ -50,3 +50,11 @@ sweep:
   repair_circuit_threshold: 3   # after this many CONSECUTIVE repair-write failures the sweep
                                 # stops attempting repairs and escalates the rest (each failed
                                 # write can burn the full AttioWriter retry budget).
+
+scrape:
+  weekly_batch_size: 300        # prospects exported per saved search on `weekly` (default for
+                                # --batch-size). The Search Export phantom has no pagination, so
+                                # it re-exports the same top-of-search window every run — a deeper
+                                # batch is the only lever that reaches past the recycled results.
+                                # Expect a larger borderline stage on the first deep run; the PB
+                                # profile cap + completion wait scale with this automatically.

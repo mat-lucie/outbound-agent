@@ -93,6 +93,12 @@ class OutreachConfig:
     sweep_window_days: int
     sweep_repair_circuit_threshold: int
 
+    # scrape — weekly prospecting scrape window (PR-252). The Search Export
+    # phantom has no pagination, so it re-exports the same top-of-search
+    # window every run; a deeper batch is the only lever that reaches past the
+    # recycled results. Optional-with-default so existing configs keep loading.
+    weekly_scrape_batch_size: int
+
 
 def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
     """Return ``raw[name]`` as a mapping, or raise ConfigError."""
@@ -226,6 +232,7 @@ def load_outreach_config() -> OutreachConfig:
     throttle = _section(raw, "throttle")
     staleness = raw.get("staleness") or {}
     sweep = raw.get("sweep") or {}
+    scrape = raw.get("scrape") or {}
 
     # Optional-with-default knobs: validate via _int_at_least (type check,
     # bool-reject, range floor) when the key is present; otherwise default to 3.
@@ -247,6 +254,14 @@ def load_outreach_config() -> OutreachConfig:
         )
     else:
         sweep_repair_circuit_threshold = 3
+    # PR-252 deep scrape window: default 300 reaches past the recycled
+    # top-of-search window (a fixed 100 re-exports the same page each week).
+    if "weekly_batch_size" in scrape:
+        weekly_scrape_batch_size = _int_at_least(
+            scrape, "weekly_batch_size", section_name="scrape", minimum=1
+        )
+    else:
+        weekly_scrape_batch_size = 300
 
     invites_per_day = _int_at_least(caps, "invites_per_day", section_name="caps", minimum=1)
     dms_per_day = _int_at_least(caps, "dms_per_day", section_name="caps", minimum=1)
@@ -313,4 +328,5 @@ def load_outreach_config() -> OutreachConfig:
         stale_run_takeover_hours=stale_run_takeover_hours,
         sweep_window_days=sweep_window_days,
         sweep_repair_circuit_threshold=sweep_repair_circuit_threshold,
+        weekly_scrape_batch_size=weekly_scrape_batch_size,
     )

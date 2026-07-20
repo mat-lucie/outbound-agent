@@ -66,6 +66,39 @@ _BACKEND_ENV = "PRE_INVITE_DEGREE_CHECK_BACKEND"
 _BACKEND_YAML_KEY = "pre_invite_degree_check_backend"
 _BACKEND_DEFAULT = "sales_nav"
 
+# PB Search Export scrape-window scaling (PR-252). The Search Export phantom has
+# no pagination — every launch re-exports the same top-of-search window — so a
+# deeper batch is the only lever that reaches past the recycled results. Two
+# phantom knobs must track the requested batch size or a deep scrape is silently
+# clipped back to the recycled window:
+#   * numberOfProfiles — a fixed cap below batch_size clips the export.
+#   * wait_for_completion max_wait — a timeout sized for the old default aborts
+#     a deep scrape mid-run.
+# The floors preserve the pre-PR-252 behavior for the default 100-row batch.
+_SCRAPE_PROFILE_FLOOR = 200          # numberOfProfiles never drops below this
+_SCRAPE_WAIT_FLOOR_SEC = 600         # completion wait never drops below this
+_SCRAPE_WAIT_SEC_PER_PROFILE = 6     # ~6s/profile observed at batch 100
+
+
+def scrape_profile_cap(batch_size: int) -> int:
+    """PB ``numberOfProfiles`` for a given batch size (PR-252).
+
+    Tracks ``batch_size`` above the historical floor: a fixed cap below the
+    requested batch silently clips deep scrapes back to the recycled
+    top-of-search window.
+    """
+    return max(_SCRAPE_PROFILE_FLOOR, batch_size)
+
+
+def scrape_max_wait(batch_size: int) -> int:
+    """PB completion ``max_wait`` (seconds) for a given batch size (PR-252).
+
+    Scales with the batch so a deeper scrape doesn't hit a timeout sized for
+    the old 100-row default, while keeping the historical floor for small
+    batches.
+    """
+    return max(_SCRAPE_WAIT_FLOOR_SEC, batch_size * _SCRAPE_WAIT_SEC_PER_PROFILE)
+
 
 @dataclass(frozen=True)
 class PBConfig:

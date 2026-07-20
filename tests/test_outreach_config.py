@@ -70,6 +70,7 @@ def test_load_outreach_config_returns_example_defaults():
     assert cfg.lane_rank == {"enterprise_mode": 0, "target_company_mode": 1, "legacy": 2}
     assert cfg.send_days == frozenset({0, 1, 2, 3, 4})
     assert cfg.company_throttle_window_days == 14
+    assert cfg.weekly_scrape_batch_size == 300
 
 
 def test_consumers_sourced_from_loaded_config():
@@ -264,6 +265,14 @@ def test_optional_knobs_absent_default(tmp_path, monkeypatch):
     assert cfg.stale_run_takeover_hours == 3
     assert cfg.sweep_window_days == 3
     assert cfg.sweep_repair_circuit_threshold == 3
+    assert cfg.weekly_scrape_batch_size == 300  # PR-252 default deep window
+
+
+def test_scrape_batch_size_override(tmp_path, monkeypatch):
+    """A scrape.weekly_batch_size override is loaded (PR-252)."""
+    body = _VALID_YAML + "scrape:\n  weekly_batch_size: 150\n"
+    _write_config(tmp_path, monkeypatch, body)
+    assert load_outreach_config().weekly_scrape_batch_size == 150
 
 
 @pytest.mark.parametrize(
@@ -278,6 +287,9 @@ def test_optional_knobs_absent_default(tmp_path, monkeypatch):
         ("sweep:\n  repair_circuit_threshold: 0\n", "repair_circuit_threshold"),
         ("sweep:\n  repair_circuit_threshold: true\n", "repair_circuit_threshold"),
         ('sweep:\n  repair_circuit_threshold: "lots"\n', "repair_circuit_threshold"),
+        ("scrape:\n  weekly_batch_size: 0\n", "weekly_batch_size"),
+        ("scrape:\n  weekly_batch_size: true\n", "weekly_batch_size"),
+        ('scrape:\n  weekly_batch_size: "lots"\n', "weekly_batch_size"),
     ],
 )
 def test_optional_knob_invalid_value_raises(tmp_path, monkeypatch, section_block, match):

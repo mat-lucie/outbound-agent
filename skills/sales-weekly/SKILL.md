@@ -26,7 +26,12 @@ Each step below is a separate sales-cli invocation. Run them in this
 order; pause between steps if the operator needs to inspect output.
 
 1. **Prospect targets** — `sales weekly` (export + score the new
-   batch).
+   batch). `--batch-size` defaults to `scrape.weekly_batch_size` in
+   `config/outreach.yaml` (300): the Search Export phantom has no
+   pagination and re-exports the same top-of-search window every run,
+   so a deeper batch is the only lever that reaches past the recycled
+   results. Expect a larger borderline stage on the first deep run;
+   recalibrate the knob after observing it.
 2. **Borderline finalize** — operator-supervised; the agent presents
    borderline verdicts and the operator confirms via the queue UI.
    Auto-finalize happens later in the day via

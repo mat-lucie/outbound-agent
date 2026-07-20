@@ -1094,6 +1094,43 @@ class TestWeeklyScrapeCsvNameBust:
         assert pb.download_result_csv.call_args.kwargs.get("csv_name") == csv_name
 
 
+class TestDeepScrapeWindow:
+    """A deeper --batch-size must actually reach past the recycled top-of-search
+    window (PR-252): the numberOfProfiles cap has to track batch_size (a fixed
+    floor silently clips deep scrapes) and the completion timeout has to scale
+    with it.
+    """
+
+    def _launch(self, monkeypatch, batch_size):
+        from workflows.weekly_prospect import _launch_and_download
+
+        monkeypatch.setenv("PB_LI_SESSION_COOKIE", "cookie-abc")
+        pb = MagicMock()
+        pb.launch_agent.return_value = MagicMock()
+        pb.download_result_csv.return_value = "firstName,lastName\nA,B\n"
+        _launch_and_download(pb, "agent-1", "https://linkedin.com/sales/search/x", batch_size)
+        return pb
+
+    def test_number_of_profiles_tracks_deep_batch_size(self, monkeypatch):
+        pb = self._launch(monkeypatch, 300)
+        launch_args = pb.launch_agent.call_args.args[1]
+        assert launch_args["numberOfProfiles"] == 300
+        assert launch_args["numberOfResultsPerSearch"] == 300
+        assert launch_args["numberOfLinesPerLaunch"] == 300
+
+    def test_number_of_profiles_keeps_floor_at_default_batch(self, monkeypatch):
+        pb = self._launch(monkeypatch, 100)
+        assert pb.launch_agent.call_args.args[1]["numberOfProfiles"] == 200
+
+    def test_max_wait_scales_with_batch_size(self, monkeypatch):
+        pb = self._launch(monkeypatch, 300)
+        assert pb.wait_for_completion.call_args.kwargs.get("max_wait") == 1800
+
+    def test_max_wait_floor_at_default_batch(self, monkeypatch):
+        pb = self._launch(monkeypatch, 100)
+        assert pb.wait_for_completion.call_args.kwargs.get("max_wait") == 600
+
+
 class TestSupplyStarvationAlarm:
     """The keystone silent-failure fix: a run that qualifies people but sources
     zero net-new prospects must be detectable (it fires a loud operator alarm).
