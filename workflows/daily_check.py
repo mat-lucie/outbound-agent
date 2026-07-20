@@ -2,7 +2,8 @@
 
 import os
 from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING, Literal
+from enum import Enum
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import click
 import httpx
@@ -33,7 +34,14 @@ from models.campaign import (
     personalize,
 )
 from models.experiment import get_current_experiment_id
-from models.pipeline import STAGE_RANK, PipelineStage, dm_step_int, is_invite_eligible, is_send_eligible  # noqa: E501
+from models.pipeline import (
+    STAGE_RANK,
+    InviteExclusionReason,
+    PipelineStage,
+    dm_step_int,
+    invite_slice_reason,
+    is_send_eligible,
+)
 from models.resolution import (
     MissingLanguageError,
     compute_next_eligible_send_date,
@@ -195,6 +203,123 @@ def _is_blocked_by_stored_floor(
             )
         return False
     return today < stored_floor
+
+
+class DmExclusionReason(Enum):
+    """Why a row has no DM due — see `dm_due_step` (PR-217).
+
+    Callers key their per-reason escalations / skips off these members.
+    """
+    INVALID_STAGE = "invalid_stage"
+    NOT_SEND_ELIGIBLE = "not_send_eligible"
+    MISSING_LAST_CONTACT_DATE = "missing_last_contact_date"
+    MALFORMED_VALUE = "malformed_value"
+    NOT_DUE = "not_due"
+    STORED_FLOOR_BLOCKED = "stored_floor_blocked"
+
+
+class DmDueVerdict(NamedTuple):
+    """Result of `dm_due_step` (PR-217). Exactly one of step/reason is non-None.
+
+    ``stage`` carries the parsed PipelineStage whenever the stage was
+    parseable (even on exclusions) so callers can key stage-specific
+    escalations — e.g. the L1-6 ACCEPTED-with-null-last_contact_date row.
+    """
+    step: "MessageStep | None"
+    reason: "DmExclusionReason | None"
+    stage: "PipelineStage | None"
+
+    @property
+    def needs_missing_lcd_escalation(self) -> bool:
+        """L1-6 classification, shared by any DM claim filter and the
+        queue loop: an ACCEPTED row with a null last_contact_date can
+        never compute DM1 eligibility — the loop escalates it
+        (`accepted_missing_last_contact_date`) and a claim filter claims
+        it so that escalation stays reachable for unassigned rows. One
+        definition so the two call sites cannot drift.
+        """
+        return (
+            self.reason is DmExclusionReason.MISSING_LAST_CONTACT_DATE
+            and self.stage is PipelineStage.ACCEPTED
+        )
+
+
+def dm_due_step(
+    attrs: dict,
+    today: date,
+    *,
+    strict: bool = True,
+    honor_stored_floor: bool = True,
+    audit_logger: "AuditLogger | None" = None,
+) -> DmDueVerdict:
+    """Single source of truth for the attrs-only DM-due predicate chain (PR-217).
+
+    Canonical order: stage parse → §3.10 send-eligibility →
+    last_contact_date present → cadence due (`get_pending_dms`) →
+    PR-12 §3.1 stored cadence floor.
+
+    All callers of the chain (the DM queue-building loop, `compute_due_dm_counts`,
+    and any multi-operator DM claim filter) MUST route through this function —
+    a gate added here reaches all of them at once; a gate added at one call
+    site re-opens the Part-B analogue of the 2026-07-02
+    claims-spent-on-undispatchable-rows starvation bug. Gates that need
+    record-cache lookups (cross-URL sibling guard, per-company throttle) are
+    deliberately NOT here: this chain is attrs-only (zero Attio traffic) so a
+    claim filter and the dry-run zero-write guarantee can use it.
+
+    ``strict`` selects the malformed-value policy for last_contact_date /
+    dm_step:
+    - True (the loops): `date.fromisoformat` / `int()` raise, per the
+      loops' fail-loud policy on corrupt data (required per PR-17 for
+      `compute_due_dm_counts`).
+    - False (a claim filter): fails closed — returns MALFORMED_VALUE.
+
+    ``honor_stored_floor=False`` preserves `compute_due_dm_counts`'s
+    pre-existing behavior of counting cadence-due cohort sizes without
+    consulting the stored floor (see its call site).
+
+    Lives in this module (not models/pipeline.py) so the internal
+    `_is_blocked_by_stored_floor` reference stays a daily_check module
+    global — tests monkeypatch `daily_check._is_blocked_by_stored_floor`.
+
+    Missing-stage handling is unified to INVALID_STAGE (skip): production
+    entries always carry `stage` (parse_entry), so the previous
+    KeyError-crash in the queue loop was unreachable outside fixtures.
+    """
+    try:
+        stage = PipelineStage(attrs.get("stage"))
+    except ValueError:
+        return DmDueVerdict(None, DmExclusionReason.INVALID_STAGE, None)
+    if not is_send_eligible(attrs):
+        return DmDueVerdict(None, DmExclusionReason.NOT_SEND_ELIGIBLE, stage)
+    last_date_str = attrs.get("last_contact_date")
+    if not last_date_str:
+        return DmDueVerdict(
+            None, DmExclusionReason.MISSING_LAST_CONTACT_DATE, stage
+        )
+    try:
+        last_date = date.fromisoformat(str(last_date_str)[:10])
+        # Deliberately int(), NOT models.pipeline.dm_step_int: this chain
+        # inherits the loops' numeric-only contract (`int(dm_step or 0)`),
+        # where a non-numeric dm_step is corrupt data — fail loud (strict)
+        # or fail closed (claim filter). dm_step_int's slug mapping
+        # ("dm1"→1, unknown→0) is for measurement readers and would
+        # silently change which rows count as due here.
+        dm_step = int(attrs.get("dm_step") or 0)
+    except (TypeError, ValueError):
+        if strict:
+            raise
+        return DmDueVerdict(None, DmExclusionReason.MALFORMED_VALUE, stage)
+    pending = get_pending_dms(stage, last_date, today, dm_step=dm_step)
+    if pending is None:
+        return DmDueVerdict(None, DmExclusionReason.NOT_DUE, stage)
+    if honor_stored_floor and _is_blocked_by_stored_floor(
+        attrs, today, audit_logger
+    ):
+        return DmDueVerdict(
+            None, DmExclusionReason.STORED_FLOOR_BLOCKED, stage
+        )
+    return DmDueVerdict(pending, None, stage)
 
 
 def _company_id_for_prospect(
@@ -2068,50 +2193,62 @@ def run_connection_requests(
     today_op = today if today is not None else operator_today()
     quarantine_skipped = 0
     skipped_low_score = 0
+    # The eligibility gates live in `models.pipeline.invite_slice_reason` —
+    # shared with starvation._pool_metrics (and any multi-operator claim
+    # filter), so a gate added there reaches all of them at once (a gate
+    # added only here re-opens the 2026-07-02 claims starvation bug). This
+    # loop only maps each exclusion reason to its counter / escalation, and
+    # routes CONNECTION_SENT rows onward for the recheck pass. Missing-stage
+    # handling is unchanged: the `attrs["stage"]` access below still
+    # KeyErrors on a stage-less entry (unreachable in production —
+    # parse_entry always stamps stage).
     for attrs in all_parsed:
-        if attrs["stage"] == PipelineStage.PROSPECT.value:
-            score = attrs.get("quality_score")
+        if attrs["stage"] == PipelineStage.CONNECTION_SENT.value:
+            connection_sent.append(attrs)
+            continue
+        reason = invite_slice_reason(attrs, today_op)
+        if reason is InviteExclusionReason.NOT_PROSPECT:
+            continue
+        if reason is InviteExclusionReason.MISSING_QUALITY_SCORE:
             # L1-5: quality_score=None means the weekly pipeline never
             # stamped this record — data bug, not a legitimate filter.
             # Escalate so the operator can investigate and skip loudly.
-            if score is None:
-                record_id = str(attrs["record_id"])
-                escalate(
-                    type="missing_quality_score",
-                    idempotency_key=f"missing_qs|{record_id}",
-                    payload={"record_id": record_id},
-                    attio=attio,
-                )
-                click.echo(
-                    f"  ⚠ Skipping {record_id}: quality_score is None — "
-                    f"weekly pipeline never stamped this record; "
-                    f"missing_quality_score queue row opened.",
-                    err=True,
-                )
-                continue
-            # score < 60: legitimate silent filter. Track in skip-counts
-            # so operators can see how many PROSPECTs were filtered.
-            if int(score) < 60:
-                skipped_low_score += 1
-                continue
+            record_id = str(attrs["record_id"])
+            escalate(
+                type="missing_quality_score",
+                idempotency_key=f"missing_qs|{record_id}",
+                payload={"record_id": record_id},
+                attio=attio,
+            )
+            click.echo(
+                f"  ⚠ Skipping {record_id}: quality_score is None — "
+                f"weekly pipeline never stamped this record; "
+                f"missing_quality_score queue row opened.",
+                err=True,
+            )
+            continue
+        if reason is InviteExclusionReason.LOW_QUALITY_SCORE:
+            # Legitimate silent filter. Track in skip-counts so operators
+            # can see how many PROSPECTs were filtered.
+            skipped_low_score += 1
+            continue
+        if reason is InviteExclusionReason.NOT_SEND_ELIGIBLE:
+            # §3.10 defense (PR-22 fold-in): archaeology-stamped or
+            # merged-loser PROSPECT rows must never join the invite
+            # slice — a §3.1 hard red line.
+            continue
+        if reason is InviteExclusionReason.QUARANTINED:
             # §3.1 defense: a fresh PROSPECT must clear its
             # invite_eligible_after quarantine before joining the invite
             # slice.
-            if not is_invite_eligible(attrs, today_op):
-                quarantine_skipped += 1
-                continue
-            # §3.10 defense (PR-22 fold-in): a PROSPECT-stage row stamped
-            # with archaeology frozen_at (`legacy_pure_unknown` /
-            # `legacy_inferred_by_archaeology`) MUST be excluded from the
-            # invite slice. `is_invite_eligible` only checks quarantine; an
-            # archaeology row that bypasses quarantine (no
-            # invite_eligible_after attribute) would otherwise leak into
-            # the invite path — a §3.1 hard red line.
-            if not is_send_eligible(attrs):
-                continue
-            prospects.append(attrs)
-        elif attrs["stage"] == PipelineStage.CONNECTION_SENT.value:
-            connection_sent.append(attrs)
+            quarantine_skipped += 1
+            continue
+        if reason is not None:
+            # Fail closed: any exclusion reason without a dedicated arm
+            # above (e.g. a future gate added to invite_slice_reason)
+            # must skip the row, never invite it.
+            continue
+        prospects.append(attrs)
     if quarantine_skipped:
         click.echo(
             f"  Quarantine: held back {quarantine_skipped} fresh prospect(s) "
@@ -3087,29 +3224,22 @@ def run_dm_sequencing(
         if len(divergent) > 20:
             click.echo(f"     ... and {len(divergent) - 20} more")
 
+    # The attrs-only eligibility gates live in `dm_due_step` — shared with
+    # compute_due_dm_counts (and any DM claim filter), so a gate added there
+    # reaches all of them at once (a gate added only here re-opens the
+    # Part-B analogue of the 2026-07-02 invite starvation bug). This loop
+    # maps exclusion reasons to escalations, then applies the gates that
+    # need record-cache lookups (sibling guard, company throttle).
     for attrs in all_parsed:
-        stage_str = attrs["stage"]
-
-        try:
-            stage = PipelineStage(stage_str)
-        except ValueError:
-            continue
-
-        # §3.10 send-eligibility gate. Archaeology-stamped rows
-        # (experiment_id_frozen_at ∈ legacy_*) and terminal stages (except
-        # NURTURE) must never queue a DM — the §3.1 no-resend hard red line.
-        if not is_send_eligible(attrs):
-            continue
-
-        last_date_str = attrs.get("last_contact_date")
-        if not last_date_str:
-            # L1-6: ACCEPTED rows with null last_contact_date can never
-            # receive DM1 because get_pending_dms requires a valid date.
-            # They sit silently in the pipeline forever — escalate so the
-            # operator can fix the missing accept date in Attio.
-            # Do NOT auto-backfill: writing a fabricated date would corrupt
-            # the cadence record and inflate dm_response_rate denominators.
-            if stage == PipelineStage.ACCEPTED:
+        verdict = dm_due_step(attrs, today, audit_logger=audit_logger)
+        if verdict.step is None:
+            if verdict.needs_missing_lcd_escalation:
+                # L1-6: ACCEPTED rows with null last_contact_date can never
+                # receive DM1 because get_pending_dms requires a valid date.
+                # They sit silently in the pipeline forever — escalate so the
+                # operator can fix the missing accept date in Attio.
+                # Do NOT auto-backfill: writing a fabricated date would corrupt
+                # the cadence record and inflate dm_response_rate denominators.
                 record_id = str(attrs["record_id"])
                 entry_id = str(attrs.get("entry_id", ""))
                 escalate(
@@ -3128,23 +3258,7 @@ def run_dm_sequencing(
                     err=True,
                 )
             continue
-        last_date = date.fromisoformat(str(last_date_str)[:10])
-
-        pending_dm = get_pending_dms(
-            stage,
-            last_date,
-            today,
-            dm_step=int(attrs.get("dm_step") or 0),
-        )
-        if not pending_dm:
-            continue
-
-        # PR-12 (B-PD-003) §3.1 protection: honor the forward-only
-        # stored cadence floor when present. See _is_blocked_by_stored_floor
-        # for the contract; rows pre-dating PR-12 lack the attribute and
-        # fall through to `get_pending_dms`'s in-memory eligibility.
-        if _is_blocked_by_stored_floor(attrs, today, audit_logger):
-            continue
+        pending_dm = verdict.step
 
         # Cross-URL guard: a sibling record for this LinkedIn URL may already be
         # at or past the stage we're about to advance to. Skip if so.
@@ -3972,26 +4086,14 @@ def compute_due_dm_counts(
 
     due = {"dm1": 0, "dm2": 0, "dm3": 0}
     for attrs in all_parsed:
-        stage_str = attrs.get("stage")
-        try:
-            stage = PipelineStage(stage_str)
-        except ValueError:
-            continue
-        if not is_send_eligible(attrs):
-            continue
-        last_date_str = attrs.get("last_contact_date")
-        if not last_date_str:
-            continue
-        # PR-17 fold-in (code-reviewer IMPORTANT): match
+        # Shared attrs-only DM-due chain (see dm_due_step). strict=True per
+        # the PR-17 fold-in (code-reviewer IMPORTANT): match
         # run_dm_sequencing's behavior — let date.fromisoformat raise
         # on a malformed value instead of silently skipping the row.
-        last_date = date.fromisoformat(str(last_date_str)[:10])
-        pending = get_pending_dms(
-            stage,
-            last_date,
-            today,
-            dm_step=int(attrs.get("dm_step") or 0),
-        )
+        # honor_stored_floor=False preserves this function's pre-existing
+        # behavior: due counts are cadence-due cohort SIZES and have never
+        # consulted the PR-12 stored floor (the send loop does).
+        pending = dm_due_step(attrs, today, honor_stored_floor=False).step
         if pending == MessageStep.DM1:
             due["dm1"] += 1
         elif pending == MessageStep.DM2:

@@ -300,6 +300,86 @@ def is_invite_eligible(entry: dict, today: date) -> bool:
     return parsed <= today
 
 
+# Minimum quality_score for the daily invite slice — the floor the
+# invite-chain call sites shared as a bare `60` literal before the predicate
+# was consolidated into `invite_slice_reason` (PR-217). Scope note:
+# quality_gate.py's commit-time pass gate and Prospect.passes_quality_gate
+# carry their own 60 literals (the same contract, different stage of the
+# pipeline) — raising this constant alone does NOT move those gates.
+INVITE_QUALITY_SCORE_FLOOR = 60
+
+
+class InviteExclusionReason(Enum):
+    """Why a row is excluded from the daily invite slice (PR-217).
+
+    Returned by `invite_slice_reason`; callers key their per-reason
+    counters / escalations off these members. Values are slugs suitable
+    for audit payloads.
+    """
+    NOT_PROSPECT = "not_prospect"
+    MISSING_QUALITY_SCORE = "missing_quality_score"
+    MALFORMED_QUALITY_SCORE = "malformed_quality_score"
+    LOW_QUALITY_SCORE = "low_quality_score"
+    NOT_SEND_ELIGIBLE = "not_send_eligible"
+    QUARANTINED = "quarantined"
+
+
+def invite_slice_reason(
+    entry: dict, today: date, *, strict: bool = True
+) -> "InviteExclusionReason | None":
+    """Single source of truth for the invite-slice predicate chain (PR-217).
+
+    Returns None when the row belongs in the invite slice (stage PROSPECT,
+    quality_score >= INVITE_QUALITY_SCORE_FLOOR, send-eligible per §3.10/§3.11,
+    quarantine cleared per §3.1), otherwise the FIRST failing gate in
+    canonical order:
+
+        NOT_PROSPECT → MISSING_QUALITY_SCORE → MALFORMED_QUALITY_SCORE /
+        LOW_QUALITY_SCORE → NOT_SEND_ELIGIBLE → QUARANTINED
+
+    All callers of the chain (the daily invite selection loop, starvation's
+    pool metrics, and any multi-operator invite claim filter) MUST route
+    through this function — a gate added here reaches all of them at once; a
+    gate added at one call site re-opens the 2026-07-02
+    claims-spent-on-undispatchable-rows starvation bug.
+
+    Canonical-order contract:
+    - Score gates come first (after stage) so MISSING_QUALITY_SCORE is
+      reported even for rows that also fail later gates — the daily loop's
+      L1-5 `missing_quality_score` escalation must stay reachable regardless
+      of send-eligibility.
+    - QUARANTINED is last: it is a timing state, not a disqualification.
+      QUARANTINED therefore means "would be invited today except
+      invite_eligible_after has not elapsed" — exactly the population
+      starvation's `quarantined_pool` metric counts.
+
+    ``strict`` selects the malformed-quality_score policy:
+    - True (the selection loops): ``int(score)`` raises TypeError/ValueError,
+      per the loops' fail-loud policy on corrupt data (§0 invariant #9).
+    - False (a claim filter): fails closed — returns MALFORMED_QUALITY_SCORE,
+      since leaving a row unclaimed is cheaper than wasting a claim (or
+      crashing the claim pass) on it.
+    """
+    if entry.get("stage") != PipelineStage.PROSPECT.value:
+        return InviteExclusionReason.NOT_PROSPECT
+    score = entry.get("quality_score")
+    if score is None:
+        return InviteExclusionReason.MISSING_QUALITY_SCORE
+    try:
+        low = int(score) < INVITE_QUALITY_SCORE_FLOOR
+    except (TypeError, ValueError):
+        if strict:
+            raise
+        return InviteExclusionReason.MALFORMED_QUALITY_SCORE
+    if low:
+        return InviteExclusionReason.LOW_QUALITY_SCORE
+    if not is_send_eligible(entry):
+        return InviteExclusionReason.NOT_SEND_ELIGIBLE
+    if not is_invite_eligible(entry, today):
+        return InviteExclusionReason.QUARANTINED
+    return None
+
+
 class DealStage(Enum):
     """Stages on the Attio 'deals' object — distinct from PipelineStage,
     which tracks the LinkedIn Outreach list-entry funnel. Deal records

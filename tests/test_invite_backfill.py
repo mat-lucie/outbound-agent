@@ -243,8 +243,8 @@ class TestTargetComputation:
              patch.object(daily_check, "get_remaining", return_value=remaining), \
              patch.object(daily_check, "_get_all_entries_parsed", return_value=prospects), \
              patch.object(daily_check, "ensure_throttle_policy_decision_opened"), \
-             patch.object(daily_check, "is_invite_eligible", return_value=True), \
-             patch.object(daily_check, "is_send_eligible", return_value=True), \
+             patch("models.pipeline.is_invite_eligible", return_value=True), \
+             patch("models.pipeline.is_send_eligible", return_value=True), \
              patch.object(daily_check, "_build_invite_send_data", side_effect=spy) as m, \
              patch.object(daily_check, "_pre_invite_degree_check", side_effect=lambda td, *a, **k: (td, [])), \
              patch.object(daily_check, "write_prospects_to_sheet"), \

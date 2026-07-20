@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from models.business_calendar import business_days_between
 from models.env import env_int_positive
-from models.pipeline import PipelineStage, is_invite_eligible, is_send_eligible
+from models.pipeline import InviteExclusionReason, invite_slice_reason
 from workflows.escalation import escalate
 
 if TYPE_CHECKING:
@@ -65,10 +65,12 @@ def _pool_metrics(entries: list[dict], today: date) -> dict[str, Any]:
     """Compute the three pool metrics + the most recent commit date.
 
     Returns a dict with:
-      - `invite_eligible_pool`: int — PROSPECT entries with score >= 60
-        that have cleared the quarantine window.
-      - `quarantined_pool`: int — PROSPECT entries with score >= 60 that
-        are still in quarantine.
+      - `invite_eligible_pool`: int — entries the shared invite chain
+        (`models.pipeline.invite_slice_reason`) admits to the invite
+        slice today.
+      - `quarantined_pool`: int — entries the chain excludes ONLY for
+        quarantine (would be invited once invite_eligible_after
+        elapses).
       - `most_recent_commit`: date | None — max prospect_committed_at
         truncated to date. None when no entry carries the attribute
         (legacy pipeline, backfill not yet run).
@@ -76,39 +78,40 @@ def _pool_metrics(entries: list[dict], today: date) -> dict[str, Any]:
     invite_eligible = 0
     quarantined = 0
     most_recent: date | None = None
-    for attrs in entries:
-        if attrs.get("stage") != PipelineStage.PROSPECT.value:
-            # Track most-recent commit across ALL stages so a healthy
-            # cadence is recognized even when prospects have already
-            # progressed past PROSPECT.
-            committed_at = attrs.get("prospect_committed_at")
-            if committed_at:
-                try:
-                    d = date.fromisoformat(str(committed_at)[:10])
-                except (TypeError, ValueError):
-                    continue
-                if most_recent is None or d > most_recent:
-                    most_recent = d
-            continue
-        if not is_send_eligible(attrs):
-            continue
-        score = attrs.get("quality_score")
-        if score is None or int(score) < 60:
-            continue
+
+    def _track_commit(attrs: dict) -> None:
+        nonlocal most_recent
         committed_at = attrs.get("prospect_committed_at")
-        if committed_at:
-            parsed_d: date | None
-            try:
-                parsed_d = date.fromisoformat(str(committed_at)[:10])
-            except (TypeError, ValueError):
-                parsed_d = None
-            if parsed_d is not None and (
-                most_recent is None or parsed_d > most_recent
-            ):
-                most_recent = parsed_d
-        if is_invite_eligible(attrs, today):
+        if not committed_at:
+            return
+        try:
+            d = date.fromisoformat(str(committed_at)[:10])
+        except (TypeError, ValueError):
+            return
+        if most_recent is None or d > most_recent:
+            most_recent = d
+
+    # The eligibility gates live in `models.pipeline.invite_slice_reason` —
+    # shared with the daily invite selection loop, so the pool counted here
+    # can never drift from what the daily run would actually invite.
+    # QUARANTINED is the chain's last gate, so it means "would be invited
+    # today except the quarantine window" — exactly this function's
+    # quarantined_pool.
+    # Commit-tracked population, in one place: non-PROSPECT rows (so a
+    # healthy cadence is recognized even when prospects have already
+    # progressed past PROSPECT) plus slice-eligible and quarantined
+    # PROSPECTs. Other exclusions (missing/low quality_score,
+    # send-ineligible) are not pool members and, as before, not
+    # commit-tracked.
+    _TRACKED = (None, InviteExclusionReason.NOT_PROSPECT,
+                InviteExclusionReason.QUARANTINED)
+    for attrs in entries:
+        reason = invite_slice_reason(attrs, today)
+        if reason in _TRACKED:
+            _track_commit(attrs)
+        if reason is None:
             invite_eligible += 1
-        else:
+        elif reason is InviteExclusionReason.QUARANTINED:
             quarantined += 1
     return {
         "invite_eligible_pool": invite_eligible,
