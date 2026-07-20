@@ -1180,7 +1180,11 @@ def attach_daily_run(
     ``read_only`` (e.g. a --dry-run send-dms, or the no-sender-id early return
     preview): attach to the row as a SNAPSHOT — do NOT reopen and do NOT close
     on exit, so a terminal row's prior status is never rewritten. A missing row
-    still raises NoDailyRunRow.
+    still raises NoDailyRunRow. Note: a read-only attach also never archives
+    terminal stray rows (the ``_archive_stray_rows`` sweep below is gated on
+    ``not read_only``) — a snapshot preview must not mutate the CRM, so stray
+    cleanup is deferred to the next writable run. This is a deliberate
+    deviation from upstream, which archived unconditionally.
     """
     actual_date = run_date or date.today()
     actual_machine = derive_machine_id(machine_id)
