@@ -17,19 +17,29 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict
 import click
 import httpx
 
-from clients.attio import AttioClient, _canonical_linkedin_url
+from clients.attio import AttioClient, _canonical_linkedin_url, first_option_title
 from clients.pb_config import li_session_cookie, li_user_agent_raw
 from models.business_calendar import add_business_days
 from models.campaign import load_personas
 from models.experiment import get_current_experiment_id
 from models.pipeline import PipelineStage
 from workflows.cadence import derive_cadence_lane
-from workflows.company_matcher import extract_real_domain, match_or_create_company
+from workflows.company_matcher import (
+    extract_real_domain,
+    find_company_record,
+    match_or_create_company,
+    normalize_company_name,
+)
 from workflows.escalation import escalate
 from workflows.identity_match import normalize_for_match
 from workflows.industry_classifier import build_anthropic_client
 from workflows.quality_gate import (
+    DECISION_MAKER_ROLE_CREDIT,
+    DETERMINISTIC_PASS_PATHS,
+    DETERMINISTIC_PASS_THRESHOLD,
     DISQUALIFIER_VERDICT_PATHS,
+    INDUSTRY_BONUS_IN_ICP,
+    NON_COMPETITOR_CREDIT,
     score_band,
     score_prospect,
 )
@@ -130,6 +140,13 @@ def _check_all_persona_target_lists_fresh(
     seen_paths: set[Path] = set()
     stale_results: list = []
     for _persona_key, persona in (personas_data or {}).items():
+        # Paused personas (active: false) are excluded from the weekly
+        # run entirely, so their backing target lists must not gate the
+        # batch — a stale list for a lane we're not harvesting should
+        # never halt the lanes we are. Mirrors the same guard in
+        # `_get_all_searches` so both chokepoints agree on what's live. (PR-226)
+        if not persona.get("active", True):
+            continue
         target_list_key = persona.get("target_company_list", "")
         if not target_list_key:
             continue
@@ -380,11 +397,26 @@ def _get_all_searches(personas_data: dict) -> list[tuple[str, str, str]]:
     are claimed before mid-market (Tier 2) processes the same PB CSV.
     """
     all_searches = []
+    paused = []
     for persona_key, persona in personas_data.items():
+        # Skip paused personas (active: false) entirely — re-activating a lane
+        # is a one-line config flip, but while paused its saved searches must
+        # not run. Mirrors the guard in _check_all_persona_target_lists_fresh. (PR-226)
+        if not persona.get("active", True):
+            paused.append(persona_key)
+            continue
         sn_urls = persona.get("search_queries", {}).get("sn_search_urls", {})
         for geo_key, url in sn_urls.items():
             if url and "PLACEHOLDER" not in url:
                 all_searches.append((persona_key, geo_key, url))
+    # Surface paused lanes so an operator never mistakes a silently
+    # skipped persona for a search that produced nothing.
+    if paused:
+        click.echo(
+            f"⏸ {len(paused)} persona(s) paused (active: false), excluded "
+            f"from this run: {', '.join(sorted(paused))}",
+            err=True,
+        )
     # Enterprise (ICP 1) runs first so they claim profiles before mid-market (ICP 2) can mis-tag them.
     all_searches.sort(key=lambda x: 0 if personas_data.get(x[0], {}).get("enterprise_mode") else 1)
     return all_searches
@@ -1120,14 +1152,23 @@ def _commit_prospect(
 
     company_domain = extract_real_domain(raw)
 
-    industry = None
-    if anthropic_client is not None:
+    # PR-25 follow-up: _process_prospects resolved industry (CRM lookup or
+    # ingest-time classification) before scoring — reuse it here so a brand-new
+    # company is CREATEd with the label + status already attached instead of
+    # burning a second classification. The classify fallback below only serves
+    # callers that commit without going through _process_prospects enrichment
+    # (tests passing a mock client).
+    industry = prospect_data.get("industry")
+    industry_status = prospect_data.get("industry_vertical_status")
+    if industry is None and anthropic_client is not None:
         from workflows.industry_classifier import classify_industry
         industry = classify_industry(
             prospect_data["company"],
             domain=company_domain or None,
             anthropic_client=anthropic_client,
         )
+        if industry:
+            industry_status = "low_confidence"
 
     # §7 boundary: `match_or_create_company` (company_matcher.py) is an
     # UNMIGRATED helper shared with `backfill_companies.backfill_import`; it
@@ -1141,6 +1182,7 @@ def _commit_prospect(
         prospect_data["company"],
         domain=company_domain or None,
         industry_vertical=industry,
+        industry_status=industry_status,
     )
 
     person_attrs: dict = {
@@ -1816,6 +1858,136 @@ def _load_in_list_canonical_urls(
     return urls
 
 
+def _resolve_company_industry(
+    attio: AttioClient,
+    company_name: str,
+    domain: str | None,
+    cache: dict[str, tuple[str | None, str | None]],
+    *,
+    dry_run: bool,
+    anthropic_client=None,
+    summary: dict | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve `(industry_vertical, industry_vertical_status)` for a prospect's
+    parent company, classifying at ingest time when the company has no label yet.
+
+    Resolution order (PR-25 follow-up — closes the TODO at quality_gate.py
+    `score_prospect`, which read `industry`/`industry_vertical_status` from
+    prospect_data that nothing populated):
+
+    1. Company record exists in the CRM with industry_vertical → return its
+       label + status. A label with no status returns status=None, which
+       score_prospect treats as "confirmed" — deliberate back-compat with
+       pre-PR-25 rows (scrape / manual / operator-confirmed labels never carried
+       a status).
+    2. Company exists without a label → classify via the LLM-dispatch path and
+       PATCH the company with the same payload backfill_missing_industries
+       writes (label + haiku_classifier provenance + low_confidence + 0.0).
+    3. No company record yet → classify; the label rides prospect_data into
+       _commit_prospect, which stamps it on the company CREATE.
+
+    Classification and the write-back are skipped in dry_run (no LLM spend, no
+    CRM writes) — dry-run scores may therefore lack the industry component for
+    never-seen companies, consistent with dry-run being a content QA pass, not
+    a score preview.
+
+    Returns (None, None) when the company is unknown and unclassifiable —
+    score_prospect treats missing industry as neutral, never as "Other".
+    Transient per-company CRM errors degrade to (None, None) with a warning;
+    auth errors (401/403) propagate so the run fails loud. (PR-225)
+    """
+    if not company_name:
+        return None, None
+    cache_key = normalize_company_name(company_name) or company_name.strip().lower()
+    if cache_key in cache:
+        return cache[cache_key]
+
+    from workflows.industry_classifier import build_classifier_payload, classify_industry
+
+    result: tuple[str | None, str | None] = (None, None)
+    try:
+        record = find_company_record(attio, company_name, domain or None)
+        if record is not None:
+            values = record.get("values", {})
+            label: str | None = first_option_title(values.get("industry_vertical"))
+            if label:
+                status = first_option_title(values.get("industry_vertical_status"))
+                result = (label, status or None)
+            elif not dry_run:
+                label = classify_industry(
+                    company_name, domain or None, anthropic_client=anthropic_client
+                )
+                if label:
+                    record_id = record.get("id", {}).get("record_id", "")
+                    if record_id:
+                        attio.update_company(record_id, build_classifier_payload(label))
+                    result = (label, "low_confidence")
+                    if summary is not None:
+                        summary["industry_classified_at_ingest"] = (
+                            summary.get("industry_classified_at_ingest", 0) + 1
+                        )
+        elif not dry_run:
+            # No company record yet — classify now so the score carries the
+            # industry signal; _commit_prospect stamps the label on CREATE.
+            label = classify_industry(
+                company_name, domain or None, anthropic_client=anthropic_client
+            )
+            if label:
+                result = (label, "low_confidence")
+                if summary is not None:
+                    summary["industry_classified_at_ingest"] = (
+                        summary.get("industry_classified_at_ingest", 0) + 1
+                    )
+    except httpx.HTTPStatusError as err:
+        if err.response.status_code in (401, 403):
+            raise  # auth failure — every later call fails too; abort loud
+        logger.warning(
+            "_resolve_company_industry: HTTP %s for %r — scoring without industry",
+            err.response.status_code, company_name,
+        )
+        if summary is not None:
+            summary["industry_resolve_errors"] = summary.get("industry_resolve_errors", 0) + 1
+    except (httpx.ConnectError, httpx.TimeoutException) as err:
+        logger.warning(
+            "_resolve_company_industry: network error for %r — scoring without "
+            "industry: %s", company_name, err,
+        )
+        if summary is not None:
+            summary["industry_resolve_errors"] = summary.get("industry_resolve_errors", 0) + 1
+
+    cache[cache_key] = result
+    return result
+
+
+def _enrich_prospect_industry(
+    attio: AttioClient,
+    prospect_data: dict,
+    raw: dict,
+    cache: dict[str, tuple[str | None, str | None]],
+    *,
+    dry_run: bool,
+    anthropic_client=None,
+    summary: dict | None = None,
+) -> None:
+    """Stamp `industry` / `industry_vertical_status` onto prospect_data from
+    the parent company (see _resolve_company_industry). Mutates in place; the
+    status key is only set when a status exists — an absent key means
+    score_prospect's back-compat "confirmed" default applies. (PR-225)"""
+    industry, industry_status = _resolve_company_industry(
+        attio,
+        prospect_data["company"],
+        extract_real_domain(raw),
+        cache,
+        dry_run=dry_run,
+        anthropic_client=anthropic_client,
+        summary=summary,
+    )
+    if industry:
+        prospect_data["industry"] = industry
+        if industry_status:
+            prospect_data["industry_vertical_status"] = industry_status
+
+
 def _process_prospects(
     prospects_raw: list[dict],
     crm: CRMProvider,
@@ -1834,6 +2006,7 @@ def _process_prospects(
     seen_urls_midmarket: set[str] | None = None,
     in_list_canonical_urls: set[str] | None = None,
     name_index: NameIndex | None = None,
+    industry_cache: dict[str, tuple[str | None, str | None]] | None = None,
 ) -> None:
     """Score, dedup, and load prospects into Attio. Mutates summary and seen_urls in place.
 
@@ -1852,6 +2025,16 @@ def _process_prospects(
     enterprise personas share the same DM intent (ICP 1).
     """
     is_midmarket = bool(persona_config and persona_config.get("target_company_mode"))
+    if industry_cache is None:
+        industry_cache = {}
+    # Industry enrichment (PR-225) needs the raw Attio escape hatch. A CRM
+    # provider without one (a non-Attio provider, or a spec'd test double)
+    # simply scores without the ingest-time industry signal (neutral) — the
+    # loud failure still fires at _commit_prospect when a real write happens.
+    try:
+        _attio: AttioClient | None = _attio_inner_client(crm)
+    except TypeError:
+        _attio = None
 
     # Load target company filter when in target_company_mode
     target_fragments: set[str] = set()
@@ -1872,7 +2055,11 @@ def _process_prospects(
             "company": raw.get("company", raw.get("companyName", raw.get("currentCompanyName", ""))),
             "location": raw.get("location", ""),
             "linkedin_url": raw.get("defaultProfileUrl", raw.get("linkedinProfileUrl", raw.get("linkedInUrl", raw.get("profileUrl", "")))),
-            "employee_count": raw.get("companyEmployees", raw.get("employeeCount", raw.get("numberOfEmployees", raw.get("companySize", "")))),
+            # No employee_count: SN search exports carry no headcount column
+            # (the old 4-column fallback chain silently returned "" on 100% of
+            # rows — 2026-07-06 RCA). Company size is a search-level signal now:
+            # score_prospect reads `search_size_credit` from the persona config
+            # instead of per-row data. (PR-227)
         }
 
         if not prospect_data["linkedin_url"]:
@@ -1909,6 +2096,12 @@ def _process_prospects(
                 and url not in seen_urls_midmarket
                 and borderline_stage is not None
             ):
+                if _attio is not None:
+                    _enrich_prospect_industry(
+                        _attio, prospect_data, raw, industry_cache,
+                        dry_run=dry_run, anthropic_client=anthropic_client,
+                        summary=summary,
+                    )
                 new_result = score_prospect(
                     prospect_data, persona_config=persona_config, agent_gate=True,
                 )
@@ -1934,9 +2127,31 @@ def _process_prospects(
         if is_midmarket and seen_urls_midmarket is not None:
             seen_urls_midmarket.add(url)
 
+        # PR-25 follow-up: resolve the parent company's industry (CRM lookup,
+        # classify-at-ingest when missing) before scoring so the industry
+        # component and abstain gate actually fire for new ingest. Runs after
+        # the dedup guard so cross-launch duplicate rows never pay the lookup;
+        # the shared cache makes same-company re-encounters free.
+        if _attio is not None:
+            _enrich_prospect_industry(
+                _attio, prospect_data, raw, industry_cache,
+                dry_run=dry_run, anthropic_client=anthropic_client, summary=summary,
+            )
+
         click.echo(f"    Scoring: {prospect_data['name']} ({prospect_data['company']})...")
         score_result = score_prospect(prospect_data, persona_config=persona_config, agent_gate=True)
         summary["scored"] += 1
+        # Signal-health counters (PR-227): a component that abstains/misses on
+        # ~100% of a run means a dead signal (the 2026-07-06 RCA class of
+        # failure) — the end-of-run SIGNAL alarm reads these. Size "abstained"
+        # means the persona declared NO search_size_credit; a configured credit
+        # of 0 is a deliberate zero, not an abstain, and must not alarm.
+        if (persona_config or {}).get("search_size_credit") is None:
+            summary.setdefault("size_abstained", 0)
+            summary["size_abstained"] += 1
+        if not prospect_data.get("industry"):
+            summary.setdefault("industry_missing", 0)
+            summary["industry_missing"] += 1
 
         if score_result.get("needs_agent_qualification"):
             # Borderline — stage for agent-driven Haiku qualification
@@ -1991,6 +2206,14 @@ def _process_prospects(
             continue
 
         summary["qualified"] += 1
+        if score_result.get("verdict_path") in DETERMINISTIC_PASS_PATHS:
+            # Deterministic passes counted apart from LLM borderline passes —
+            # this run-level number was invisible before the 2026-07-06 RCA
+            # (0 deterministic qualifies for 3 months, unnoticed). Membership
+            # comes from quality_gate.DETERMINISTIC_PASS_PATHS so a future
+            # lane's pass path cannot fall out of the count. (PR-227)
+            summary.setdefault("deterministic_qualified", 0)
+            summary["deterministic_qualified"] += 1
 
         # Authoritative dedup (2026-06-16 recycle fix): check the candidate's
         # canonical URL against the set of URLs already in the pipeline, built
@@ -2128,6 +2351,94 @@ def _is_supply_starved(summary: dict, dry_run: bool) -> bool:
     return summary.get("net_new_created", 0) == 0
 
 
+# Minimum scored-prospect count before the deterministic-qualifier and
+# dead-signal alarms are allowed to fire — a tiny run legitimately produces
+# zeros and 100%-missing rates, and alarming on it trains operators to
+# ignore the alarm. (PR-227)
+SIGNAL_ALARM_MIN_SCORED = 50
+# A signal that is missing/abstained on more than this share of a run is a
+# dead signal (the 2026-07-06 RCA class: industry unwired, size defaulting
+# on 100% of rows for 3 months, unnoticed).
+SIGNAL_DEAD_THRESHOLD = 0.9
+
+# Smallest search_size_credit at which a deterministic pass is geometrically
+# reachable, DERIVED from the scorer's own named constants: the best non-size
+# hand is decision-maker role + non-competitor + confirmed in-ICP industry,
+# and the pass gate is strictly > DETERMINISTIC_PASS_THRESHOLD. Deriving (not
+# hardcoding) means a recalibration of any component in quality_gate moves
+# this line automatically instead of silently invalidating the alarm gating
+# below. The 2026-07-06 calibration measured the auto-pass cell below the 80%
+# enable bar, so shipped configs deliberately sit one below the line. (PR-227)
+DETERMINISTIC_REACHABLE_MIN_CREDIT = (
+    DETERMINISTIC_PASS_THRESHOLD + 1
+    - (DECISION_MAKER_ROLE_CREDIT + NON_COMPETITOR_CREDIT + INDUSTRY_BONUS_IN_ICP)
+)
+
+
+def _deterministic_pass_reachable(
+    personas_data: dict, searched_persona_keys: set[str] | None = None
+) -> bool:
+    """True when a persona that actually contributed rows makes the
+    deterministic pass geometrically reachable (see
+    DETERMINISTIC_REACHABLE_MIN_CREDIT). While every searched credit sits
+    below the line, 0 deterministic qualifications is the *configured*
+    outcome, not a dead signal — the alarm must not fire on it.
+
+    `searched_persona_keys` scopes the check to the personas this run
+    harvested (from _get_all_searches): a high-credit persona whose search
+    never ran cannot produce passes, so counting it would arm a false alarm
+    (and paused/deprecated personas are naturally excluded). (PR-227)"""
+    for key, persona in (personas_data or {}).items():
+        if searched_persona_keys is not None and key not in searched_persona_keys:
+            continue
+        credit = persona.get("search_size_credit")
+        if credit is None:
+            continue
+        try:
+            if int(credit) >= DETERMINISTIC_REACHABLE_MIN_CREDIT:
+                return True
+        except (ValueError, TypeError):
+            # Malformed credit — load_personas validation rejects these at
+            # startup; a hand-built dict reaching here must not crash the
+            # end-of-run alarm block after commits already happened.
+            continue
+    return False
+
+
+def _run_alarm_eligible(summary: dict, dry_run: bool) -> bool:
+    """Shared gate for the signal-health alarms: only real (wet) runs of
+    meaningful size may alarm. Dry runs skip industry classification (no LLM
+    spend) so their miss-rates are 100% by construction, and tiny runs
+    legitimately produce zeros — alarming on either trains operators to
+    ignore the alarm. (PR-227)"""
+    return not dry_run and summary.get("scored", 0) >= SIGNAL_ALARM_MIN_SCORED
+
+
+def _is_deterministically_dead(summary: dict, dry_run: bool) -> bool:
+    """True when a real run scored a meaningful batch and the deterministic
+    scorer qualified nobody — every pass came from the LLM gate. Only
+    meaningful when the persona configs make a deterministic pass reachable
+    at all (caller gates on _deterministic_pass_reachable). (PR-227)"""
+    if not _run_alarm_eligible(summary, dry_run):
+        return False
+    return summary.get("deterministic_qualified", 0) == 0
+
+
+def _dead_signals(summary: dict, dry_run: bool) -> list[str]:
+    """Names of scoring signals missing/abstained on >90% of scored rows.
+    Dry-run industry misses are expected (classification is skipped to avoid
+    LLM spend), so only wet runs report. (PR-227)"""
+    if not _run_alarm_eligible(summary, dry_run):
+        return []
+    scored = summary["scored"]
+    dead = []
+    if summary.get("industry_missing", 0) / scored > SIGNAL_DEAD_THRESHOLD:
+        dead.append(f"industry (missing on {summary['industry_missing']}/{scored})")
+    if summary.get("size_abstained", 0) / scored > SIGNAL_DEAD_THRESHOLD:
+        dead.append(f"size (abstained on {summary['size_abstained']}/{scored})")
+    return dead
+
+
 def run_weekly_prospecting(
     crm: CRMProvider,
     pb: PhantomBusterClient,
@@ -2201,6 +2512,12 @@ def run_weekly_prospecting(
         "llm_error_staged": 0,
         "ledger_unavailable_staged": 0,
         "reprospect_review": 0,
+        # Signal health (PR-227, 2026-07-06 RCA): deterministic passes counted
+        # apart from LLM borderline passes, plus per-signal abstain/miss rates
+        # the end-of-run alarms read.
+        "deterministic_qualified": 0,
+        "size_abstained": 0,
+        "industry_missing": 0,
         # Per-verdict-path rejection counts, surfaced in the run summary so
         # sales-weekly / sales-learn can see which filter caught how many.
         # E.g. `deterministic_reject_sales_role` flags wrong-role leakage trends.
@@ -2269,6 +2586,12 @@ def run_weekly_prospecting(
     name_index = _build_name_index(crm, existing_entries)
     click.echo(f"  {len(name_index)} distinct names indexed for name+company dedup.\n")
 
+    # Industry resolution cache shared across ALL searches in this run — the
+    # same company routinely surfaces in multiple SN searches (enterprise +
+    # midmarket personas over one geo); sharing prevents duplicate CRM lookups
+    # and duplicate LLM classifications of the same company. (PR-225)
+    industry_cache: dict[str, tuple[str | None, str | None]] = {}
+
     for i, (persona_key, geo_key, sn_url) in enumerate(searches, 1):
         click.echo(f"[{i}/{len(searches)}] {persona_key} / {geo_key}")
         click.echo(f"  URL: {sn_url[:80]}...")
@@ -2277,33 +2600,65 @@ def run_weekly_prospecting(
         persona_config = dict(personas_data.get(persona_key, {}))
         persona_config["key"] = persona_key
 
-        # Launch and download CSV
-        if not dry_run:
-            csv_text = _launch_and_download(pb, search_export_id, sn_url, batch_size)
-            if not csv_text:
-                click.echo("  No results. Skipping.\n")
+        # Launch and download CSV. The whole per-search body is guarded
+        # (PR-227, SRE lens): an unguarded raise here used to skip every
+        # end-of-run alarm block — the exact safety net the 2026-07-06 RCA
+        # added. A failed search now logs, counts, and continues so the
+        # signal-health verdict always runs on whatever WAS scored. Auth
+        # failures (401/403) still abort loud — every later call fails too.
+        try:
+            if not dry_run:
+                csv_text = _launch_and_download(pb, search_export_id, sn_url, batch_size)
+                if not csv_text:
+                    click.echo("  No results. Skipping.\n")
+                    continue
+            else:
+                click.echo("  [DRY RUN] Skipping PhantomBuster launch.\n")
                 continue
-        else:
-            click.echo("  [DRY RUN] Skipping PhantomBuster launch.\n")
-            continue
 
-        # Parse CSV
-        prospects_raw = list(csv.DictReader(io.StringIO(csv_text)))
-        summary["exported"] += len(prospects_raw)
-        click.echo(f"  Exported {len(prospects_raw)} prospects.")
+            # Parse CSV
+            prospects_raw = list(csv.DictReader(io.StringIO(csv_text)))
+            summary["exported"] += len(prospects_raw)
+            click.echo(f"  Exported {len(prospects_raw)} prospects.")
 
-        # Process
-        _process_prospects(
-            prospects_raw, crm, list_id, today, dry_run, summary, seen_urls,
-            in_list_record_ids=in_list_record_ids,
-            persona_config=persona_config, borderline_stage=borderline_stage,
-            reprospect_review=reprospect_review,
-            anthropic_client=anthropic_client,
-            existing_entries=existing_entries,
-            seen_urls_midmarket=seen_urls_midmarket,
-            in_list_canonical_urls=in_list_canonical_urls,
-            name_index=name_index,
-        )
+            # Process
+            _process_prospects(
+                prospects_raw, crm, list_id, today, dry_run, summary, seen_urls,
+                in_list_record_ids=in_list_record_ids,
+                persona_config=persona_config, borderline_stage=borderline_stage,
+                reprospect_review=reprospect_review,
+                anthropic_client=anthropic_client,
+                existing_entries=existing_entries,
+                seen_urls_midmarket=seen_urls_midmarket,
+                in_list_canonical_urls=in_list_canonical_urls,
+                name_index=name_index,
+                industry_cache=industry_cache,
+            )
+        except httpx.HTTPStatusError as err:
+            if err.response.status_code in (401, 403):
+                raise  # auth failure cascades — abort the whole run loud
+            summary.setdefault("searches_aborted", 0)
+            summary["searches_aborted"] += 1
+            logger.exception(
+                "search %s/%s aborted (HTTP %s) — continuing with remaining searches",
+                persona_key, geo_key, err.response.status_code,
+            )
+            click.echo(
+                f"  ⚠ search aborted (HTTP {err.response.status_code}) — "
+                "continuing; see summary.",
+                err=True,
+            )
+        except Exception:  # noqa: BLE001 — alarms must still run at end of run
+            summary.setdefault("searches_aborted", 0)
+            summary["searches_aborted"] += 1
+            logger.exception(
+                "search %s/%s aborted — continuing with remaining searches",
+                persona_key, geo_key,
+            )
+            click.echo(
+                "  ⚠ search aborted (unexpected error) — continuing; see summary.",
+                err=True,
+            )
         click.echo()
 
     # Write borderline JSONL (even for dry-run — the agent wants to see them)
@@ -2335,6 +2690,37 @@ def run_weekly_prospecting(
     click.echo(f"Exported:   {summary['exported']}")
     click.echo(f"Scored:     {summary['scored']}")
     click.echo(f"Qualified:  {summary['qualified']}")
+    click.echo(
+        f"   ├ deterministic (scorer alone): {summary.get('deterministic_qualified', 0)}"
+    )
+    click.echo(
+        f"   └ via LLM borderline gate: "
+        f"{summary['qualified'] - summary.get('deterministic_qualified', 0)}"
+    )
+    # Signal health (PR-227, 2026-07-06 RCA): industry resolution + size
+    # scoping. Framed as coverage, not deficit — "missing" read as a defect on
+    # healthy runs (unclassifiable companies are neutral-scored by design, not
+    # lost).
+    _ind_missing = summary.get("industry_missing", 0)
+    _size_abst = summary.get("size_abstained", 0)
+    click.echo(
+        f"Signals:    industry resolved on {summary['scored'] - _ind_missing}"
+        f"/{summary['scored']} scored ({_ind_missing} unclassifiable — neutral)"
+        f" · size abstained on {_size_abst}/{summary['scored']}"
+        + (" (dry-run: industry classification skipped — 0 resolved is expected)"
+           if dry_run else "")
+    )
+    if summary.get("searches_aborted"):
+        click.echo(
+            f"⚠ Aborted:   {summary['searches_aborted']} search(es) failed mid-run "
+            "and were skipped — counts above cover only completed searches.",
+            err=True,
+        )
+    if summary.get("industry_classified_at_ingest") or summary.get("industry_resolve_errors"):
+        click.echo(
+            f"            {summary.get('industry_classified_at_ingest', 0)} industries "
+            f"classified at ingest · {summary.get('industry_resolve_errors', 0)} resolve errors"
+        )
     click.echo(f"Duplicates: {summary['duplicates']}")
     click.echo(f"Rejected:   {summary['rejected']}")
     if summary["rejected_by_path"]:
@@ -2378,6 +2764,56 @@ def run_weekly_prospecting(
         click.echo(
             "   The Sales Nav saved searches are likely exhausted — refresh the "
             "configured search inputs (the persona search URLs).",
+            err=True,
+        )
+
+    # Deterministic-qualifier alarm (PR-227, 2026-07-06 RCA): the scorer ran 0
+    # deterministic qualifications on every weekly for 3 months and nothing
+    # noticed — a hard zero from a component that is supposed to classify is a
+    # bug signal, not a statistic.
+    searched_persona_keys = {persona_key for persona_key, _geo, _url in searches}
+    autopass_reachable = _deterministic_pass_reachable(
+        personas_data, searched_persona_keys
+    )
+    if autopass_reachable and _is_deterministically_dead(summary, dry_run):
+        click.echo("", err=True)
+        click.echo(
+            "⚠️  DETERMINISTIC QUALIFIER ALARM: 0 deterministic qualifications "
+            f"across {summary['scored']} scored prospects.",
+            err=True,
+        )
+        click.echo(
+            "   Every pass this run came from the LLM borderline gate. A scoring "
+            "signal has likely died (missing industry labels, missing "
+            "search_size_credit in personas.json, or a threshold drift).",
+            err=True,
+        )
+    elif not autopass_reachable and summary.get("deterministic_qualified", 0) == 0:
+        # The suppressed state must itself be visible: "configured off" and
+        # "died again" look identical (0) without this line — the exact
+        # observability gap that hid the original 3-month failure.
+        click.echo(
+            f"ℹ  Deterministic auto-pass is configured OFF for this run's "
+            f"personas (every search_size_credit < "
+            f"{DETERMINISTIC_REACHABLE_MIN_CREDIT}) — 0 deterministic "
+            "qualifications is the expected outcome, not a dead signal.",
+            err=True,  # same stream as the ⚠ alarm this line stands in for
+        )
+
+    # Dead-signal alarm (same RCA): a component missing on >90% of a run's
+    # rows is structurally dead, whatever each individual row's score says.
+    dead_signals = _dead_signals(summary, dry_run)
+    if dead_signals:
+        click.echo("", err=True)
+        click.echo(
+            f"⚠️  SIGNAL ALARM: {len(dead_signals)} scoring signal(s) dead this run: "
+            + "; ".join(dead_signals),
+            err=True,
+        )
+        click.echo(
+            "   A signal that defaults/misses on nearly every row contributes "
+            "nothing and silently caps scores. Check industry ingest wiring "
+            "(PR-225) and search_size_credit persona config.",
             err=True,
         )
 

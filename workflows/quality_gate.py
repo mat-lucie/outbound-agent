@@ -9,7 +9,7 @@ falls back to the deterministic threshold.
 import json
 import logging
 import re
-from typing import Literal
+from typing import Literal, cast
 
 from clients.settings import ConfigError, config_dir
 from workflows.icp_config import ICPConfig, load_icp_config
@@ -104,6 +104,25 @@ INDUSTRY_PENALTY_OFF_ICP = _ICP.industry_penalty_off_icp
 # keep their individual contributions.
 OPS_IN_INDUSTRIAL_COMBINED = _ICP.ops_in_industrial_combined
 
+# ── Deterministic-pass geometry (PR-227) ─────────────────────────────
+# The strict gate for a deterministic pass in score_prospect (score must be
+# STRICTLY greater). Named so downstream reachability math (see
+# weekly_prospect.DETERMINISTIC_REACHABLE_MIN_CREDIT) derives from the same
+# number the verdict branch uses instead of re-encoding a literal 75.
+DETERMINISTIC_PASS_THRESHOLD = 75
+# The two largest non-size, non-joint component credits — the "best hand" a
+# prospect can hold besides the search-scoped size credit and the industry
+# bonus. Named for the same reason: the reachability line is derived from
+# these, and an unnamed literal drifting in this file would silently
+# invalidate the alarm gating in weekly_prospect.
+DECISION_MAKER_ROLE_CREDIT = 28
+NON_COMPETITOR_CREDIT = 20
+
+# Bump whenever the component geometry changes in a way that shifts the score
+# scale (see the scale_version stamp in score_prospect): analytics that pool
+# quality_score across scale versions are comparing different rulers.
+SCORING_SCALE_VERSION = "2026-07-search-credit"
+
 
 # ── Score-band helper (Phase 1 auto-research) ───────────────────────
 # Single source of truth so the writer (weekly_prospect.py) and the reader
@@ -124,7 +143,7 @@ def score_band(score: int | float | None) -> str | None:
         return "<40"
     if s < 60:
         return "40-59"
-    if s <= 75:
+    if s <= DETERMINISTIC_PASS_THRESHOLD:
         return "60-75"
     return ">75"
 
@@ -516,6 +535,16 @@ VERDICT_PATHS: frozenset[str] = frozenset({
     "disqualifier_medical_regulatory",
 })
 
+# The verdict paths score_prospect emits for a DETERMINISTIC pass (>75 gate,
+# no LLM involved). Single source of truth for "was this pass deterministic?"
+# — consumers (e.g. weekly_prospect's deterministic_qualified counter) import
+# this instead of hand-listing the paths, so a future lane's pass path cannot
+# silently fall out of the count. (PR-227)
+DETERMINISTIC_PASS_PATHS: frozenset[str] = frozenset({
+    "enterprise_pass",
+    "target_pass",
+})
+
 DISQUALIFIER_VERDICT_PATHS: frozenset[str] = frozenset({
     "disqualifier_hr",
     "disqualifier_finance",
@@ -610,26 +639,6 @@ def _detect_language(location: str, name: str = "") -> str:
     return "en"
 
 
-def _parse_employee_count(raw: str | int | None) -> int:
-    """Parse employee count from various formats."""
-    if raw is None:
-        return 0
-    if isinstance(raw, int):
-        return raw
-    raw_str = str(raw).strip().replace(",", "").replace("+", "")
-    # Handle ranges like "5001-10000"
-    if "-" in raw_str:
-        parts = raw_str.split("-")
-        try:
-            return int(parts[-1])
-        except ValueError:
-            pass
-    # Handle "10K" style
-    raw_str = raw_str.lower().replace("k", "000").replace("m", "000000")
-    match = re.search(r"\d+", raw_str)
-    return int(match.group()) if match else 0
-
-
 # ── LLM qualifier system prompt (externalized to a Jinja2 template) ──────
 # P2b: the narrative, ICP-specific pieces of the LLM tiebreaker's system prompt
 # (product summary, geography requirement, the two ICP-lane blocks, and the
@@ -713,7 +722,6 @@ def render_qualification_prompt(prospect_data: dict, persona_config: dict | None
         f"- Title: {prospect_data.get('title', '')}\n"
         f"- Company: {prospect_data.get('company', '')}\n"
         f"- Location: {prospect_data.get('location', '')}\n"
-        f"- Employee count: {prospect_data.get('employee_count', 'unknown')}\n"
         f"- Persona mode: {mode}\n"
     )
     return {"system": QUALIFIER_SYSTEM_PROMPT, "user": user_content}
@@ -868,14 +876,17 @@ def score_prospect(
 
     Args:
         prospect_data: Dict with keys: name, title, company, location,
-                       employee_count, linkedin_url, etc.
+                       linkedin_url, etc.
         persona_config: Optional persona config (from personas.json). Two
                        dedicated modes:
                        - target_company_mode=true → Lane 1 mid-market scoring
-                         (200-2000 emp sweet spot, curated target company list).
+                         (curated target company list).
                        - enterprise_mode=true → Lane 2 enterprise subsidiary
-                         scoring (5000+ emp sweet spot, rewards unknown size as
-                         neutral-positive since Sales Nav search is pre-scoped).
+                         scoring.
+                       The size component reads `search_size_credit` /
+                       `search_headcount_filter` from the config (the saved
+                       search's headcount facet is the size signal — see the
+                       size block below); no config → size abstains.
                        In target_company_mode the curated persona key is assigned
                        directly. In enterprise_mode the persona is re-classified
                        by title (the search returns mixed titles, so binding the
@@ -893,20 +904,20 @@ def score_prospect(
     # Default "confirmed" for back-compat with prospects that predate PR-25 and
     # don't carry the new attr — existing scoring behavior is preserved.
     #
-    # TODO(PR-25 follow-up — see task chip): weekly_prospect.py currently does NOT
-    # populate `industry_vertical_status` into prospect_data when building from
-    # PB CSV rows, so the default fires for 100% of new ingest and the PR-25
-    # abstain gate is dormant for production scoring. The integration is its
-    # own architectural concern (Attio Companies lookup → prospect_data builder)
-    # and is tracked as a separate PR. silent-failure-hunter QA flagged this as
-    # BLOCKING-1; GTM-QA recommended deferral to preserve back-compat semantics.
-    # This default does NOT introduce a regression — pre-PR-25 scoring already
-    # silently trusted the industry string at face value.
+    # PR-25 follow-up (PR-225): weekly_prospect._resolve_company_industry now
+    # populates `industry` + `industry_vertical_status` into prospect_data at
+    # ingest (company lookup, classify-on-miss), so the abstain gate is live
+    # for new ingest. The "confirmed" default below remains for labels that
+    # predate the status attr (scrape / manual / operator-set) — those carry no
+    # status and keep pre-PR-25 face-value semantics.
+    _raw_status = prospect_data.get("industry_vertical_status") or "confirmed"
+    # A status outside the known set (operator typo / future schema drift in
+    # the CRM select) must abstain, not silently score as confirmed.
     industry_vertical_status: Literal["confirmed", "unknown", "low_confidence"] = (
-        prospect_data.get("industry_vertical_status") or "confirmed"
+        cast("Literal['confirmed', 'unknown', 'low_confidence']", _raw_status)
+        if _raw_status in ("confirmed", "unknown", "low_confidence")
+        else "unknown"
     )
-    employee_count = _parse_employee_count(prospect_data.get("employee_count"))
-
     score = 0
     reasons: list[str] = []
     component_scores: dict[str, int] = {}
@@ -920,74 +931,47 @@ def score_prospect(
         )
 
     size_score_before = score
-    # 1. Company size (0-30 points)
-    if target_company_mode:
-        # Mid-market ICP: $50M-$500M revenue ≈ 200-2000 employees sweet spot.
-        # NOTE: For capital-intensive verticals (tequila, wine, mining equipment) a 100-emp
-        # company can do $100M+ revenue, so we score 50-199 generously to avoid filtering
-        # them out on headcount alone.
-        if 200 <= employee_count <= 2000:
-            score += 28
-            reasons.append(f"Mid-market sweet spot ({employee_count} employees)")
-        elif 50 <= employee_count < 200:
-            score += 22
-            reasons.append(f"Lower edge of mid-market ({employee_count} employees, revenue may still fit if capital-intensive)")
-        elif 2000 < employee_count <= 5000:
-            score += 18
-            reasons.append(f"Upper edge of mid-market ({employee_count} employees)")
-        elif employee_count > 5000:
-            score += 3
-            reasons.append(f"Too large for mid-market ({employee_count} employees)")
-        elif employee_count > 0:
-            score += 2
-            reasons.append(f"Too small for mid-market ({employee_count} employees)")
-        else:
-            score += 22
-            reasons.append("Unknown company size (default mid-market)")
-    elif enterprise_mode:
-        # Enterprise Lane 2: reward large multinational parents. Unknown headcount
-        # is common in PB Sales Nav exports — treat as neutral-positive since the
-        # search was already scoped to enterprise companies. Bands widened to
-        # include small subsidiaries of large parents (ICP correction).
-        if employee_count >= 5000:
-            score += 28
-            reasons.append(f"Enterprise sweet spot ({employee_count}+ employees)")
-        elif employee_count >= 2000:
-            score += 25
-            reasons.append(f"Upper mid-enterprise ({employee_count} employees)")
-        elif employee_count >= 500:
-            score += 22
-            reasons.append(f"Smaller than enterprise sweet spot ({employee_count} employees)")
-        elif employee_count >= 200:
-            score += 15
-            reasons.append(f"Below enterprise scale ({employee_count} employees, mid-market territory)")
-        elif employee_count > 0:
-            score += 5
-            reasons.append(f"Small subsidiary ({employee_count} employees)")
-        else:
-            score += 20
-            reasons.append("Unknown company size (enterprise-search default)")
-
-        # ERP presence is a strong ICP 1 structural signal
-        erp_keywords = {"sap", "s/4hana", "oracle", "erp"}
-        company_info = (prospect_data.get("company_headline", "") + " " + prospect_data.get("description", "")).lower()
-        if any(kw in company_info for kw in erp_keywords):
-            score += 5
-            reasons.append("ERP signal detected (+5)")
+    # 1. Company size (0-30 points) — search-scoped structural credit. (PR-227)
+    #
+    # Sales-search exports carry NO headcount column, so per-row employee_count
+    # was empty on 100% of production rows and the old per-prospect bands
+    # silently defaulted on everyone (2026-07-06 RCA: deterministic
+    # qualification was mathematically impossible since April). The size signal
+    # actually lives in the saved search: every search is scoped with a
+    # company-headcount facet, so every exported row already passed the size
+    # filter. The persona config declares that scoping and the credit it earns:
+    #   search_size_credit      — points granted to every row from this search
+    #   search_headcount_filter — the headcount facet, echoed into the reasons
+    # No declared scoping → ABSTAIN (0 points, mirroring low-confidence
+    # industry): a default that fires on 100% of inputs is an offset, not a
+    # score. The credit value is calibration-gated — see the RCA fix and the
+    # PR that introduced this block before changing it.
+    search_size_credit = (persona_config or {}).get("search_size_credit")
+    if search_size_credit is not None:
+        try:
+            credit = int(search_size_credit)
+        except (ValueError, TypeError):
+            # A bare int() error names neither the key nor the file — make
+            # the config typo (e.g. the headcount facet string pasted into
+            # the credit key) diagnosable from the message alone.
+            raise ValueError(
+                f"search_size_credit={search_size_credit!r} in the persona "
+                "config is not an integer — expected 0-30 (personas.json)."
+            ) from None
+        if not 0 <= credit <= 30:
+            raise ValueError(
+                f"search_size_credit={credit} out of the size component's "
+                "0-30 range — check the persona config."
+            )
+        score += credit
+        headcount_filter = (persona_config or {}).get(
+            "search_headcount_filter", "declared in persona config"
+        )
+        reasons.append(
+            f"Size scoped by SN search (+{credit}): headcount {headcount_filter}"
+        )
     else:
-        # Legacy enterprise-biased scoring (existing personas)
-        if employee_count >= 2000:
-            score += 28
-            reasons.append(f"Large company ({employee_count}+ employees)")
-        elif employee_count >= 500:
-            score += 20
-            reasons.append(f"Mid-size company ({employee_count} employees)")
-        elif employee_count > 0:
-            score += 3
-            reasons.append(f"Small company ({employee_count} employees)")
-        else:
-            score += 10
-            reasons.append("Unknown company size (default mid)")
+        reasons.append("Company size unknown (search not size-scoped): abstained")
 
     component_scores["size"] = score - size_score_before
     role_score_before = score
@@ -1052,7 +1036,7 @@ def score_prospect(
         score += 2
         reasons.append(f"Global-scope executive (out of LATAM scope): {title}")
     elif is_decision_maker:
-        score += 28
+        score += DECISION_MAKER_ROLE_CREDIT
         reasons.append(f"Decision-maker title: {title}")
     elif is_ops_industrial_joint:
         # Joint signal: ops-influencer at in-ICP industrial company.  The role
@@ -1103,7 +1087,7 @@ def score_prospect(
         score += 8
         reasons.append("Consultant (moderate priority)")
     else:
-        score += 20
+        score += NON_COMPETITOR_CREDIT
         reasons.append("Not a competitor")
 
     component_scores["competitor"] = score - competitor_score_before
@@ -1221,7 +1205,16 @@ def score_prospect(
         "persona": persona,
         "language": language,
         "reasons": reasons,
-        "score_breakdown": {**component_scores, "reasons": reasons},
+        # Scale version (PR-227, measurement-integrity lens): the search-credit
+        # change shifted every lane's scale, so any consumer pooling scores
+        # across the change date (threshold_calibration ROC, diagnostic bands)
+        # mixes two scales. This stamp lets them segment or refuse. Bump it
+        # whenever the component geometry changes again.
+        "score_breakdown": {
+            **component_scores,
+            "scale_version": SCORING_SCALE_VERSION,
+            "reasons": reasons,
+        },
         "scoring_lane": scoring_lane,
         "verdict_path": None,
     }
@@ -1264,10 +1257,24 @@ def score_prospect(
         # matches the dominant signal in the title.
         result["pass"] = False
         result["verdict_path"] = "deterministic_reject_junior_ic"
-    elif final_score < 40:
+    elif final_score < 40 and not (
+        # Adversarial-QA rescue (PR-227, pipeline-leakage lens): a
+        # DECISION-MAKER title pushed under the reject line SOLELY by the
+        # off-ICP industry penalty must reach the LLM band, not die in a
+        # silent deterministic reject. The "Other" label is a name-only
+        # classification (conglomerates / holding companies that own real
+        # plants mislabel into it) and the LLM qualifier prompt is the
+        # designed check against exactly that misjudgment. Guarded to the
+        # decisive case only: without the industry penalty the row would have
+        # cleared 40 on its own. Falling through to the borderline/LLM branch
+        # keeps the row reviewable; the score itself is untouched.
+        is_decision_maker
+        and component_scores.get("industry", 0) < 0
+        and final_score - component_scores["industry"] >= 40
+    ):
         result["pass"] = False
         result["verdict_path"] = "deterministic_reject"
-    elif final_score > 75:
+    elif final_score > DETERMINISTIC_PASS_THRESHOLD:
         result["pass"] = True
         result["verdict_path"] = "enterprise_pass" if enterprise_mode else "target_pass"
         # PR-28 icp_lane_persisted fix: deterministic pass implies the

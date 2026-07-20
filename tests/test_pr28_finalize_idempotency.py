@@ -741,13 +741,15 @@ class TestIcpLanePersistedFix:
     """
 
     def test_deterministic_enterprise_pass_at_real_icp_company(self):
-        persona = {"enterprise_mode": True, "key": "operations_leaders"}
+        # A deterministic enterprise pass needs a credit above the reachability
+        # line (PR-227): 22 + 28 (DM) + 20 + 12 (confirmed in-ICP) = 82 > 75.
+        persona = {"enterprise_mode": True, "key": "operations_leaders",
+                   "search_size_credit": 22}
         result = score_prospect({
             "name": "Test",
             "title": "VP Operations LATAM",
             "company": "Whirlpool Mexico",
             "location": "Mexico City, Mexico",
-            "employee_count": 70000,
             "industry": "Manufacturing",
         }, persona_config=persona)
         assert result["pass"] is True
@@ -755,13 +757,13 @@ class TestIcpLanePersistedFix:
         assert result.get("icp_lane") == 1
 
     def test_deterministic_target_pass_sets_icp_lane_2(self):
-        persona = {"target_company_mode": True, "key": "operations_leaders"}
+        persona = {"target_company_mode": True, "key": "operations_leaders",
+                   "search_size_credit": 22}
         result = score_prospect({
             "name": "Test",
             "title": "Director de Operaciones",
             "company": "Mid-Market LATAM Mfg",
             "location": "Lima, Peru",
-            "employee_count": 800,
             "industry": "Manufacturing",
         }, persona_config=persona)
         assert result["pass"] is True

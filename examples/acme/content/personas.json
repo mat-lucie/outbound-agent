@@ -1,6 +1,8 @@
 {
   "digitalization_champions": {
     "label": "Digitalization Champions",
+    "search_size_credit": 15,
+    "search_headcount_filter": "501-1,000 / 1,001-5,000 / 5,001-10,000 / 10,001+",
     "target_titles": [
       "Dir. Digitalización",
       "VP Innovation",
@@ -24,6 +26,8 @@
   },
   "operations_leaders": {
     "label": "Operations Leaders",
+    "search_size_credit": 15,
+    "search_headcount_filter": "501-1,000 / 1,001-5,000 / 5,001-10,000 / 10,001+",
     "target_titles": [
       "VP Operaciones",
       "Dir. Manufactura",
@@ -47,6 +51,8 @@
   },
   "executive_sponsors": {
     "label": "Executive Sponsors",
+    "search_size_credit": 15,
+    "search_headcount_filter": "501-1,000 / 1,001-5,000 / 5,001-10,000 / 10,001+",
     "target_titles": [
       "CFO",
       "COO",
@@ -70,6 +76,8 @@
   },
   "mx_midmarket_manufacturing": {
     "label": "MX Mid-Market Manufacturing",
+    "search_size_credit": 15,
+    "search_headcount_filter": "51-200 / 201-500",
     "target_titles": [
       "Director de Operaciones",
       "Gerente de Planta",
@@ -99,6 +107,8 @@
   },
   "co_midmarket_manufacturing": {
     "label": "CO Mid-Market Manufacturing",
+    "search_size_credit": 15,
+    "search_headcount_filter": "51-200 / 201-500",
     "target_titles": [
       "Director de Operaciones",
       "Gerente de Planta",
@@ -128,6 +138,8 @@
   },
   "cl_midmarket_manufacturing": {
     "label": "CL Mid-Market Manufacturing",
+    "search_size_credit": 15,
+    "search_headcount_filter": "51-200 / 201-500",
     "target_titles": [
       "Director de Operaciones",
       "Gerente de Planta",
@@ -154,6 +166,27 @@
       "sn_search_urls": [
         "https://www.linkedin.com/sales/search/people?example=acme"
       ]
+    }
+  },
+  "deprecated_example_lane": {
+    "label": "Deprecated Example Lane",
+    "active": false,
+    "deprecated": true,
+    "search_size_credit": 15,
+    "search_headcount_filter": "51-200 / 201-500",
+    "target_titles": [
+      "Director de Operaciones"
+    ],
+    "volume_per_month": "0",
+    "hook_angle": "Reference hook angle for the Acme example operator.",
+    "target_company_mode": true,
+    "target_company_list": "mx-midmarket",
+    "icp_notes": "Synthetic PAUSED lane — exercises the persona-deprecation guard (PR-226). active:false keeps blocks resolvable for existing records while excluding the lane from harvest and the target-freshness gate.",
+    "search_queries": {
+      "content_keywords": [
+        "operations"
+      ],
+      "sn_search_urls": []
     }
   }
 }

@@ -465,6 +465,73 @@ class TestPersonaOrchestration:
                 personas_data, attio,
             )
 
+    def test_paused_persona_stale_list_does_not_gate_batch(
+        self, tmp_path, monkeypatch,
+    ):
+        # PR-226 companion: a persona flagged `active: false` is excluded
+        # from the weekly run, so its stale target list must NOT raise and
+        # halt the lanes that ARE running.
+        from workflows import weekly_prospect
+        monkeypatch.setattr(weekly_prospect, "CONTENT_DIR", tmp_path)
+        _make_target_file(
+            tmp_path, "midmarket", days_old=STALE_THRESHOLD_DAYS + 30,
+        )
+        personas_data = {
+            "midmarket_mx": {
+                "active": False,
+                "target_company_list": "midmarket",
+            },
+        }
+        attio = MagicMock()
+        # No raise, and no escalation queued for the paused lane.
+        weekly_prospect._check_all_persona_target_lists_fresh(
+            personas_data, attio,
+        )
+        attio.assert_not_called()
+
+    def test_paused_stale_plus_active_fresh_passes(
+        self, tmp_path, monkeypatch,
+    ):
+        # Mixed roster: active persona with a fresh list runs; paused
+        # persona with a stale list is ignored. The gate must pass.
+        from workflows import weekly_prospect
+        monkeypatch.setattr(weekly_prospect, "CONTENT_DIR", tmp_path)
+        _make_target_file(
+            tmp_path, "midmarket", days_old=STALE_THRESHOLD_DAYS + 30,
+        )
+        _make_target_file(tmp_path, "enterprise", days_old=5)
+        personas_data = {
+            "operations_leaders": {"target_company_list": "enterprise"},
+            "midmarket_mx": {
+                "active": False,
+                "target_company_list": "midmarket",
+            },
+        }
+        attio = MagicMock()
+        weekly_prospect._check_all_persona_target_lists_fresh(
+            personas_data, attio,
+        )
+
+    def test_active_stale_still_raises_with_paused_sibling(
+        self, tmp_path, monkeypatch,
+    ):
+        # Guard the guard: pausing one persona must not accidentally
+        # loosen the gate for lanes that are still live.
+        from workflows import weekly_prospect
+        monkeypatch.setattr(weekly_prospect, "CONTENT_DIR", tmp_path)
+        _make_target_file(
+            tmp_path, "enterprise", days_old=STALE_THRESHOLD_DAYS + 30,
+        )
+        personas_data = {
+            "operations_leaders": {"target_company_list": "enterprise"},
+            "midmarket_mx": {"active": False, "target_company_list": "gone"},
+        }
+        attio = MagicMock()
+        with pytest.raises(WeeklyTargetListStaleError):
+            weekly_prospect._check_all_persona_target_lists_fresh(
+                personas_data, attio,
+            )
+
 
 # -- Registry + manifest invariants -------------------------------------
 

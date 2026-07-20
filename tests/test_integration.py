@@ -117,6 +117,22 @@ def _make_attio_entry(
     }
 
 
+# Persona configs for tests that need the deterministic commit path: shipped
+# configs sit at search_size_credit=15 (auto-pass deliberately unreachable —
+# 2026-07-06 calibration), so these tests inject a credit above the line.
+# Geometry: 30 (size credit) + 28 (decision-maker) + 20 (non-competitor) = 78
+# > 75 → enterprise_pass without needing an industry label. (PR-227)
+TEST_PERSONAS_DETERMINISTIC = {
+    "operations_leaders": {
+        "label": "Operations Leaders",
+        "enterprise_mode": True,
+        "search_headcount_filter": "501+ (test fixture)",
+        "search_size_credit": 30,
+        "search_queries": {"sn_search_urls": {}},
+    },
+}
+
+
 def _make_sn_csv(rows: list[dict]) -> str:
     """Build a Sales Navigator-style CSV string from a list of row dicts."""
     import csv
@@ -164,7 +180,8 @@ class TestWeeklyProspectIntegration:
         attio.search_person_by_linkedin.return_value = None  # not a duplicate
         attio.upsert_person.return_value = {"id": {"record_id": "rec-abc"}}
 
-        with patch("workflows.weekly_prospect._get_all_searches") as mock_searches:
+        with patch("workflows.weekly_prospect._get_all_searches") as mock_searches, \
+             patch("workflows.weekly_prospect.load_personas", return_value=TEST_PERSONAS_DETERMINISTIC):
             mock_searches.return_value = [(
                 "operations_leaders",
                 "mx",
@@ -284,7 +301,8 @@ class TestWeeklyProspectIntegration:
             {"id": {"record_id": "existing-rec", "entry_id": "entry-X"}, "entry_values": {}},
         ]
 
-        with patch("workflows.weekly_prospect._get_all_searches") as mock_searches:
+        with patch("workflows.weekly_prospect._get_all_searches") as mock_searches, \
+             patch("workflows.weekly_prospect.load_personas", return_value=TEST_PERSONAS_DETERMINISTIC):
             mock_searches.return_value = [(
                 "operations_leaders",
                 "mx",
@@ -327,6 +345,7 @@ class TestWeeklyProspectIntegration:
         attio.upsert_person.return_value = {"id": {"record_id": "rec-abc"}}
 
         with _patch("workflows.weekly_prospect._get_all_searches") as mock_searches, \
+             _patch("workflows.weekly_prospect.load_personas", return_value=TEST_PERSONAS_DETERMINISTIC), \
              _patch("workflows.weekly_prospect.match_or_create_company", return_value="comp-test-123"):
             mock_searches.return_value = [(
                 "operations_leaders",
@@ -371,6 +390,7 @@ class TestWeeklyProspectIntegration:
         attio.upsert_person.return_value = {"id": {"record_id": "rec-abc"}}
 
         with _patch("workflows.weekly_prospect._get_all_searches") as mock_searches, \
+             _patch("workflows.weekly_prospect.load_personas", return_value=TEST_PERSONAS_DETERMINISTIC), \
              _patch("workflows.weekly_prospect.match_or_create_company", return_value=None):
             mock_searches.return_value = [(
                 "operations_leaders",

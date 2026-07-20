@@ -264,7 +264,7 @@ class TestReprospectReviewSkip:
             summary=summary,
             seen_urls=seen_urls,
             in_list_record_ids=set(),  # rec-existing NOT in current pipeline
-            persona_config={"key": "operations_leaders", "enterprise_mode": True},
+            persona_config={"key": "operations_leaders", "enterprise_mode": True, "search_size_credit": 30},
             borderline_stage=borderline_stage,
             reprospect_review=reprospect_review,
         )
@@ -302,7 +302,7 @@ class TestReprospectReviewSkip:
             summary=summary,
             seen_urls=seen_urls,
             in_list_record_ids={"rec-in-list"},
-            persona_config={"key": "operations_leaders", "enterprise_mode": True},
+            persona_config={"key": "operations_leaders", "enterprise_mode": True, "search_size_credit": 30},
             borderline_stage=borderline_stage,
             reprospect_review=reprospect_review,
         )
@@ -1055,7 +1055,7 @@ class TestNetNewSupplyAccounting:
             summary=summary,
             seen_urls=set(),
             in_list_record_ids={"rec-listed"},
-            persona_config={"key": "operations_leaders", "enterprise_mode": True},
+            persona_config={"key": "operations_leaders", "enterprise_mode": True, "search_size_credit": 30},
             borderline_stage=[],
             reprospect_review=[],
         )
@@ -1188,7 +1188,7 @@ class TestCanonicalUrlDedupPrecheck:
             [self._PROSPECT], _crm(attio), list_id="l", today="2026-06-17",
             dry_run=False, summary=summary, seen_urls=set(),
             in_list_record_ids=set(),
-            persona_config={"key": "operations_leaders", "enterprise_mode": True},
+            persona_config={"key": "operations_leaders", "enterprise_mode": True, "search_size_credit": 30},
             borderline_stage=[], reprospect_review=[],
             in_list_canonical_urls={canonical},
         )
@@ -1214,7 +1214,7 @@ class TestCanonicalUrlDedupPrecheck:
             [self._PROSPECT], _crm(attio), list_id="l", today="2026-06-17",
             dry_run=False, summary=summary, seen_urls=set(),
             in_list_record_ids=set(),
-            persona_config={"key": "operations_leaders", "enterprise_mode": True},
+            persona_config={"key": "operations_leaders", "enterprise_mode": True, "search_size_credit": 30},
             borderline_stage=[], reprospect_review=[],
             in_list_canonical_urls={"https://linkedin.com/in/someone-else"},
         )
@@ -1417,3 +1417,169 @@ class TestFindNameCompanyDuplicateLocal:
             candidate_canonical_url="https://linkedin.com/in/sam-rivera-2",
         )
         assert hit is None
+
+
+class TestPausedPersonaSkip:
+    """Companion to the persona deprecation guard (PR-226): personas flagged
+    `active: false` must be excluded from search harvesting entirely, and
+    the skip must be loud on stderr — never a silent zero-result lane."""
+
+    def _personas(self):
+        return {
+            "operations_leaders": {
+                "enterprise_mode": True,
+                "search_queries": {"sn_search_urls": {"mexico": "https://sn/ent"}},
+            },
+            "midmarket_mx": {
+                "active": False,
+                "search_queries": {"sn_search_urls": {"mexico": "https://sn/mx"}},
+            },
+            "midmarket_co": {
+                "active": False,
+                "search_queries": {"sn_search_urls": {"colombia": "https://sn/co"}},
+            },
+        }
+
+    def test_paused_personas_yield_no_searches(self):
+        from workflows.weekly_prospect import _get_all_searches
+
+        searches = _get_all_searches(self._personas())
+        assert searches == [("operations_leaders", "mexico", "https://sn/ent")]
+
+    def test_missing_active_key_defaults_to_active(self):
+        from workflows.weekly_prospect import _get_all_searches
+
+        personas = {
+            "legacy_no_flag": {
+                "search_queries": {"sn_search_urls": {"peru": "https://sn/pe"}},
+            },
+            "explicit_true": {
+                "active": True,
+                "search_queries": {"sn_search_urls": {"chile": "https://sn/cl"}},
+            },
+        }
+        searches = _get_all_searches(personas)
+        assert {s[0] for s in searches} == {"legacy_no_flag", "explicit_true"}
+
+    def test_paused_skip_is_announced_on_stderr(self, capsys):
+        from workflows.weekly_prospect import _get_all_searches
+
+        _get_all_searches(self._personas())
+        err = capsys.readouterr().err
+        assert "2 persona(s) paused" in err
+        assert "midmarket_co, midmarket_mx" in err
+
+    def test_no_paused_personas_no_stderr_noise(self, capsys):
+        from workflows.weekly_prospect import _get_all_searches
+
+        _get_all_searches(
+            {
+                "operations_leaders": {
+                    "enterprise_mode": True,
+                    "search_queries": {"sn_search_urls": {"mexico": "https://sn/e"}},
+                }
+            }
+        )
+        assert "paused" not in capsys.readouterr().err
+
+
+class TestResolveCompanyIndustry:
+    """PR-225: ingest-time industry resolution (CRM lookup, classify-on-miss)."""
+
+    def test_existing_label_returned_with_status(self):
+        from workflows.weekly_prospect import _resolve_company_industry
+        attio = MagicMock()
+        attio.search_company_by_domain.return_value = {
+            "id": {"record_id": "c1"},
+            "values": {
+                "industry_vertical": [{"option": {"title": "Food & Beverage"}}],
+                "industry_vertical_status": [{"option": {"title": "confirmed"}}],
+            },
+        }
+        cache: dict = {}
+        assert _resolve_company_industry(
+            attio, "Acme", "acme.com", cache, dry_run=False,
+        ) == ("Food & Beverage", "confirmed")
+
+    def test_existing_label_no_status_returns_none_status(self):
+        from workflows.weekly_prospect import _resolve_company_industry
+        attio = MagicMock()
+        attio.search_company_by_domain.return_value = {
+            "id": {"record_id": "c1"},
+            "values": {"industry_vertical": [{"option": {"title": "Retail"}}]},
+        }
+        assert _resolve_company_industry(
+            attio, "Acme", "acme.com", {}, dry_run=False,
+        ) == ("Retail", None)
+
+    def test_classify_on_miss_writes_payload(self):
+        from unittest.mock import patch
+
+        from workflows import weekly_prospect
+        attio = MagicMock()
+        attio.search_company_by_domain.return_value = None
+        attio.search_companies.return_value = []
+        summary: dict = {}
+        with patch("workflows.industry_classifier.classify_industry", return_value="Logistics"):
+            label, status = weekly_prospect._resolve_company_industry(
+                attio, "NewCo", None, {}, dry_run=False, summary=summary,
+            )
+        assert (label, status) == ("Logistics", "low_confidence")
+        assert summary["industry_classified_at_ingest"] == 1
+
+    def test_dry_run_does_not_classify_or_write(self):
+        from unittest.mock import patch
+
+        from workflows import weekly_prospect
+        attio = MagicMock()
+        attio.search_company_by_domain.return_value = None
+        attio.search_companies.return_value = []
+        with patch("workflows.industry_classifier.classify_industry") as cls:
+            result = weekly_prospect._resolve_company_industry(
+                attio, "NewCo", None, {}, dry_run=True,
+            )
+        assert result == (None, None)
+        cls.assert_not_called()
+        attio.update_company.assert_not_called()
+
+    def test_cache_prevents_second_lookup(self):
+        from workflows.weekly_prospect import _resolve_company_industry
+        attio = MagicMock()
+        attio.search_company_by_domain.return_value = {
+            "id": {"record_id": "c1"},
+            "values": {"industry_vertical": [{"option": {"title": "Retail"}}]},
+        }
+        cache: dict = {}
+        _resolve_company_industry(attio, "Acme", "acme.com", cache, dry_run=False)
+        _resolve_company_industry(attio, "Acme", "acme.com", cache, dry_run=False)
+        assert attio.search_company_by_domain.call_count == 1
+
+    def test_transient_http_error_degrades(self):
+        import httpx
+
+        from workflows.weekly_prospect import _resolve_company_industry
+        attio = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 500
+        attio.search_company_by_domain.side_effect = httpx.HTTPStatusError(
+            "boom", request=MagicMock(), response=resp,
+        )
+        summary: dict = {}
+        assert _resolve_company_industry(
+            attio, "Acme", "acme.com", {}, dry_run=False, summary=summary,
+        ) == (None, None)
+        assert summary["industry_resolve_errors"] == 1
+
+    def test_auth_error_propagates(self):
+        import httpx
+        import pytest
+
+        from workflows.weekly_prospect import _resolve_company_industry
+        attio = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 403
+        attio.search_company_by_domain.side_effect = httpx.HTTPStatusError(
+            "forbidden", request=MagicMock(), response=resp,
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            _resolve_company_industry(attio, "Acme", "acme.com", {}, dry_run=False)

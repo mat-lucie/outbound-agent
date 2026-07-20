@@ -57,19 +57,59 @@ def normalize_company_name(name: str) -> str:
     return result
 
 
+def find_company_record(
+    attio: AttioClient,
+    company_name: str,
+    domain: str | None = None,
+) -> dict | None:
+    """Find an existing CRM company record. Read-only — never creates.
+
+    Same matching order as match_or_create_company: domain-first (normalized),
+    then normalized-name equality. Returns the full record dict (id + values)
+    or None when no match. HTTP errors propagate to the caller. (PR-225)
+    """
+    if not company_name:
+        return None
+
+    # 1. Domain-first search (normalize www. prefix)
+    if domain:
+        if domain.startswith("www."):
+            domain = domain[4:]
+        result = attio.search_company_by_domain(domain)
+        if result:
+            return result
+
+    # 2. Name matching
+    results = attio.search_companies(filter_={"name": company_name}, limit=5)
+    normalized_input = normalize_company_name(company_name)
+    for result in results:
+        # Guard the deref: the workspace contains name-less shell companies
+        # (import artifacts) that the CRM's name filter can still return. A
+        # malformed hit must degrade to no-match, not crash the caller.
+        name_data = result.get("values", {}).get("name") or []
+        candidate = name_data[0].get("value", "") if name_data and isinstance(name_data[0], dict) else ""
+        if candidate and normalize_company_name(candidate) == normalized_input:
+            return result
+
+    return None
+
+
 def match_or_create_company(
     attio: AttioClient,
     company_name: str,
     domain: str | None = None,
     *,
     industry_vertical: str | None = None,
+    industry_status: str | None = None,
 ) -> str | None:
-    """Find an existing Attio company record or create a new one.
+    """Find an existing CRM company record or create a new one.
 
     When a new company is created and industry_vertical is provided, the value
-    is set as the company's industry_vertical attribute. Existing companies found
-    via domain or name match are NOT updated — this function only sets the field
-    on CREATE.
+    is set as the company's industry_vertical attribute; industry_status (when
+    also provided) is stamped alongside it with the classifier provenance attrs
+    so the record carries the same payload the backfill writer produces.
+    Existing companies found via domain or name match are NOT updated — this
+    function only sets the fields on CREATE.
 
     Returns the record_id string, or None on failure.
     """
@@ -77,28 +117,22 @@ def match_or_create_company(
         if not company_name:
             return None
 
-        # 1. Domain-first search (normalize www. prefix)
-        if domain:
-            if domain.startswith("www."):
-                domain = domain[4:]
-            result = attio.search_company_by_domain(domain)
-            if result:
-                return result["id"]["record_id"]
+        existing = find_company_record(attio, company_name, domain)
+        if existing:
+            return existing["id"]["record_id"]
 
-        # 2. Name matching
-        results = attio.search_companies(filter_={"name": company_name}, limit=5)
-        normalized_input = normalize_company_name(company_name)
-        for result in results:
-            candidate = result["values"]["name"][0]["value"]
-            if normalize_company_name(candidate) == normalized_input:
-                return result["id"]["record_id"]
-
-        # 3. Create new company
+        # Create new company
+        if domain and domain.startswith("www."):
+            domain = domain[4:]
         attributes: dict = {"name": company_name}
         if domain:
             attributes["domains"] = [{"domain": domain}]
         if industry_vertical:
-            attributes["industry_vertical"] = industry_vertical
+            if industry_status:
+                from workflows.industry_classifier import build_classifier_payload
+                attributes.update(build_classifier_payload(industry_vertical, status=industry_status))
+            else:
+                attributes["industry_vertical"] = industry_vertical
 
         created = attio.create_company(attributes)
         record_id = created.get("id", {}).get("record_id", "")

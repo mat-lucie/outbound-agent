@@ -347,3 +347,80 @@ class TestBackfillImport:
             assert result["failed"] == 1
             assert result["linked"] == 0
             mock_matcher.assert_not_called()
+
+
+# ── PR-225: find_company_record + industry_status stamping ──────────────────
+
+class TestFindCompanyRecord:
+    def test_domain_match_returns_full_record(self):
+        from workflows.company_matcher import find_company_record
+        attio = MagicMock()
+        rec = {"id": {"record_id": "c1"}, "values": {"name": [{"value": "Acme"}]}}
+        attio.search_company_by_domain.return_value = rec
+        assert find_company_record(attio, "Acme", "acme.com") is rec
+
+    def test_name_match_returns_full_record(self):
+        from workflows.company_matcher import find_company_record
+        attio = MagicMock()
+        attio.search_company_by_domain.return_value = None
+        rec = {"id": {"record_id": "c2"}, "values": {"name": [{"value": "Acme Foods"}]}}
+        attio.search_companies.return_value = [rec]
+        assert find_company_record(attio, "Acme Foods") is rec
+
+    def test_nameless_shell_company_degrades_to_no_match(self):
+        # A name-less shell company (import artifact) returned by the name
+        # filter must degrade to no-match, not raise IndexError.
+        from workflows.company_matcher import find_company_record
+        attio = MagicMock()
+        attio.search_company_by_domain.return_value = None
+        attio.search_companies.return_value = [{"id": {"record_id": "c3"}, "values": {"name": []}}]
+        assert find_company_record(attio, "Acme Foods") is None
+
+    def test_empty_name_returns_none(self):
+        from workflows.company_matcher import find_company_record
+        assert find_company_record(MagicMock(), "") is None
+
+
+class TestMatchOrCreateIndustryStatus:
+    def test_create_stamps_classifier_payload_when_status_given(self):
+        attio = MagicMock()
+        attio.search_company_by_domain.return_value = None
+        attio.search_companies.return_value = []
+        attio.create_company.return_value = {"id": {"record_id": "new-1"}}
+        match_or_create_company(
+            attio, "Acme", domain="acme.com",
+            industry_vertical="Food & Beverage", industry_status="low_confidence",
+        )
+        attrs = attio.create_company.call_args[0][0]
+        assert attrs["industry_vertical"] == "Food & Beverage"
+        assert attrs["industry_vertical_status"] == "low_confidence"
+        assert attrs["industry_source"] == "haiku_classifier"
+        assert attrs["industry_vertical_confidence"] == 0.0
+
+    def test_create_plain_vertical_without_status(self):
+        attio = MagicMock()
+        attio.search_company_by_domain.return_value = None
+        attio.search_companies.return_value = []
+        attio.create_company.return_value = {"id": {"record_id": "new-2"}}
+        match_or_create_company(
+            attio, "Acme", industry_vertical="Food & Beverage",
+        )
+        attrs = attio.create_company.call_args[0][0]
+        assert attrs["industry_vertical"] == "Food & Beverage"
+        assert "industry_vertical_status" not in attrs
+
+
+class TestBuildClassifierPayload:
+    def test_low_confidence_carries_zero_confidence(self):
+        from workflows.industry_classifier import build_classifier_payload
+        p = build_classifier_payload("Food & Beverage")
+        assert p["industry_vertical"] == "Food & Beverage"
+        assert p["industry_vertical_status"] == "low_confidence"
+        assert p["industry_vertical_confidence"] == 0.0
+        assert p["industry_source"] == "haiku_classifier"
+
+    def test_confirmed_omits_confidence(self):
+        from workflows.industry_classifier import build_classifier_payload
+        p = build_classifier_payload("Food & Beverage", status="confirmed")
+        assert p["industry_vertical_status"] == "confirmed"
+        assert "industry_vertical_confidence" not in p
