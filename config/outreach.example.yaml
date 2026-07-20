@@ -58,3 +58,11 @@ scrape:
                                 # batch is the only lever that reaches past the recycled results.
                                 # Expect a larger borderline stage on the first deep run; the PB
                                 # profile cap + completion wait scale with this automatically.
+
+radar:                          # Follow-up Radar Gmail conversation-ledger sweep (PR-214).
+  gmail_sweep_enabled: false    # OFF by default. When true, the radar reconciles a warm
+                                # candidate's CRM staleness against the actual email ledger
+                                # (a fresh inbound reply means the ball already moved). Requires
+                                # the optional Gmail token (see GETTING_STARTED.md → Gmail); it
+                                # degrades to a clean skip when the token is absent.
+  gmail_lookback_days: 90       # how far back the inbound-reply search looks per candidate.

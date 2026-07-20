@@ -99,6 +99,32 @@ class OutreachConfig:
     # recycled results. Optional-with-default so existing configs keep loading.
     weekly_scrape_batch_size: int
 
+    # radar — Follow-up Radar Gmail conversation-ledger sweep (PR-214). OFF by
+    # default: the radar runs on CRM-resident signals alone; when enabled it
+    # reconciles a warm candidate's CRM staleness against the actual email
+    # ledger (a fresh inbound reply means the ball already moved). Degrades to
+    # skip when Gmail credentials are absent. Optional-with-default so existing
+    # configs keep loading.
+    radar_gmail_sweep_enabled: bool
+    radar_gmail_lookback_days: int
+
+
+def _bool_at(section: dict[str, Any], key: str, *, section_name: str, default: bool) -> bool:
+    """Return ``section[key]`` as a strict bool, defaulting when absent.
+
+    Rejects non-bool values (an int/str ``enabled`` is a config error, not a
+    silent truthiness coercion) so a misconfigured flag fails loud.
+    """
+    if key not in section:
+        return default
+    value = section.get(key)
+    if not isinstance(value, bool):
+        raise ConfigError(
+            f"outreach config key {section_name}.{key!r} must be a boolean "
+            f"(got {type(value).__name__}). See config/outreach.example.yaml."
+        )
+    return value
+
 
 def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
     """Return ``raw[name]`` as a mapping, or raise ConfigError."""
@@ -233,6 +259,7 @@ def load_outreach_config() -> OutreachConfig:
     staleness = raw.get("staleness") or {}
     sweep = raw.get("sweep") or {}
     scrape = raw.get("scrape") or {}
+    radar = raw.get("radar") or {}
 
     # Optional-with-default knobs: validate via _int_at_least (type check,
     # bool-reject, range floor) when the key is present; otherwise default to 3.
@@ -262,6 +289,17 @@ def load_outreach_config() -> OutreachConfig:
         )
     else:
         weekly_scrape_batch_size = 300
+
+    # radar Gmail sweep (PR-214): OFF by default, 90-day lookback default.
+    radar_gmail_sweep_enabled = _bool_at(
+        radar, "gmail_sweep_enabled", section_name="radar", default=False
+    )
+    if "gmail_lookback_days" in radar:
+        radar_gmail_lookback_days = _int_at_least(
+            radar, "gmail_lookback_days", section_name="radar", minimum=1
+        )
+    else:
+        radar_gmail_lookback_days = 90
 
     invites_per_day = _int_at_least(caps, "invites_per_day", section_name="caps", minimum=1)
     dms_per_day = _int_at_least(caps, "dms_per_day", section_name="caps", minimum=1)
@@ -329,4 +367,6 @@ def load_outreach_config() -> OutreachConfig:
         sweep_window_days=sweep_window_days,
         sweep_repair_circuit_threshold=sweep_repair_circuit_threshold,
         weekly_scrape_batch_size=weekly_scrape_batch_size,
+        radar_gmail_sweep_enabled=radar_gmail_sweep_enabled,
+        radar_gmail_lookback_days=radar_gmail_lookback_days,
     )

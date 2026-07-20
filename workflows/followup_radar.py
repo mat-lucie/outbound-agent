@@ -175,6 +175,13 @@ class FollowupCandidate:
     awaiting_reply_thread_id: str | None = None
     awaiting_reply_note_id: str | None = None
     awaiting_reply_nudge_count: int = 0
+    # Gmail conversation-ledger signal (PR-214, opt-in sweep). True when the
+    # optional Gmail sweep saw an inbound reply from this candidate's email
+    # AFTER its CRM-derived last_touch — the ball already moved, so the
+    # CRM-staleness read is stale. Advisory only: the sweep NEVER drops a
+    # candidate (the skill layer/operator decides); it just annotates so a
+    # "you went quiet" digest line can be reconciled against the real inbox.
+    email_reply_seen: bool = False
     notes: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -1471,6 +1478,7 @@ def to_json(candidates: list[FollowupCandidate]) -> list[dict]:
             "awaiting_reply_thread_id": c.awaiting_reply_thread_id,
             "awaiting_reply_note_id": c.awaiting_reply_note_id,
             "awaiting_reply_nudge_count": c.awaiting_reply_nudge_count,
+            "email_reply_seen": c.email_reply_seen,
         }
         for c in candidates
     ]
@@ -1859,6 +1867,97 @@ def _trim_with_waiting_cap(
     return out, waiting_capped
 
 
+def _resolve_gmail_sweep_enabled(override: bool | None) -> bool:
+    """Whether the Gmail sweep runs: explicit override, else the outreach knob.
+
+    Defaults to OFF (False) if the config can't be read — a missing/unreadable
+    outreach config must never silently turn the email side ON.
+    """
+    if override is not None:
+        return override
+    try:
+        from clients.outreach_config import load_outreach_config
+
+        return load_outreach_config().radar_gmail_sweep_enabled
+    except Exception:  # noqa: BLE001 — config unreadable → stay OFF (fail-safe)
+        return False
+
+
+def _resolve_gmail_lookback_days(override: int | None) -> int:
+    """Gmail sweep lookback window: explicit override, else the outreach knob
+    (default 90)."""
+    if override is not None:
+        return override
+    try:
+        from clients.outreach_config import load_outreach_config
+
+        return load_outreach_config().radar_gmail_lookback_days
+    except Exception:  # noqa: BLE001 — config unreadable → default window
+        return 90
+
+
+def sweep_gmail_conversations(
+    candidates: list[FollowupCandidate],
+    *,
+    today: date,
+    lookback_days: int,
+    client_factory: object = None,
+) -> list[str]:
+    """Reconcile warm candidates against the Gmail conversation ledger (PR-214).
+
+    OFF by default (gated by ``outreach.radar.gmail_sweep_enabled``); the caller
+    only reaches here when the operator opted in. For each candidate carrying an
+    email address, search the inbox for an inbound reply on/after
+    ``last_touch`` (bounded by ``lookback_days``). A hit sets
+    ``email_reply_seen=True`` — the ball already moved, so the CRM-derived
+    "you went quiet" is stale. This NEVER drops a candidate: it annotates so
+    the digest/skill layer can reconcile against the real inbox.
+
+    Degrades to a clean SKIP: if the Gmail token is absent
+    (``GmailCredentialsMissing``) the sweep returns a single degraded reason
+    and touches no candidate — the radar still runs on CRM signals alone.
+    Per-candidate Gmail errors are collected as degraded reasons, never raised,
+    so one bad lookup can't strand the whole run.
+
+    Returns the list of degradation reasons (empty when the sweep ran clean).
+    """
+    from clients.gmail import GmailClient, GmailCredentialsMissing
+
+    factory = client_factory or GmailClient.from_credentials
+    try:
+        client = factory()  # type: ignore[operator]
+    except GmailCredentialsMissing as exc:
+        return [
+            "Gmail conversation-ledger sweep skipped — no Gmail credentials "
+            f"({exc}); radar ran on CRM signals only"
+        ]
+
+    lookback_floor = today - timedelta(days=max(1, lookback_days))
+    degraded: list[str] = []
+    for c in candidates:
+        email = (c.email_address or "").strip()
+        if not email:
+            continue
+        # Search from the later of last_touch and the lookback floor — a reply
+        # OLDER than the CRM last_touch isn't news (the staleness clock already
+        # started after it).
+        after = c.last_touch or lookback_floor
+        if after < lookback_floor:
+            after = lookback_floor
+        try:
+            inbound = client.search_inbound(email, after)
+        except Exception as exc:  # noqa: BLE001 — one bad lookup must not strand the sweep
+            degraded.append(
+                f"Gmail lookup failed for {c.record_id} "
+                f"({type(exc).__name__}: {exc})"
+            )
+            continue
+        if inbound:
+            c.email_reply_seen = True
+            c.notes.append("email reply seen after last touch (Gmail ledger)")
+    return degraded
+
+
 def run_followup_radar(
     crm: CRMProvider,
     *,
@@ -1866,6 +1965,9 @@ def run_followup_radar(
     list_id: str | None = None,
     limit: int | None = None,
     full: bool = False,
+    gmail_sweep: bool | None = None,
+    gmail_lookback_days: int | None = None,
+    gmail_client_factory: object = None,
 ) -> dict:
     """Detect → rank → enrich top-N → render. Read-only.
 
@@ -1894,6 +1996,23 @@ def run_followup_radar(
     total = len(candidates)
     surfaced, waiting_capped = _trim_with_waiting_cap(candidates, limit)
     enrich_names(attio, surfaced)
+
+    # Optional Gmail conversation-ledger sweep (PR-214). OFF by default; when
+    # the operator enables it, reconcile the surfaced (top-N) candidates against
+    # the real inbox. Resolves the enable flag + lookback from outreach config
+    # unless the caller overrides them (tests pass a fake factory). Degrades to
+    # a clean skip — a missing Gmail token adds a degraded reason and touches
+    # no candidate, so the radar still runs without the email side.
+    sweep_today = today if today is not None else operator_today()
+    if _resolve_gmail_sweep_enabled(gmail_sweep):
+        sweep_degraded = sweep_gmail_conversations(
+            surfaced,
+            today=sweep_today,
+            lookback_days=_resolve_gmail_lookback_days(gmail_lookback_days),
+            client_factory=gmail_client_factory,
+        )
+        result.degraded.extend(sweep_degraded)
+
     digest = render_digest(
         surfaced,
         degraded=result.degraded,

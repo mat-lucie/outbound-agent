@@ -1935,3 +1935,154 @@ def test_run_followup_radar_rejects_provider_without_inner_client(identity_parse
 
     with pytest.raises(TypeError, match="inner_client"):
         run_followup_radar(NoInnerProvider(), today=TODAY)
+
+
+# ── Gmail conversation-ledger sweep (PR-214, opt-in) ────────────────────────
+# The optional email side: OFF by default, degrades to a clean skip without a
+# Gmail token, and NEVER drops a candidate (annotation only). Uses branch-10's
+# clients.gmail.GmailClient via an injected factory so no real inbox is touched.
+
+from datetime import date as _date  # noqa: E402
+
+
+class _FakeGmail:
+    """Minimal GmailClient stand-in: returns a canned inbound hit for the
+    addresses in `hits`, empty otherwise. Records the (email, after) queries."""
+
+    def __init__(self, hits=(), raise_for=None):
+        self._hits = set(hits)
+        self._raise_for = set(raise_for or ())
+        self.queries: list[tuple[str, _date]] = []
+
+    def search_inbound(self, from_address, after):
+        self.queries.append((from_address, after))
+        if from_address in self._raise_for:
+            raise RuntimeError("gmail 500")
+        return [{"message_id": "m1", "thread_id": "t1"}] if from_address in self._hits else []
+
+
+def _waiting_email_candidate(rid="w1", email="prospect@acme.test"):
+    from workflows.followup_radar import FollowupCandidate
+
+    return FollowupCandidate(
+        object="linkedin_outreach",
+        record_id=rid,
+        entry_id=f"ent-{rid}",
+        reason=FollowupReason.AWAITING_REPLY,
+        lane=WarmLane.WAITING,
+        last_touch=date(2026, 6, 10),
+        silent_days=21,
+        heat=4,
+        value_mult=1.0,
+        urgency=4.0,
+        email_address=email,
+        channel_hint="email",
+    )
+
+
+def test_gmail_sweep_marks_email_reply_seen():
+    from workflows.followup_radar import sweep_gmail_conversations
+
+    cand = _waiting_email_candidate(email="hot@acme.test")
+    gmail = _FakeGmail(hits={"hot@acme.test"})
+    degraded = sweep_gmail_conversations(
+        [cand], today=TODAY, lookback_days=90, client_factory=lambda: gmail,
+    )
+    assert degraded == []
+    assert cand.email_reply_seen is True
+    assert any("email reply seen" in n for n in cand.notes)
+    # Never searches before the CRM last_touch (a reply older than last_touch
+    # isn't news) — the `after` bound is >= last_touch.
+    assert gmail.queries[0][1] >= cand.last_touch
+
+
+def test_gmail_sweep_no_hit_leaves_candidate_untouched():
+    from workflows.followup_radar import sweep_gmail_conversations
+
+    cand = _waiting_email_candidate()
+    degraded = sweep_gmail_conversations(
+        [cand], today=TODAY, lookback_days=90, client_factory=lambda: _FakeGmail(),
+    )
+    assert degraded == []
+    assert cand.email_reply_seen is False
+
+
+def test_gmail_sweep_degrades_to_skip_without_credentials():
+    """The disabled/degraded email path: no Gmail token → a surfaced degraded
+    reason and ZERO candidate mutation. The radar still runs on CRM signals."""
+    from clients.gmail import GmailCredentialsMissing
+    from workflows.followup_radar import sweep_gmail_conversations
+
+    cand = _waiting_email_candidate(email="hot@acme.test")
+
+    def _missing():
+        raise GmailCredentialsMissing("no token")
+
+    degraded = sweep_gmail_conversations(
+        [cand], today=TODAY, lookback_days=90, client_factory=_missing,
+    )
+    assert len(degraded) == 1
+    assert "no Gmail credentials" in degraded[0]
+    assert cand.email_reply_seen is False  # untouched
+
+
+def test_gmail_sweep_collects_per_candidate_errors_without_raising():
+    from workflows.followup_radar import sweep_gmail_conversations
+
+    good = _waiting_email_candidate("g1", email="ok@acme.test")
+    bad = _waiting_email_candidate("b1", email="boom@acme.test")
+    gmail = _FakeGmail(hits={"ok@acme.test"}, raise_for={"boom@acme.test"})
+    degraded = sweep_gmail_conversations(
+        [good, bad], today=TODAY, lookback_days=90, client_factory=lambda: gmail,
+    )
+    assert good.email_reply_seen is True
+    assert bad.email_reply_seen is False
+    assert len(degraded) == 1 and "b1" in degraded[0]
+
+
+def test_gmail_sweep_skips_candidates_without_email():
+    from workflows.followup_radar import sweep_gmail_conversations
+
+    cand = _waiting_email_candidate(email="")
+    gmail = _FakeGmail(hits={"x"})
+    degraded = sweep_gmail_conversations(
+        [cand], today=TODAY, lookback_days=90, client_factory=lambda: gmail,
+    )
+    assert degraded == []
+    assert gmail.queries == []  # no lookup for an emailless candidate
+
+
+def test_run_followup_radar_gmail_sweep_off_by_default(identity_parsers):
+    """Feature OFF by default: run_followup_radar never invokes the Gmail
+    factory unless explicitly enabled — a schemaless/credential-less install
+    stays green."""
+    attio = FakeAttio(entries=[
+        _entry("r1", "Responded", last_contact="2026-06-25", email_address="a@acme.test"),
+    ])
+    called = {"n": 0}
+
+    def _factory():
+        called["n"] += 1
+        return _FakeGmail()
+
+    summary = run_followup_radar(attio, today=TODAY, gmail_client_factory=_factory)
+    assert called["n"] == 0  # sweep did NOT run (default off)
+    assert all(not c.get("email_reply_seen") for c in summary["candidates"])
+
+
+def test_run_followup_radar_gmail_sweep_on_annotates_and_surfaces_degraded(identity_parsers):
+    from clients.gmail import GmailCredentialsMissing
+
+    attio = FakeAttio(entries=[
+        _entry("r1", "Responded", last_contact="2026-06-25", email_address="a@acme.test"),
+    ])
+
+    def _missing():
+        raise GmailCredentialsMissing("no token")
+
+    summary = run_followup_radar(
+        attio, today=TODAY, gmail_sweep=True, gmail_client_factory=_missing,
+    )
+    # Enabled-but-credential-less: the run still succeeds and the degradation
+    # is surfaced (never a false clean).
+    assert any("no Gmail credentials" in d for d in summary["degraded"])
