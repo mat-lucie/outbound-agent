@@ -46,7 +46,7 @@ import itertools
 from typing import Any
 
 from clients.crm.base import CRMProvider, Entry, Record, RecordInfo, Stage
-from clients.crm.exceptions import UniquenessConflictError
+from clients.crm.exceptions import ResultTruncatedError, UniquenessConflictError
 from models.pipeline import STAGE_RANK, PipelineStage
 
 _DEFAULT_LIST = "__default__"
@@ -276,6 +276,8 @@ class FakeProvider(CRMProvider):
         list_id: str | None = None,
         filter_: dict[str, Any] | None = None,
         limit: int = 50000,
+        *,
+        fail_if_truncated: bool = False,
     ) -> list[Entry]:
         target = list_id or _DEFAULT_LIST
         matched = [
@@ -284,6 +286,11 @@ class FakeProvider(CRMProvider):
             if e.attributes.get("__list_id__") == target
             and _matches(e.attributes, filter_)
         ]
+        if fail_if_truncated and len(matched) > limit:
+            raise ResultTruncatedError(
+                f"list {target!r} has {len(matched)} entries but the sweep "
+                f"limit is {limit} — raise the limit so every entry is seen"
+            )
         return matched[:limit]
 
     def add_list_entry(

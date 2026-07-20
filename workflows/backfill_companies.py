@@ -52,7 +52,7 @@ def backfill_export(crm: CRMProvider) -> str:
     write-path functions in this module still take a raw ``AttioClient`` — they
     migrate in a later increment.
     """
-    entries = crm.query_list_entries(limit=500)
+    entries = crm.query_list_entries(limit=50_000, fail_if_truncated=True)
 
     total = len(entries)
     already_linked = 0
@@ -199,7 +199,7 @@ def detect_bad_company_links(crm: CRMProvider) -> str:
     contract's documented escape hatch). The write sibling ``repair_bad_companies``
     stays on ``AttioClient`` — it migrates in a later increment.
     """
-    entries = crm.query_list_entries(limit=500)
+    entries = crm.query_list_entries(limit=50_000, fail_if_truncated=True)
 
     total = len(entries)
     bad_rows: list[dict] = []

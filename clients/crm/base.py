@@ -328,6 +328,8 @@ class CRMProvider(abc.ABC):
         list_id: str | None = None,
         filter_: dict[str, Any] | None = None,
         limit: int = 50000,
+        *,
+        fail_if_truncated: bool = False,
     ) -> list[Entry]:
         """Query the pipeline list's entries, optionally filtered,
         auto-paginating up to ``limit``.
@@ -335,6 +337,10 @@ class CRMProvider(abc.ABC):
         ``list_id`` selects the list; ``None`` means the adapter's configured
         default pipeline list. Returns normalized :class:`Entry` objects (stage
         + flat attribute map), the staged-cadence rows the engine iterates.
+
+        With ``fail_if_truncated=True`` a full-sweep read that hits ``limit``
+        with entries remaining raises :class:`ResultTruncatedError` instead of
+        returning a silently incomplete set (PR-234).
         """
 
     @abc.abstractmethod

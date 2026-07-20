@@ -14,6 +14,16 @@ from models.pipeline import STAGE_RANK, PipelineStage
 logger = logging.getLogger(__name__)
 
 
+class AttioResultTruncated(RuntimeError):
+    """A paginated query hit its ``limit`` with records (possibly) remaining.
+
+    Raised only when the caller passed ``fail_if_truncated=True`` — full-sweep
+    callers prefer a loud failure over a silently incomplete result set
+    (PR-234: suppression sweeps, per-stage campaign queries, and list-scan
+    exports must not drop the tail past their fetch ceiling).
+    """
+
+
 def _is_stage_regression(prior_stage: str, new_stage: str) -> bool:
     """True iff ``new_stage`` ranks strictly below ``prior_stage``.
 
@@ -295,24 +305,74 @@ class AttioClient:
 
     # ── People records ────────────────────────────────────────
 
-    def search_people(self, filter_: dict | None = None, limit: int = 50) -> list[dict]:
-        """Search person records with optional filter. Auto-paginates."""
+    def _query_paginated(
+        self,
+        path: str,
+        filter_: dict | None,
+        limit: int,
+        *,
+        fail_if_truncated: bool = False,
+    ) -> list[dict]:
+        """Shared pagination loop for the record/entry query endpoints.
+
+        Pages through ``path`` until ``limit`` records are collected or the API
+        returns a short page (exhausted). With ``fail_if_truncated=True``,
+        raises :class:`AttioResultTruncated` when records remain past ``limit``
+        (probing one extra page when the count lands exactly on the limit, so a
+        complete result never raises). Full-sweep callers (suppression sweep,
+        per-stage campaign queries, list-scan exports) use this so a silently
+        truncated sweep becomes a loud operator-visible failure (PR-234).
+        """
         all_records: list[dict] = []
         page_size = min(limit, 100)
         offset: int = 0
+        exhausted = False
 
         while len(all_records) < limit:
             body: dict = {"limit": page_size, "offset": offset}
             if filter_:
                 body["filter"] = filter_
-            data = self._request("POST", "/objects/people/records/query", json=body)
+            data = self._request("POST", path, json=body)
             records = data.get("data", [])
             all_records.extend(records)
             if len(records) < page_size:
+                exhausted = True
                 break
             offset += len(records)
 
+        if fail_if_truncated and len(all_records) >= limit:
+            truncated = len(all_records) > limit
+            if not truncated and not exhausted:
+                # Exactly ``limit`` records with a full final page — a complete
+                # result is indistinguishable from a truncated one without
+                # probing the next page. One extra request here (boundary case
+                # only) avoids a false-positive crash when the true count lands
+                # exactly on the limit.
+                body = {"limit": page_size, "offset": offset}
+                if filter_:
+                    body["filter"] = filter_
+                probe = self._request("POST", path, json=body)
+                truncated = bool(probe.get("data", []))
+            if truncated:
+                raise AttioResultTruncated(
+                    f"query {path} hit its scan limit ({limit}) with more "
+                    f"records remaining — raise the limit so the sweep sees "
+                    f"every record"
+                )
         return all_records[:limit]
+
+    def search_people(
+        self,
+        filter_: dict | None = None,
+        limit: int = 50,
+        *,
+        fail_if_truncated: bool = False,
+    ) -> list[dict]:
+        """Search person records with optional filter. Auto-paginates."""
+        return self._query_paginated(
+            "/objects/people/records/query", filter_, limit,
+            fail_if_truncated=fail_if_truncated,
+        )
 
     def get_person(self, record_id: str) -> dict | None:
         """Get a person record by its record ID. Returns None if not found."""
@@ -606,25 +666,20 @@ class AttioClient:
         list_id: str | None = None,
         filter_: dict | None = None,
         limit: int = 50000,
+        *,
+        fail_if_truncated: bool = False,
     ) -> list[dict]:
-        """Query entries in a list (pipeline) with optional filters. Auto-paginates."""
+        """Query entries in a list (pipeline) with optional filters. Auto-paginates.
+
+        With ``fail_if_truncated=True`` a full-list sweep that hits ``limit``
+        with entries remaining raises :class:`AttioResultTruncated` instead of
+        silently dropping the tail (PR-234).
+        """
         lid = list_id or os.environ.get("ATTIO_LIST_ID", "")
-        all_entries: list[dict] = []
-        page_size = min(limit, 100)
-        offset: int = 0
-
-        while len(all_entries) < limit:
-            body: dict = {"limit": page_size, "offset": offset}
-            if filter_:
-                body["filter"] = filter_
-            data = self._request("POST", f"/lists/{lid}/entries/query", json=body)
-            entries = data.get("data", [])
-            all_entries.extend(entries)
-            if len(entries) < page_size:
-                break
-            offset += len(entries)
-
-        return all_entries[:limit]
+        return self._query_paginated(
+            f"/lists/{lid}/entries/query", filter_, limit,
+            fail_if_truncated=fail_if_truncated,
+        )
 
     def add_list_entry(
         self,

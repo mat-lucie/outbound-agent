@@ -87,7 +87,8 @@ def run_wave2_blast(
     for stage in WAVE2_SOURCE_STAGES:
         results = attio.search_people(
             filter_={"email_campaign_stage": stage.value},
-            limit=500,
+            limit=50_000,
+            fail_if_truncated=True,
         )
         for record in results:
             values = record.get("values", {})

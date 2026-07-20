@@ -52,9 +52,9 @@ from typing import Any
 
 import httpx
 
-from clients.attio import AttioClient
+from clients.attio import AttioClient, AttioResultTruncated
 from clients.crm.base import CRMProvider, Entry, Record, RecordInfo, Stage
-from clients.crm.exceptions import UniquenessConflictError
+from clients.crm.exceptions import ResultTruncatedError, UniquenessConflictError
 from clients.crm.mapping import CRMMapping, default_attio_mapping
 
 # Attio-internal concurrency tuning for bulk person fetch. The contract drops
@@ -323,13 +323,19 @@ class AttioProvider(CRMProvider):
         list_id: str | None = None,
         filter_: dict[str, Any] | None = None,
         limit: int = 50000,
+        *,
+        fail_if_truncated: bool = False,
     ) -> list[Entry]:
-        return [
-            self._to_entry(e)
-            for e in self._attio.query_list_entries(
-                list_id=list_id, filter_=filter_, limit=limit
+        # Map the vendor-native truncation signal to the neutral contract
+        # exception so callers catch ResultTruncatedError, not an Attio type.
+        try:
+            raw_entries = self._attio.query_list_entries(
+                list_id=list_id, filter_=filter_, limit=limit,
+                fail_if_truncated=fail_if_truncated,
             )
-        ]
+        except AttioResultTruncated as exc:
+            raise ResultTruncatedError(str(exc)) from exc
+        return [self._to_entry(e) for e in raw_entries]
 
     def add_list_entry(
         self,

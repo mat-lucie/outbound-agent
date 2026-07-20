@@ -30,6 +30,21 @@ class CRMError(Exception):
     """
 
 
+class ResultTruncatedError(CRMError):
+    """Raised by a read (:meth:`CRMProvider.query_list_entries`) that hit its
+    ``limit`` with records still remaining, when the caller passed
+    ``fail_if_truncated=True``.
+
+    The neutral signal for "a full-sweep read was silently incomplete". Full-
+    sweep callers (e.g. the suppression sweep, list-scan exports) prefer a loud
+    failure over an incomplete result set — a silently truncated sweep would
+    leak suppressed prospects into outbound or export a partial pipeline
+    (PR-234). The Attio adapter maps its vendor-native ``AttioResultTruncated``
+    to this type; the in-memory ``FakeProvider`` raises it directly. Callers
+    catch THIS rather than a vendor-specific truncation exception.
+    """
+
+
 class UniquenessConflictError(CRMError):
     """Raised by a write (:meth:`CRMProvider.create_object_record` /
     :meth:`CRMProvider.update_object_record`) when the vendor rejects it for

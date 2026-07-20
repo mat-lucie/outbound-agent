@@ -13,7 +13,11 @@ from clients.crm.base import (
     RecordInfo,
     Stage,
 )
-from clients.crm.exceptions import CRMError, UniquenessConflictError
+from clients.crm.exceptions import (
+    CRMError,
+    ResultTruncatedError,
+    UniquenessConflictError,
+)
 from clients.crm.fake_provider import FakeProvider
 from clients.crm.mapping import (
     CRMMapping,
@@ -30,6 +34,7 @@ __all__ = [
     "FakeProvider",
     "Record",
     "RecordInfo",
+    "ResultTruncatedError",
     "Stage",
     "UniquenessConflictError",
     "default_attio_mapping",

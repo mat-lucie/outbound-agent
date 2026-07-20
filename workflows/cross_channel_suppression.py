@@ -97,7 +97,9 @@ def build_suppression_set(attio: AttioClient) -> set[str]:
             f"Export {LINKEDIN_OUTREACH_LIST_ID_ENV}=<uuid> and retry."
         )
 
-    entries = attio.query_list_entries(list_id=list_id, limit=100_000)
+    entries = attio.query_list_entries(
+        list_id=list_id, limit=100_000, fail_if_truncated=True,
+    )
     suppressed: set[str] = set()
     for entry in entries:
         attrs = _AttioClient.parse_entry(entry)

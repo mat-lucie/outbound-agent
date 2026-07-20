@@ -469,3 +469,55 @@ class TestBulkFetchPersonsByRecordIds:
 
         assert "rec-1" in result
         assert "rec-missing" not in result
+
+
+class TestSearchLimitTruncationGuard:
+    """PR-234: full-sweep callers pass ``fail_if_truncated=True`` so a query
+    that hits its scan limit with records remaining raises
+    ``AttioResultTruncated`` instead of silently dropping the tail."""
+
+    @staticmethod
+    def _page(n: int) -> dict:
+        return {"data": [{"id": {"record_id": f"r{i}"}} for i in range(n)]}
+
+    def test_search_people_raises_when_truncated(self, attio: AttioClient) -> None:
+        from clients.attio import AttioResultTruncated
+
+        # limit=2, page_size=2: first page full (2) → loop stops at limit; the
+        # boundary probe returns a non-empty page → truncated.
+        with patch.object(
+            attio, "_request",
+            side_effect=[self._page(2), self._page(1)],  # main page, probe
+        ), pytest.raises(AttioResultTruncated):
+            attio.search_people(limit=2, fail_if_truncated=True)
+
+    def test_search_people_no_raise_when_exhausted(self, attio: AttioClient) -> None:
+        # Short final page → exhausted, never raises even under the guard.
+        with patch.object(attio, "_request", return_value=self._page(1)):
+            result = attio.search_people(limit=50, fail_if_truncated=True)
+        assert len(result) == 1
+
+    def test_search_people_no_raise_at_exact_limit(self, attio: AttioClient) -> None:
+        # Exactly `limit` records, probe returns empty → complete, no raise.
+        with patch.object(
+            attio, "_request",
+            side_effect=[self._page(2), {"data": []}],  # main page, empty probe
+        ):
+            result = attio.search_people(limit=2, fail_if_truncated=True)
+        assert len(result) == 2
+
+    def test_default_never_raises(self, attio: AttioClient) -> None:
+        # Without the opt-in flag the pre-PR-234 silent-truncation behavior
+        # is preserved (limit caps the result, no exception).
+        with patch.object(attio, "_request", return_value=self._page(2)):
+            result = attio.search_people(limit=2)
+        assert len(result) == 2
+
+    def test_query_list_entries_raises_when_truncated(self, attio: AttioClient) -> None:
+        from clients.attio import AttioResultTruncated
+
+        with patch.object(
+            attio, "_request",
+            side_effect=[self._page(2), self._page(1)],
+        ), pytest.raises(AttioResultTruncated):
+            attio.query_list_entries(list_id="l1", limit=2, fail_if_truncated=True)

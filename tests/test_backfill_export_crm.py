@@ -81,7 +81,9 @@ class TestBackfillExportCRM:
         rows = _read_csv(file_path)
 
         # Contract methods were used (not raw AttioClient methods).
-        crm.query_list_entries.assert_called_once_with(limit=500)
+        crm.query_list_entries.assert_called_once_with(
+            limit=50_000, fail_if_truncated=True,
+        )
         crm.get_person.assert_called_once_with("rec-001")
         crm.extract_person_info.assert_called_once()
         assert rows == [

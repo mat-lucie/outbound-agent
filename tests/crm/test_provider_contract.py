@@ -239,9 +239,17 @@ class _StatefulAttioClient:
         list_id: str | None = None,
         filter_: dict[str, Any] | None = None,
         limit: int = 50000,
+        *,
+        fail_if_truncated: bool = False,
     ) -> list[dict[str, Any]]:
+        from clients.attio import AttioResultTruncated
+
         target = list_id or "__default__"
         rows = [e for e in self._entries.values() if e["id"].get("list_id") == target]
+        if fail_if_truncated and len(rows) > limit:
+            raise AttioResultTruncated(
+                f"list {target!r} has {len(rows)} entries past limit {limit}"
+            )
         return rows[:limit]
 
     def add_list_entry(
@@ -654,6 +662,26 @@ class TestListEntries:
         entries = provider.query_list_entries()
         assert all(isinstance(e, Entry) for e in entries)
         assert {e.record_id for e in entries} >= {p1.record_id, p2.record_id}
+
+    def test_query_fail_if_truncated_raises(self, provider: CRMProvider) -> None:
+        """PR-234: with ``fail_if_truncated=True`` a sweep that hits its limit
+        with entries remaining raises the neutral ``ResultTruncatedError``
+        instead of silently returning a partial set."""
+        from clients.crm.exceptions import ResultTruncatedError
+
+        for i in range(3):
+            person = provider.create_person({"name": f"P{i}"})
+            provider.add_list_entry(person.record_id, "Connection Sent")
+        with pytest.raises(ResultTruncatedError):
+            provider.query_list_entries(limit=1, fail_if_truncated=True)
+
+    def test_query_fail_if_truncated_ok_within_limit(
+        self, provider: CRMProvider
+    ) -> None:
+        person = provider.create_person({"name": "solo"})
+        provider.add_list_entry(person.record_id, "Connection Sent")
+        entries = provider.query_list_entries(limit=1000, fail_if_truncated=True)
+        assert any(e.record_id == person.record_id for e in entries)
 
     def test_update_list_entry_changes_stage(self, provider: CRMProvider) -> None:
         person = provider.create_person({"name": "Ada"})
