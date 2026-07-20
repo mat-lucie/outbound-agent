@@ -2086,3 +2086,90 @@ def test_run_followup_radar_gmail_sweep_on_annotates_and_surfaces_degraded(ident
     # Enabled-but-credential-less: the run still succeeds and the degradation
     # is surfaced (never a false clean).
     assert any("no Gmail credentials" in d for d in summary["degraded"])
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("build failed"), ValueError("malformed token")])
+def test_gmail_sweep_construction_failure_degrades_not_blackout(exc):
+    """IMPORTANT-1: from_credentials can raise more than GmailCredentialsMissing
+    (ValueError on a malformed token, RefreshError, transport/build errors). ANY
+    such failure must degrade to a surfaced reason — never propagate out and let
+    the Phase C firewall discard the whole CRM digest."""
+    from workflows.followup_radar import sweep_gmail_conversations
+
+    cand = _waiting_email_candidate(email="hot@acme.test")
+
+    def _boom():
+        raise exc
+
+    degraded = sweep_gmail_conversations(
+        [cand], today=TODAY, lookback_days=90, client_factory=_boom,
+    )
+    assert len(degraded) == 1
+    assert "client init failed" in degraded[0]
+    assert type(exc).__name__ in degraded[0]
+    # NEVER a credentials-missing wording for a non-credentials error — the two
+    # degraded reasons stay distinct so the operator can tell them apart.
+    assert "no Gmail credentials" not in degraded[0]
+    assert cand.email_reply_seen is False  # untouched
+
+
+def test_run_followup_radar_sweep_init_failure_keeps_crm_digest(identity_parsers):
+    """IMPORTANT-1 end-to-end: a sweep factory that raises a NON-credentials
+    error degrades the run AND the already-computed CRM digest still renders —
+    the exact 'radar runs on CRM signals alone' contract."""
+    attio = FakeAttio(entries=[
+        _entry("r1", "Responded", last_contact="2026-06-25", email_address="a@acme.test"),
+    ])
+
+    def _boom():
+        raise RuntimeError("gmail build exploded")
+
+    summary = run_followup_radar(
+        attio, today=TODAY, gmail_sweep=True, gmail_client_factory=_boom,
+    )
+    # Degraded reason surfaced …
+    assert any("client init failed" in d for d in summary["degraded"])
+    # … AND the CRM digest is NOT lost: the surfaced candidate still renders.
+    assert summary["surfaced"] == 1
+    assert len(summary["candidates"]) == 1
+    assert "**r1**" in summary["digest"]
+
+
+def test_reply_seen_marker_renders_over_state_gate_note():
+    """IMPORTANT-2: email_reply_seen renders as its OWN marker in the digest row,
+    independent of notes[0] ordering. A WAITING/drafted-stale candidate whose
+    notes[0] is a state-gate line must STILL show the reply-seen reconciliation
+    flag — otherwise it reads 'you went quiet, N days silent' with no counter."""
+    cand = _waiting_email_candidate(email="hot@acme.test")
+    # notes[0] is the WAITING/state-gate note that already owns the ⚠ slot.
+    cand.notes.append("nudge 1/2 sent 5d ago")
+    cand.email_reply_seen = True
+    md = render_digest([cand], full=True)
+    # The dedicated reply-seen marker renders …
+    assert "↩ reply seen" in md
+    # … AND does NOT displace the pre-existing state-gate note (both present).
+    assert "nudge 1/2 sent 5d ago" in md
+
+
+def test_reply_seen_marker_absent_when_not_seen():
+    """The marker is only rendered when email_reply_seen is True — a normal warm
+    candidate never gets a spurious ↩ flag."""
+    cand = _waiting_email_candidate(email="hot@acme.test")
+    assert cand.email_reply_seen is False
+    md = render_digest([cand], full=True)
+    assert "↩ reply seen" not in md
+
+
+def test_run_followup_radar_enrich_failure_degrades_and_renders(identity_parsers):
+    """MINOR-1: a transient Attio error during NAME resolution must not sink a
+    fully-successful detection. The run degrades (names fall back to record_id
+    via _who) and the digest still renders."""
+    attio = FakeAttio(
+        entries=[_entry("r1", "Responded", last_contact="2026-06-25", email_address="a@acme.test")],
+        bulk_fetch_exc=RuntimeError("attio 503 during enrichment"),
+    )
+    summary = run_followup_radar(attio, today=TODAY)
+    assert any("Name enrichment failed" in d for d in summary["degraded"])
+    # Detection succeeded and the digest still renders the row (fallback name).
+    assert summary["surfaced"] == 1
+    assert "**r1**" in summary["digest"]

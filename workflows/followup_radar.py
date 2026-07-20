@@ -7,8 +7,13 @@ went quiet: replied, booked a call, got demo'd, or have an open deal.
 
 Scope of THIS module (Python, Attio-REST only):
   * detect warm candidates from ``linkedin_outreach`` + ``deals``
-  * exclude declines (cross-channel suppression) and active-cadence overlap
-    (mid cold-email-drip) so a warm nudge never double-touches
+  * exclude declines and active-cadence overlap (mid cold-email-drip) so a
+    warm nudge never double-touches. General OWED/NUDGE-path decline
+    suppression is via ``build_suppression_set`` on entry signals (entry
+    stage + response_classification). The email-terminal-decline exclusion
+    (``_EMAIL_TERMINAL_STAGES``, keyed on people.email_campaign_stage) is
+    WAITING-lane-scoped — consulted only inside ``_waiting_pre_pass``. The
+    skill-layer C.2 gate is the final cross-channel decline check.
   * compute a *coarse* staleness/urgency from Attio-resident timestamps
   * render a ranked, lane-split digest (Owed vs Nudge)
 
@@ -1711,6 +1716,13 @@ def render_digest(
         else:
             approx = ""
         note = f" · ⚠ {c.notes[0]}" if c.notes else ""
+        # email_reply_seen (PR-214) renders as its OWN marker, NOT via notes[0]:
+        # a WAITING "nudge N/2 sent" or state-gate "drafted Nd ago" note already
+        # owns notes[0], so folding the reply-seen signal into notes[0] would
+        # bury the reconciliation line exactly when it matters most — a
+        # drafted-stale/waiting account that actually REPLIED must not read
+        # "you went quiet, N days silent" with no counter-signal.
+        reply_seen = " · ↩ reply seen" if c.email_reply_seen else ""
         # Partner-referred deals name the introducing partner so the operator
         # knows whose credibility is on the line. Best-effort: only rendered
         # when referred_by is actually a non-empty string.
@@ -1725,7 +1737,7 @@ def render_digest(
         )
         return (
             f"- **{_who(c)}** — {label} · {silence} "
-            f"· urgency {c.urgency}{via}{note}"
+            f"· urgency {c.urgency}{reply_seen}{via}{note}"
         )
 
     lines: list[str] = ["**Follow-up Radar**"]
@@ -1931,6 +1943,18 @@ def sweep_gmail_conversations(
             "Gmail conversation-ledger sweep skipped — no Gmail credentials "
             f"({exc}); radar ran on CRM signals only"
         ]
+    except Exception as exc:  # noqa: BLE001 — ANY sweep-construction failure must degrade, never blackout the CRM digest
+        # from_credentials can also raise ValueError (a malformed token that
+        # slips the shallow validity check), google.auth RefreshError, or a
+        # transport/build error. None of those are the caller's problem: the
+        # sweep is opt-in and advisory, so a construction failure degrades to a
+        # surfaced reason and the already-computed CRM digest still renders —
+        # the same "clean skip, radar runs on CRM signals alone" contract as
+        # the credentials-missing case above.
+        return [
+            "Gmail conversation-ledger sweep skipped — client init failed "
+            f"({type(exc).__name__}: {exc}); radar ran on CRM signals only"
+        ]
 
     lookback_floor = today - timedelta(days=max(1, lookback_days))
     degraded: list[str] = []
@@ -1995,7 +2019,17 @@ def run_followup_radar(
     candidates = result.candidates
     total = len(candidates)
     surfaced, waiting_capped = _trim_with_waiting_cap(candidates, limit)
-    enrich_names(attio, surfaced)
+    # Name resolution is COSMETIC — detection already fully succeeded. A
+    # transient Attio error mid-enrichment must not crash the run and lose the
+    # whole digest: degrade instead, and _who falls back to record_id[:8] for
+    # the unresolved rows so the digest still renders.
+    try:
+        enrich_names(attio, surfaced)
+    except Exception as exc:  # noqa: BLE001 — name lookup is best-effort; never sink a completed detection
+        result.degraded.append(
+            "Name enrichment failed — display names fall back to record ids "
+            f"({type(exc).__name__}: {exc})"
+        )
 
     # Optional Gmail conversation-ledger sweep (PR-214). OFF by default; when
     # the operator enables it, reconcile the surfaced (top-N) candidates against
