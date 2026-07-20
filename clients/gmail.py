@@ -23,7 +23,11 @@ signal consumers degrade on — Gmail is OFF by default until a token exists.
 Requires the ``[gmail]`` optional install extra
 (``pip install -e '.[gmail]'``) for ``google-api-python-client`` /
 ``google-auth-oauthlib``; those are lazy-imported so the core install and
-the mocked tests never need them.
+the mocked tests never need them. If a valid token is present but the extra
+is NOT installed, ``from_credentials`` raises ``GmailDependencyMissing`` (a
+``GmailCredentialsMissing`` subclass) rather than a raw ``ModuleNotFoundError``
+— so a missing library degrades to the same visible skip as a missing token
+instead of hard-crashing the daily run.
 """
 
 from __future__ import annotations
@@ -71,6 +75,17 @@ _QUOTED_HISTORY_RE = re.compile(
 
 class GmailCredentialsMissing(Exception):
     """Gmail token/client secret unavailable — email detection should skip."""
+
+
+class GmailDependencyMissing(GmailCredentialsMissing):
+    """The optional ``[gmail]`` extra is not installed — email detection skips.
+
+    Subclasses :class:`GmailCredentialsMissing` on purpose: every consumer
+    already guards on that base type, so a missing Google library degrades to
+    the SAME visible skip as a missing token instead of hard-crashing the run
+    with a raw ``ModuleNotFoundError``. It stays distinguishable (and carries
+    an actionable install hint) for callers that want to tell the two apart.
+    """
 
 
 def _is_valid_token(path: str) -> bool:
@@ -191,9 +206,19 @@ class GmailClient:
             )
         # Lazy imports: google-api-python-client is a runtime dep of this
         # path only (the [gmail] extra); tests inject a mock service and
-        # never need it.
-        from google.oauth2.credentials import Credentials
-        from googleapiclient.discovery import build
+        # never need it. A missing extra with a valid token present would
+        # otherwise raise ModuleNotFoundError — which escapes every
+        # consumer's `except GmailCredentialsMissing` guard and hard-crashes
+        # the run. Re-raise it as GmailDependencyMissing (a subclass) so the
+        # feature degrades to the same visible skip as a missing token.
+        try:
+            from google.oauth2.credentials import Credentials
+            from googleapiclient.discovery import build
+        except ImportError as exc:
+            raise GmailDependencyMissing(
+                "Gmail support requires the optional extra: "
+                "pip install -e '.[gmail]'"
+            ) from exc
 
         creds = Credentials.from_authorized_user_file(GMAIL_AUTHORIZED_USER, GMAIL_SCOPES)
         service = build("gmail", "v1", credentials=creds, cache_discovery=False)
@@ -270,7 +295,12 @@ def is_auto_generated(headers: dict, from_header: str = "") -> bool:
 
 def _interactive_mint_token() -> None:  # pragma: no cover
     """One-time operator flow: mint credentials/gmail-authorized-user.json."""
-    from google_auth_oauthlib.flow import InstalledAppFlow
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError as exc:
+        raise GmailDependencyMissing(
+            "Gmail support requires the optional extra: pip install -e '.[gmail]'"
+        ) from exc
 
     flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CREDENTIALS, GMAIL_SCOPES)
     creds = flow.run_local_server(port=0)
