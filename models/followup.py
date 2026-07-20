@@ -5,7 +5,7 @@ Pure logic — no I/O, fully unit-testable. The Python engine
 data (list-entry stage + ``last_contact_date`` + ``response_received_at``, deal
 stage + age). The skill layer (``/sales-daily`` Phase C) *refines* them with
 MCP-only signals it can see but Python cannot — Gmail thread direction
-(dropped-ball vs nudge), Granola call transcripts (recap owed, unfulfilled
+(dropped-ball vs nudge), call transcripts (recap owed, unfulfilled
 commitment), and deferral callback dates. See the sales-daily SKILL.md Phase C
 section for that split.
 
@@ -51,7 +51,7 @@ class FollowupReason(Enum):
     proposal_stall — require call transcripts / Gmail threads that only the
     skill layer can read via MCP, and are assigned there. The Python engine
     emits the coarse reason below; the skill layer may promote it (e.g.
-    RESPONDED_NO_NEXT_STEP → recap_owed when Granola shows a recent call).
+    RESPONDED_NO_NEXT_STEP → recap_owed when a recent call transcript exists).
     """
 
     CALLBACK_DUE = "callback_due"

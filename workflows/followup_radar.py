@@ -25,7 +25,7 @@ Tiers 1–2 are real recency (synthetic=False); every candidate carries
 synthetic and never blend them.
 
 Out of scope here, done by the skill layer via MCP (see SKILL.md Phase C):
-  * true last-touch verification (Gmail thread direction, Granola transcript)
+  * true last-touch verification (email thread direction, call transcript)
   * the 3-fact draft-context extraction and Gmail draft creation
   * writing follow-up state back to Attio
 
@@ -159,7 +159,7 @@ class FollowupCandidate:
     verified: bool = False
     # True when last_touch is derived from the entry/deal creation date rather
     # than a real contact stamp — the skill layer must treat the silence figure
-    # as approximate and re-derive from Gmail/Granola.
+    # as approximate and re-derive from the email thread / call transcript.
     last_touch_synthetic: bool = False
     # Which tier resolved last_touch (TOUCH_SOURCE_*): "verified" /
     # "interaction" / "contact_stamp" / "created_at" / "awaiting_send" /
@@ -1790,7 +1790,7 @@ def render_digest(
 
     footer = (
         "_Coarse last-touch from Attio only — the skill layer verifies via "
-        "Gmail/Granola before drafting (fail-closed)._"
+        "the email thread / call transcript before drafting (fail-closed)._"
     )
     if any(c.object == "deals" and c.last_touch_synthetic for c in candidates):
         footer += (
