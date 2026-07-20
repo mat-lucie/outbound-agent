@@ -107,6 +107,29 @@ If the token is absent or unreadable, the client raises
 `GmailCredentialsMissing` and the email-detection path skips cleanly — never a
 crash. Re-run `python -m clients.gmail` to re-enable.
 
+3. Provision the CRM schema Phase 0.6 writes to. On the bundled Attio adapter,
+   run `python3 scripts/setup_attio_schema.py --feature phase06` (idempotent,
+   safe to re-run; `--dry-run` previews). On a bring-your-own CRM, add the
+   equivalent attributes by hand. Without them, every Phase 0.6 write 400s.
+   The first three attributes below are written only by
+   `workflows.detect_email_responses`; `email_last_resend_id` is stamped by the
+   email lane (`workflows.email_campaign.run_email_daily`). The two terminal
+   `email_campaign_stage` select options (`email_responded`,
+   `email_not_interested`) are also seeded onto the existing
+   `email_campaign_stage` attribute so the detector can flip a replier out of
+   the drip.
+
+| Object | Attribute | Type | Purpose |
+|--------|-----------|------|---------|
+| people | `email_response_classification` | select (`positive`/`question`/`neutral`/`negative`/`defensive`) | Classifier verdict for a detected inbound email reply. |
+| people | `email_response_received_at` | datetime | Gmail internalDate of the reply; doubles as the one-detection-ever idempotency marker. |
+| people | `last_email_response_text` | long_text | Reply body (quoted history stripped, truncated to 1000 chars). |
+| people | `email_last_resend_id` | text | Resend message id of the most recent outreach email (forward-compat thread matching). |
+
+Once the token exists and the schema is provisioned, Phase 0.6 runs inside the
+daily flow. Set `OUTBOUND_DISABLE_EMAIL_RESPONSE_DETECTION=1` to force it off
+even when a token is present.
+
 ### (Optional) Follow-up Radar
 
 **Off by default.** The Follow-up Radar (PR-211/214/247) surfaces warm-but-stale

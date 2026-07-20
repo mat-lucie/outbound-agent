@@ -684,6 +684,22 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
     ("deals", "awaiting_reply_thread_id"): "workflows.followup_state",
     ("deals", "awaiting_reply_note_id"): "workflows.followup_state",
     ("deals", "awaiting_reply_nudge_count"): "workflows.followup_state",
+
+    # ---- People: email response detection (Phase 0.6, PR-243) ----
+    # Sole writer: the daily-run email reply detector. Note that
+    # email_campaign_stage itself stays OUTSIDE the registry (the email
+    # lane's writes go through attio.update_person directly, matching
+    # workflows/email_campaign.py's existing convention).
+    ("people", "email_response_classification"):
+        "workflows.detect_email_responses.detect_email_responses",
+    ("people", "email_response_received_at"):
+        "workflows.detect_email_responses.detect_email_responses",
+    ("people", "last_email_response_text"):
+        "workflows.detect_email_responses.detect_email_responses",
+    # Written via direct attio.update_person alongside email_campaign_stage
+    # (email-lane convention); registered for manifest parity.
+    ("people", "email_last_resend_id"):
+        "workflows.email_campaign.run_email_daily",
 }
 
 

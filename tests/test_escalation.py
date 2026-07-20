@@ -96,8 +96,12 @@ class TestSlugInventory:
         #   - awaiting_reply_resolved (a WAITING-lane cycle ended: the prospect
         #     replied to a tracked send; emitted by followup-await
         #     --clear --resolved, carrying the reply-latency learning signal).
-        # New count: 89 + 1 + 2 + 1 + 2 + 1 + 1 = 97.
-        assert len(ESCALATION_TYPES) == 97
+        # feat/port-phase06-email (PR-243) added 1 more:
+        #   - email_response_detected (Phase 0.6 auto-classified an inbound
+        #     email reply and flipped email_campaign_stage; operator cue to
+        #     read the note and take over the thread).
+        # New count: 89 + 1 + 2 + 1 + 2 + 1 + 1 + 1 = 98.
+        assert len(ESCALATION_TYPES) == 98
 
     def test_no_duplicate_slugs(self):
         assert len(ESCALATION_TYPES) == len(ESCALATION_TYPES_SET)

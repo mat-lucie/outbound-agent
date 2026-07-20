@@ -13,11 +13,19 @@ once you want the radar (see GETTING_STARTED.md → Follow-up Radar). The
 attribute specs mirror the CRM-agnostic requirement documented there; the
 sole in-code writer is ``workflows.followup_state``.
 
+The optional Email Response Detection feature (``--feature phase06``,
+PR-243) provisions the four ``people`` attributes and two terminal
+``email_campaign_stage`` options Phase 0.6 needs to flip a prospect who
+replied to an outreach email. Also DISABLED by default: the detector
+no-ops without a Gmail token, and these writes 400 until provisioned. See
+GETTING_STARTED.md → Email Response Detection.
+
 Usage:
   python3 scripts/setup_attio_schema.py --dry-run
   python3 scripts/setup_attio_schema.py
-  python3 scripts/setup_attio_schema.py --feature radar   # add radar attrs
-  python3 scripts/setup_attio_schema.py --feature all     # core + radar
+  python3 scripts/setup_attio_schema.py --feature radar    # add radar attrs
+  python3 scripts/setup_attio_schema.py --feature phase06  # add email-detection attrs
+  python3 scripts/setup_attio_schema.py --feature all      # core + radar + phase06
 """
 from __future__ import annotations
 
@@ -33,7 +41,10 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from clients.attio import AttioClient  # noqa: E402
-from scripts._attio_migration_helpers import ensure_attribute  # noqa: E402
+from scripts._attio_migration_helpers import (  # noqa: E402
+    ensure_attribute,
+    reconcile_select_options,
+)
 from workflows.quality_gate import VERDICT_PATHS  # noqa: E402
 
 # ── Follow-up Radar attribute specs (PR-211/214/247) ───────────────────────
@@ -127,6 +138,89 @@ def _provision_radar(client: AttioClient, list_id: str, dry_run: bool) -> None:
     )
     if failed:
         raise click.ClickException(f"{failed} radar attribute(s) failed to provision.")
+
+
+# ── Email response detection attribute specs (Phase 0.6, PR-243) ────────────
+# (slug, source-type, options, description). All land on the `people` object.
+# Sole writer of the first three: workflows.detect_email_responses; the
+# email lane (workflows.email_campaign.run_email_daily) writes
+# email_last_resend_id. OFF by default — only provisioned via
+# `--feature phase06`; the detector no-ops without a Gmail token regardless.
+_PHASE06_PEOPLE_ATTRS: list[tuple[str, str, list[str] | None, str]] = [
+    ("email_response_classification", "select",
+     ["positive", "question", "neutral", "negative", "defensive"],
+     "Classifier verdict for a detected inbound email reply (Phase 0.6). "
+     "Same taxonomy as the LinkedIn response classification."),
+    ("email_response_received_at", "datetime", None,
+     "Gmail internalDate of the detected reply. Doubles as the Phase 0.6 "
+     "idempotency marker: set => person is never re-scanned."),
+    ("last_email_response_text", "long_text", None,
+     "Reply body (quoted history stripped, truncated to 1000 chars). Full "
+     "text lives in the auto-created CRM note."),
+    ("email_last_resend_id", "text", None,
+     "Resend message id of the most recent outreach email — enables future "
+     "thread-id reply matching. Written by the email lane."),
+]
+
+# The two new terminal email_campaign_stage select options Phase 0.6 flips
+# to. Reconciled (not created) — the email_campaign_stage attribute must
+# already exist (the email lane writes it); RESPONDED/NOT_INTERESTED may
+# already be present from earlier enum additions, so this is idempotent.
+_PHASE06_STAGE_OPTIONS = ["email_responded", "email_not_interested"]
+
+
+def _provision_phase06(client: AttioClient, dry_run: bool) -> None:
+    """Idempotently provision the email-response-detection schema (PR-243).
+
+    Four new `people` attributes + two new `email_campaign_stage` select
+    options. Safe to re-run; skips anything already present.
+    """
+    click.echo("\nEmail response detection attributes (Phase 0.6, PR-243):")
+    created = skipped = failed = 0
+    for slug, type_, options, description in _PHASE06_PEOPLE_ATTRS:
+        target = f"people.{slug}"
+        try:
+            action = ensure_attribute(
+                client, "object", "people", slug, type_,  # type: ignore[arg-type]
+                options=options, description=description, dry_run=dry_run,
+            )
+        except Exception as exc:  # noqa: BLE001
+            click.echo(f"  ✗ {target}: FAILED — {exc}", err=True)
+            failed += 1
+            continue
+        if action in ("created", "would_create"):
+            tag = "[dry-run] would create" if dry_run else "created"
+            click.echo(f"  + {target} ({type_}): {tag}")
+            created += 1
+        else:
+            click.echo(f"  ✓ {target}: exists ({action})")
+            skipped += 1
+
+    # Seed the two terminal reply stages onto the existing
+    # email_campaign_stage select (must already exist — the email lane
+    # writes it). Idempotent: reconcile only adds missing options.
+    click.echo("Terminal email_campaign_stage options:")
+    try:
+        action = reconcile_select_options(
+            client, "object", "people", "email_campaign_stage",
+            _PHASE06_STAGE_OPTIONS, dry_run=dry_run,
+        )
+        click.echo(f"  people.email_campaign_stage options: {action}")
+    except httpx.HTTPStatusError as exc:
+        click.echo(
+            f"  ✗ email_campaign_stage options FAILED — {exc}. The "
+            "email_campaign_stage select attribute must exist on `people` "
+            "first (the email lane provisions it).",
+            err=True,
+        )
+        failed += 1
+
+    click.echo(
+        f"Phase 0.6 attributes: created={created}, skipped={skipped}, "
+        f"failed={failed}."
+    )
+    if failed:
+        raise click.ClickException(f"{failed} Phase 0.6 item(s) failed to provision.")
 
 
 # Spec: each entry is (parent_kind, parent_id_or_slug, attribute body).
@@ -337,14 +431,15 @@ def _create_option(
 @click.option("--dry-run", is_flag=True, help="List actions without writing.")
 @click.option(
     "--feature",
-    type=click.Choice(["core", "radar", "all"]),
+    type=click.Choice(["core", "radar", "phase06", "all"]),
     default="core",
     show_default=True,
     help=(
         "Which attribute set to provision. 'core' (default) = scorer + "
         "persistence attrs only. 'radar' = Follow-up Radar attrs only. "
-        "'all' = both. The radar is off by default; provision it only when "
-        "you want the Follow-up Radar (see GETTING_STARTED.md)."
+        "'phase06' = email response detection attrs only (PR-243). 'all' = "
+        "all of them. Radar and phase06 are off by default; provision them "
+        "only when you want those features (see GETTING_STARTED.md)."
     ),
 )
 def main(dry_run: bool, feature: str) -> int:
@@ -354,6 +449,9 @@ def main(dry_run: bool, feature: str) -> int:
     with AttioClient() as client:
         if feature == "radar":
             _provision_radar(client, list_id, dry_run)
+            return 0
+        if feature == "phase06":
+            _provision_phase06(client, dry_run)
             return 0
         # Cache existing slugs per parent so we make one GET per parent
         cache: dict[tuple[str, str], set[str]] = {}
@@ -404,6 +502,7 @@ def main(dry_run: bool, feature: str) -> int:
 
         if feature == "all":
             _provision_radar(client, list_id, dry_run)
+            _provision_phase06(client, dry_run)
     return 0
 
 

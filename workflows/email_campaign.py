@@ -192,6 +192,41 @@ def import_contacts(
     return {"queued": queued, "skipped": skipped, "not_found": not_found}
 
 
+def _update_person_with_resend_id_fallback(
+    attio: AttioClient, record_id: str, attributes: dict
+) -> None:
+    """PATCH the person, dropping `email_last_resend_id` on a 400 (PR-243).
+
+    Forward-compat (mirrors detect_responses' Phase-1 fallback): until the
+    operator provisions the `email_last_resend_id` attribute
+    (``scripts/setup_attio_schema.py --feature phase06``), writes including
+    it 400. The stage advance MUST still land — a stranded stage after a
+    successful Resend send means a duplicate email next run — so we retry
+    without the optional key.
+    """
+    try:
+        attio.update_person(record_id, attributes)
+    except httpx.HTTPStatusError as exc:
+        if (
+            exc.response is not None
+            and exc.response.status_code == 400
+            and "email_last_resend_id" in attributes
+        ):
+            fallback = {k: v for k, v in attributes.items() if k != "email_last_resend_id"}
+            attio.update_person(record_id, fallback)
+            # Loud on purpose (no-silent-fallbacks): the id is dropped for
+            # good on this send, and repeated firings mean the phase06
+            # schema hasn't been provisioned against the workspace.
+            click.echo(
+                "  ⚠ email_last_resend_id dropped (Attio 400 — attribute "
+                "missing?). Run scripts/setup_attio_schema.py --feature "
+                "phase06 to provision it.",
+                err=True,
+            )
+        else:
+            raise
+
+
 def run_email_daily(
     attio: AttioClient,
     resend: ResendClient | None,
@@ -422,7 +457,7 @@ def run_email_daily(
             # Non-dry-run path: resend is guaranteed non-None by the guard at
             # the top of this function (raises RuntimeError if unset).
             assert resend is not None
-            resend.send_email(
+            send_resp = resend.send_email(
                 to=contact["email"],
                 subject=subject,
                 html=html,
@@ -432,7 +467,13 @@ def run_email_daily(
                 headers=list_unsubscribe_header(),
             )
             mark_sent(contact["record_id"], "email1", today)
-            attio.update_person(contact["record_id"], stage_update)
+            # Capture the Resend message id (PR-243, forward-compat thread
+            # matching); falls back without it until the attribute exists.
+            _update_person_with_resend_id_fallback(
+                attio,
+                contact["record_id"],
+                {**stage_update, "email_last_resend_id": (send_resp or {}).get("id", "")},
+            )
             click.echo(f"  Sent Email 1 -> {contact['email']}")
 
         sent += 1
@@ -472,7 +513,7 @@ def run_email_daily(
             # Non-dry-run path: resend is guaranteed non-None by the guard at
             # the top of this function (raises RuntimeError if unset).
             assert resend is not None
-            resend.send_email(
+            send_resp = resend.send_email(
                 to=contact["email"],
                 subject=subject,
                 html=html,
@@ -482,7 +523,13 @@ def run_email_daily(
                 headers=list_unsubscribe_header(),
             )
             mark_sent(contact["record_id"], step.value, today)
-            attio.update_person(contact["record_id"], stage_update)
+            # Capture the Resend message id (PR-243, forward-compat thread
+            # matching); falls back without it until the attribute exists.
+            _update_person_with_resend_id_fallback(
+                attio,
+                contact["record_id"],
+                {**stage_update, "email_last_resend_id": (send_resp or {}).get("id", "")},
+            )
             click.echo(f"  Sent {step.value} -> {contact['email']}")
 
         sent += 1
