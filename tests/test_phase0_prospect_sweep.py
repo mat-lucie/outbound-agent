@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 from models.pipeline import PipelineStage
 from workflows.daily_check import (
     PHASE0_MAX_PROFILES_PER_LAUNCH,
+    PHASE0_PROSPECT_MIN_BUDGET,
     _prospect_accept_disposition,
 )
 
@@ -346,9 +347,10 @@ def test_prospect_second_degree_not_flipped_not_escalated(monkeypatch):
 
 # ── Test 4: capacity sharing — CONNECTION_SENT priority, flat cap ────────────
 
-def test_conn_sent_fills_cap_prospects_get_zero_budget(monkeypatch):
-    """When stale CONNECTION_SENT already fills the 50 cap, PROSPECTs get 0
-    scrape budget — the scrape batch is CONNECTION_SENT-only and ≤ cap."""
+def test_conn_sent_flood_reserves_prospect_floor(monkeypatch):
+    """PR-208: when stale CONNECTION_SENT would fill the whole cap, the Defect-2
+    PROSPECT sweep keeps a reserved floor (PHASE0_PROSPECT_MIN_BUDGET) instead of
+    being starved to 0. Total batch stays ≤ cap."""
     conns = [_conn_sent(i) for i in range(PHASE0_MAX_PROFILES_PER_LAUNCH)]
     prospects = [_prospect(i) for i in range(20)]
     entries = conns + prospects
@@ -358,10 +360,13 @@ def test_conn_sent_fills_cap_prospects_get_zero_budget(monkeypatch):
 
     submitted = {row["profileUrl"] for row in sheet_calls[0]}
     assert len(submitted) == PHASE0_MAX_PROFILES_PER_LAUNCH
-    # Batch is CONNECTION_SENT only — no prospect URL got scraped.
+    # PROSPECTs keep the reserved floor; CONNECTION_SENT takes the rest.
     prospect_urls = {p["linkedin_url"] for p in prospects}
-    assert submitted.isdisjoint(prospect_urls)
-    # All 20 prospects deferred this run.
+    conn_urls = {c["linkedin_url"] for c in conns}
+    assert len(submitted & prospect_urls) == PHASE0_PROSPECT_MIN_BUDGET
+    assert len(submitted & conn_urls) == (
+        PHASE0_MAX_PROFILES_PER_LAUNCH - PHASE0_PROSPECT_MIN_BUDGET
+    )
     assert result["scraped"] == PHASE0_MAX_PROFILES_PER_LAUNCH
     assert result["prospects_accepted"] == 0
 
@@ -387,20 +392,21 @@ def test_light_conn_sent_lets_prospects_fill_remainder(monkeypatch):
 
 
 def test_prospect_tail_rotates_least_recently_checked_first(monkeypatch):
-    """Under a tight prospect budget, the LEAST-recently-checked PROSPECTs are
+    """Under a binding prospect budget, the LEAST-recently-checked PROSPECTs are
     scraped first (round-robin) so a busy CONNECTION_SENT pipeline can't starve
-    the same tail forever (MEDIUM-2). Never-checked ("") sorts ahead of dated."""
-    conns = [_conn_sent(i) for i in range(PHASE0_MAX_PROFILES_PER_LAUNCH - 2)]  # budget = 2
-    prospects = [_prospect(i) for i in range(5)]
+    the same tail forever (MEDIUM-2). Never-checked ("") sorts ahead of dated.
+
+    With the PR-208 reserved floor, a CONNECTION_SENT flood leaves the PROSPECT
+    budget at exactly PHASE0_PROSPECT_MIN_BUDGET; here 5 extra stale PROSPECTs
+    compete for those slots."""
+    conns = [_conn_sent(i) for i in range(PHASE0_MAX_PROFILES_PER_LAUNCH)]
+    prospects = [_prospect(i) for i in range(PHASE0_PROSPECT_MIN_BUDGET + 5)]
     entries = conns + prospects
-    # p000 never checked (""), p001 oldest date, then newer → only p000 + p001
-    # should win the 2 slots.
+    # The last 5 PROSPECTs were checked most recently → they LOSE the budgeted
+    # slots; the first PHASE0_PROSPECT_MIN_BUDGET (never-checked, "") win.
+    recent = prospects[PHASE0_PROSPECT_MIN_BUDGET:]
     last_checked = {
-        prospects[1]["linkedin_url"]: "2026-06-01",
-        prospects[2]["linkedin_url"]: "2026-06-10",
-        prospects[3]["linkedin_url"]: "2026-06-20",
-        prospects[4]["linkedin_url"]: "2026-06-22",
-        # prospects[0] absent → "" (never checked) → sorts first
+        p["linkedin_url"]: f"2026-06-2{i}" for i, p in enumerate(recent)
     }
     degree_by_url = {e["linkedin_url"]: "2nd" for e in entries}
     pb = _mock_pb(_csv_for(entries, degree_by_url))
@@ -410,10 +416,11 @@ def test_prospect_tail_rotates_least_recently_checked_first(monkeypatch):
     submitted = {row["profileUrl"] for row in sheet_calls[0]}
     prospect_urls = {p["linkedin_url"] for p in prospects}
     scraped_prospects = submitted & prospect_urls
+    assert len(scraped_prospects) == PHASE0_PROSPECT_MIN_BUDGET
     assert scraped_prospects == {
-        prospects[0]["linkedin_url"],  # never checked, wins
-        prospects[1]["linkedin_url"],  # oldest checked, wins
+        p["linkedin_url"] for p in prospects[:PHASE0_PROSPECT_MIN_BUDGET]
     }
+    assert scraped_prospects.isdisjoint({p["linkedin_url"] for p in recent})
 
 
 def test_total_scrape_batch_never_exceeds_cap(monkeypatch):
@@ -427,9 +434,14 @@ def test_total_scrape_batch_never_exceeds_cap(monkeypatch):
 
     assert len(sheet_calls[0]) == PHASE0_MAX_PROFILES_PER_LAUNCH
     submitted = {row["profileUrl"] for row in sheet_calls[0]}
-    # CONNECTION_SENT priority: with 80 stale conns the whole cap goes to them.
+    # PR-208: CONNECTION_SENT keeps priority but PROSPECTs hold the reserved
+    # floor — so the batch is (cap − reserve) conn + reserve prospect, still ≤ cap.
+    conn_urls = {c["linkedin_url"] for c in conns}
     prospect_urls = {p["linkedin_url"] for p in prospects}
-    assert submitted.isdisjoint(prospect_urls)
+    assert len(submitted & prospect_urls) == PHASE0_PROSPECT_MIN_BUDGET
+    assert len(submitted & conn_urls) == (
+        PHASE0_MAX_PROFILES_PER_LAUNCH - PHASE0_PROSPECT_MIN_BUDGET
+    )
 
 
 # ── Mixed batch: conn_sent + prospect both flip in one pass ──────────────────

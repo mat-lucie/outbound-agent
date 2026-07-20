@@ -582,7 +582,7 @@ def open_daily_run(
         # L4-4: same-machine stale row takeover.
         # A stuck status=running row from the same machine (same machine_id)
         # that is older than STALE_RUN_TAKEOVER_HOURS means the prior
-        # process crashed without closing. We mark it abandoned so the new
+        # process crashed without closing. We mark it aborted so the new
         # run can open fresh. Cross-machine rows are never taken over
         # automatically — we can't verify the other machine is dead.
         if existing and _is_stale_same_machine(existing, actual_machine):
@@ -701,22 +701,32 @@ def _takeover_stale_row(
     run_date: str,
     machine_id: str,
 ) -> None:
-    """Mark a stale running row as abandoned, freeing its uniqueness_key lock.
+    """Mark a stale running row as aborted, freeing its uniqueness_key lock.
+
+    PR-210: the status is ``aborted`` — the same terminal status the normal
+    abort close-path writes — because the ``daily_run.status`` select only
+    offers running/completed/failed/aborted. Writing a non-existent option
+    (previously ``abandoned``) rejects the update, which re-raises and leaves
+    the stale running-lock stuck, defeating this auto-takeover entirely. The
+    released uniqueness_key carries the matching ``aborted|`` segment so the
+    released key matches the written status and the running-lock is actually
+    freed. Forensic distinction from a Ctrl-C abort is preserved via the
+    ``[stale-run takeover]`` marker in failure_details.
 
     Logs loudly to stderr. (L4-4 audit fix.)
     """
-    released_key = _released_uniqueness_key("abandoned", run_date, machine_id, stale_record_id)
+    released_key = _released_uniqueness_key("aborted", run_date, machine_id, stale_record_id)
     print(
         f"WARN: daily_run stale-run takeover: record {stale_record_id!r} for "
         f"{run_date!r}/{machine_id!r} has been running longer than "
-        f"{STALE_RUN_TAKEOVER_HOURS}h — marking it abandoned.",
+        f"{STALE_RUN_TAKEOVER_HOURS}h — marking it aborted.",
         file=sys.stderr,
     )
     crm.update_object_record(
         "daily_run",
         stale_record_id,
         {
-            "status": "abandoned",
+            "status": "aborted",
             "completed_at": datetime.now(UTC).isoformat(),
             "uniqueness_key": released_key,
             "failure_details": (
@@ -835,7 +845,6 @@ _STATUS_PRIORITY = {
     "completed": 1,
     "failed": 2,
     "aborted": 3,
-    "abandoned": 4,
 }
 # Far above any plausible same-day retry count; exists only so the query is
 # bounded. More rows than this on one day is operational chaos the WARN in

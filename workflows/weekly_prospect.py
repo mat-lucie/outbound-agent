@@ -1022,6 +1022,33 @@ def _commit_prospect(
     already_listed = (
         in_list_record_ids is not None and record_id in in_list_record_ids
     )
+    # PR-207 (re-stamp incident): the snapshot-membership check above is a
+    # silent no-op when the caller passes no `in_list_record_ids` — exactly the
+    # `weekly_finalize_cmd` borderline-commit path. With the snapshot absent, an
+    # existing pipeline entry (even a terminal/Responded one) got re-stamped
+    # back to a fresh stage/dm_step=0, wiping cadence depth. When no snapshot
+    # was supplied, ground the guard in CRM truth instead: if the record already
+    # owns ANY entry in this list, weekly must not touch it. Prefer the in-memory
+    # `existing_entries` cache (the finalize path now supplies it); fall back to a
+    # targeted list read only when neither cache is present. FAIL CLOSED — if the
+    # read errors, skip rather than re-stamp a live entry. The bulk weekly run
+    # always passes `in_list_record_ids`, so this adds zero per-prospect work
+    # there — it keeps its authoritative single run-start snapshot.
+    if not already_listed and in_list_record_ids is None:
+        if existing_entries is not None:
+            record_entries = [e for e in existing_entries if e.record_id == record_id]
+        else:
+            try:
+                all_entries = crm.query_list_entries(list_id=list_id)
+            except httpx.HTTPStatusError:
+                click.echo(
+                    f"      → Re-stamp guard lookup failed for {record_id}; "
+                    "skipping commit rather than risk re-stamping a live entry"
+                )
+                return False
+            record_entries = [e for e in all_entries if e.record_id == record_id]
+        if record_entries:
+            already_listed = True
     if summary is not None:
         key = "restamped_existing" if already_listed else "net_new_created"
         summary[key] = summary.get(key, 0) + 1

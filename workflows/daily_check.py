@@ -67,6 +67,7 @@ from workflows.escalation import escalate
 from workflows.pb_advance_gate import emit_pb_inmail_dead_end, emit_pb_silent_no_op
 from workflows.pre_invite_check import (
     _IMMUTABLE_FROZEN_AT_VALUES,
+    SALES_NAV_HAS_PENDING_INVITATION_COL,
     _pre_invite_degree_check,
 )
 from workflows.quality_gate import classify_response
@@ -120,6 +121,38 @@ STALE_CONNECTION_SENT_ESCALATE_DAYS = 45
 # budget (MAX_VISITS_PER_DAY) allowed — one run must not burn a week of
 # account-safety headroom clearing a backlog.
 PHASE0_MAX_PROFILES_PER_LAUNCH = 50
+
+# PR-209 (Leak A): of each Phase-0 scrape batch, reserve this many slots for the
+# OLDEST in-window invites (about to exit ACCEPTANCE_CHECK_WINDOW_DAYS — a
+# last-chance check so a late accepter isn't lost forever); the remaining budget
+# is filled NEWEST-first. Fresh acceptances cluster in the first days
+# post-invite and are the highest-value to detect + DM promptly. Pure
+# oldest-first starved them: on a backlog day the newest invites were deferred
+# last, so confirmed acceptances sat undetected behind the older tail. Stays
+# under the cap → no extra profile-visit volume. Tunable; must be <
+# PHASE0_MAX_PROFILES_PER_LAUNCH.
+PHASE0_EXPIRING_RESERVE = 15
+
+# PR-208 stale-degree fix: the Sales Nav scraper's connectionDegree LAGS the
+# live graph (returns "2nd" for a freshly-accepted, now-1st-degree connection),
+# so the fix below re-scrapes every non-"1st" CONNECTION_SENT row daily instead
+# of letting a cached "2nd" suppress it for RECHECK_TTL_DAYS. That raises the
+# steady-state CONNECTION_SENT scrape volume, which would let the
+# CONNECTION_SENT-priority slice consume the whole per-run cap and starve the
+# Defect-2 PROSPECT sweep to ~0 every day. Reserve a floor of scrape slots for
+# stale PROSPECTs (when any exist) so the PROSPECT acceptance sweep keeps making
+# progress. CONNECTION_SENT still takes the lion's share (cap − reserve) plus
+# any reserved slots the PROSPECT pool doesn't use.
+PHASE0_PROSPECT_MIN_BUDGET = 10
+
+# PR-208 acceptance-reconcile alarm: a CONNECTION_SENT row the SN scrape reports
+# as invite-resolved (hasPendingInvitation="false") but still NOT 1st-degree is
+# either a declined/withdrawn invite OR an accepted invite whose degree the
+# scraper is mis-reading. Both warrant a human cross-reference against LinkedIn
+# "My Network". Only surface rows whose invite is at least this old, so invites
+# that just resolved (and may flip to 1st on the next scrape) don't spam the
+# queue.
+SUSPECTED_STALE_MIN_AGE_DAYS = 4
 
 
 def _is_blocked_by_stored_floor(
@@ -756,6 +789,43 @@ def _escalate_phase0_stale_scrape(
         )
 
 
+def _escalate_phase0_suspected_stale_degree(
+    *,
+    attio: AttioClient,
+    backend: str,
+    record_ids: list[str],
+) -> None:
+    """Open a phase0_suspected_stale_degree escalation row, swallowing errors.
+
+    PR-208: emitted once per day with the CONNECTION_SENT rows the SN scrape
+    reported invite-resolved (hasPendingInvitation="false") yet still NOT
+    1st-degree — the stale-degree / declined-invite cohort an operator should
+    cross-reference against LinkedIn "My Network". Visibility only; no stage
+    changes. Swallow + log so a queue-write outage (e.g. the Attio select option
+    not yet registered by the operator_review_queue migration) never crashes the
+    daily run — mirrors `_escalate_phase0_stale_scrape`.
+    """
+    op_today = operator_today().isoformat()
+    try:
+        escalate(
+            type="phase0_suspected_stale_degree",
+            idempotency_key=f"phase0-suspected-stale|{op_today}",
+            payload={
+                "run_date": op_today,
+                "backend": backend,
+                "count": len(record_ids),
+                "record_ids": record_ids[:20],
+            },
+            attio=attio,
+        )
+    except Exception as esc_exc:  # noqa: BLE001 — guard must not crash the run
+        click.echo(
+            f"  ⚠ could not open phase0_suspected_stale_degree escalation: "
+            f"{type(esc_exc).__name__}: {esc_exc}",
+            err=True,
+        )
+
+
 def _echo_phase0_prospect_summary(*, checked: int, accepted: int, regressions: int) -> None:
     """Echo the Defect-2 PROSPECT sweep line. No-op when no PROSPECT
     candidates were collected so quiet runs read identically to pre-Defect-2
@@ -963,9 +1033,13 @@ def detect_accepted_connections(
     ACCEPTANCE_CHECK_WINDOW_DAYS days (older invites rarely convert).
 
     At most PHASE0_MAX_PROFILES_PER_LAUNCH stale profiles are scraped per
-    run (2026-06-11 oversized-launch fix), oldest invites first; the tail
-    is deferred and rotates in on subsequent runs via the recheck cache.
-    The ``deferred`` key of the returned summary carries the tail size.
+    run (2026-06-11 oversized-launch fix). Within that cap the batch is filled
+    NEWEST-invite first (PR-209) — fresh acceptances cluster in the first days
+    post-invite and are the highest-value to detect + DM promptly — after
+    reserving PHASE0_EXPIRING_RESERVE slots for the oldest invites about to exit
+    the acceptance window (last-chance check). The middle band is deferred and
+    rotates in on subsequent runs via the recheck cache. The ``deferred`` key of
+    the returned summary carries the deferred size.
 
     Backend selection mirrors the pre-invite degree-check (PR-B):
     ``PRE_INVITE_DEGREE_CHECK_BACKEND=sales_nav`` routes the scrape through
@@ -1108,6 +1182,37 @@ def detect_accepted_connections(
     urls_in = [p["linkedin_url"] for p in candidates]
     fresh_cache, stale_urls = recheck_cache.partition(urls_in)
     stale_set = set(stale_urls)
+
+    # PR-208 stale-degree fix. The SN scraper's connectionDegree lags the live
+    # graph — it returns "2nd" for a connection that has actually accepted (now
+    # 1st-degree). partition() treats that cached "2nd" as fresh for
+    # RECHECK_TTL_DAYS and suppresses re-scraping, so the 2nd→1st correction is
+    # never observed and the row sticks at CONNECTION_SENT indefinitely. For
+    # CONNECTION_SENT candidates ONLY, force a re-scrape of any cached NON-"1st"
+    # degree UNLESS it was already checked today — same-day repeat passes still
+    # cache-hit, so no duplicate scrape credits within a day, while a stale
+    # negative from a prior day re-checks daily. A cached "1st" is terminal (the
+    # flip loop below advances it) so it stays a cache-hit. PROSPECT candidates
+    # keep the plain TTL behavior: they have no invite to have "accepted", and
+    # they share the capped scrape budget. today_iso (UTC) is compared against
+    # recheck_cache's UTC `checked_at` stamp so the same-day predicate cannot
+    # drift off-by-one.
+    today_iso = date.today().isoformat()
+    for p in conn_sent:
+        url = p["linkedin_url"]
+        if url in stale_set:
+            continue
+        cached_entry = fresh_cache.get(url) or {}
+        # .get() (not subscript): visit-only cache entries carry checked_at but
+        # no `degree` key (recheck_cache.record_many only writes degree when
+        # truthy) — a subscript would KeyError and crash Phase 0.
+        if (
+            cached_entry.get("degree") != "1st"
+            and cached_entry.get("checked_at") != today_iso
+        ):
+            stale_set.add(url)
+            fresh_cache.pop(url, None)
+
     conn_sent_stale = [p for p in conn_sent if p["linkedin_url"] in stale_set]
     prospect_stale = [p for p in prospect_cands if p["linkedin_url"] in stale_set]
     cache_hit_count = len(candidates) - len(conn_sent_stale) - len(prospect_stale)
@@ -1119,7 +1224,7 @@ def detect_accepted_connections(
 
     # Flip any cache-hit "1st" entries to ACCEPTED without re-scraping.
     # Cache-hit flips are NOT capped (no PB cost) — apply to both stages.
-    today_iso = date.today().isoformat()
+    # (today_iso is computed above, before the PR-208 forced-rescrape predicate.)
     accepted = 0
     prospects_accepted = 0
     prospect_regressions_flagged = 0
@@ -1184,15 +1289,44 @@ def detect_accepted_connections(
     # volume is UNCHANGED by the Defect-2 PROSPECT sweep (flat PB cost).
     #
     # CONNECTION_SENT keeps PRIORITY: fill the batch with stale CONNECTION_SENT
-    # first (oldest invites first — they exit the ACCEPTANCE_CHECK_WINDOW_DAYS
-    # window soonest, so they have the fewest re-check chances left), then fill
-    # the REMAINING budget with stale PROSPECTs. On busy CONNECTION_SENT days
-    # PROSPECTs get little/no budget — acceptable, they rotate in on quieter
-    # days. Scraped rows are stamped into the recheck cache below and read as
-    # fresh next run, so each deferred tail rotates in instead of re-queueing.
-    conn_sent_stale.sort(key=lambda p: p.get("last_contact_date") or "")
-    conn_sent_deferred = max(0, len(conn_sent_stale) - PHASE0_MAX_PROFILES_PER_LAUNCH)
-    conn_sent_batch = conn_sent_stale[:PHASE0_MAX_PROFILES_PER_LAUNCH]
+    # first, then fill the REMAINING budget with stale PROSPECTs. On busy
+    # CONNECTION_SENT days PROSPECTs get little/no budget — acceptable, they
+    # rotate in on quieter days. Scraped rows are stamped into the recheck cache
+    # below and read as fresh next run, so each deferred tail rotates in instead
+    # of re-queueing.
+    #
+    # PR-208: reserve a PROSPECT floor so the daily CONNECTION_SENT re-scrape
+    # flood (stale-degree fix) can't starve the Defect-2 PROSPECT sweep — see
+    # PHASE0_PROSPECT_MIN_BUDGET. CONNECTION_SENT takes (cap − reserve) plus any
+    # reserved slots PROSPECTs don't use; total never exceeds the cap and the
+    # no-PROSPECT case is unchanged (reserve = 0).
+    reserved_for_prospects = (
+        min(PHASE0_PROSPECT_MIN_BUDGET, len(prospect_stale)) if prospect_stale else 0
+    )
+    # max(0, …): guards the "total ≤ cap" invariant if PHASE0_PROSPECT_MIN_BUDGET
+    # is ever raised at/above the cap — without it conn_sent_cap goes negative and
+    # the slice would silently scrape zero CONNECTION_SENT (the inverse starvation).
+    conn_sent_cap = max(0, PHASE0_MAX_PROFILES_PER_LAUNCH - reserved_for_prospects)
+    #
+    # PR-209 Leak-A fix: WITHIN the CONNECTION_SENT budget (conn_sent_cap),
+    # reserve PHASE0_EXPIRING_RESERVE slots for the OLDEST invites (about to exit
+    # the ACCEPTANCE_CHECK_WINDOW_DAYS window — a last-chance check) and fill the
+    # rest NEWEST-first. Fresh acceptances cluster in the first days post-invite;
+    # pure oldest-first deferred those newest invites behind the backlog and
+    # starved the most-likely-to-have-just-accepted profiles. The deferred set is
+    # the MIDDLE band, which rotates in via the 3-day recheck cache. (Composes
+    # with the PROSPECT reserve above: the expiring/newest split runs against
+    # conn_sent_cap, not the full cap.)
+    conn_sent_stale.sort(key=lambda p: p.get("last_contact_date") or "")  # oldest -> newest
+    expiring_reserve = min(
+        PHASE0_EXPIRING_RESERVE, conn_sent_cap, len(conn_sent_stale)
+    )
+    expiring_batch = conn_sent_stale[:expiring_reserve]  # oldest, about to expire
+    fresh_pool = conn_sent_stale[expiring_reserve:]
+    fresh_budget = conn_sent_cap - len(expiring_batch)
+    fresh_batch = fresh_pool[-fresh_budget:] if fresh_budget > 0 else []  # newest end
+    conn_sent_batch = expiring_batch + fresh_batch
+    conn_sent_deferred = max(0, len(conn_sent_stale) - len(conn_sent_batch))
 
     prospect_budget = PHASE0_MAX_PROFILES_PER_LAUNCH - len(conn_sent_batch)
     # Rotate the PROSPECT tail least-recently-checked first so a small budget
@@ -1215,8 +1349,9 @@ def detect_accepted_connections(
             f"  Capping Phase 0 scrape batch at {PHASE0_MAX_PROFILES_PER_LAUNCH} "
             f"(per-run visit-safety cap; phantom schema max is 150) — "
             f"{conn_sent_deferred} CONNECTION_SENT + {prospect_deferred} PROSPECT "
-            f"profile(s) deferred to subsequent runs, oldest invites first; "
-            f"CONNECTION_SENT keeps scrape priority."
+            f"profile(s) deferred to subsequent runs (CONNECTION_SENT filled "
+            f"newest-first with a {PHASE0_EXPIRING_RESERVE}-slot expiring-invite "
+            f"reserve); CONNECTION_SENT keeps scrape priority."
         )
 
     click.echo(
@@ -1433,6 +1568,13 @@ def detect_accepted_connections(
 
     reader = csv.DictReader(io.StringIO(result_csv))
     degree_lookup: dict[str, str] = {}
+    # PR-208: also capture hasPendingInvitation per URL. It is NOT used to flip
+    # (declined/withdrawn invites also read "false", which would be a
+    # false-accept); it feeds the phase0_suspected_stale_degree reconcile alarm
+    # below — a CONNECTION_SENT row reported invite-resolved (pending="false")
+    # but still not 1st-degree is exactly the stale-degree / declined cohort a
+    # human should eyeball.
+    pending_lookup: dict[str, str] = {}
     for row in reader:
         # PB Profile Scraper uses multiple URL columns; try all
         url = (
@@ -1446,6 +1588,9 @@ def detect_accepted_connections(
             norm = _normalize_linkedin_url(url)
             if norm in our_urls:
                 degree_lookup[norm] = degree
+                pending_lookup[norm] = (
+                    row.get(SALES_NAV_HAS_PENDING_INVITATION_COL) or ""
+                ).strip().lower()
 
     # Silent-zero guard (2026-06-09 incident): a dedup-refused scrape used to
     # join stale result.csv rows and report a confident "0 accepted". With a
@@ -1524,6 +1669,73 @@ def detect_accepted_connections(
                 prospect_regressions_flagged += 1
 
     recheck_cache.record_many(cache_updates)
+
+    # PR-208 acceptance-reconcile alarm. Surface CONNECTION_SENT rows the SN
+    # scrape reports as invite-resolved (hasPendingInvitation="false") but still
+    # NOT 1st-degree. These are either declined/withdrawn invites or — the bug
+    # this guards — accepted invites whose degree the scraper is mis-reading;
+    # both need a human cross-reference against LinkedIn "My Network". Auto-flip
+    # is NOT triggered (pending="false" alone can't distinguish accepted from
+    # declined, so flipping would risk cold-DMing someone who declined). The
+    # blind/no_csv paths return early above; the PARTIAL-dedup path (dedup marker
+    # + rows>0) falls through here and MAY co-fire with phase0_stale_scrape
+    # (partial) — that is intended: distinct alarms, distinct idempotency keys,
+    # both visibility-only. Aggregated to one row/day (mirrors
+    # stale_connection_sent).
+    suspect_cutoff = (
+        date.today() - timedelta(days=SUSPECTED_STALE_MIN_AGE_DAYS)
+    ).isoformat()
+    suspected_ids: list[str] = []
+    conn_sent_matched = 0  # CONNECTION_SENT rows we got a degree for this scrape
+    pending_signal_seen = 0  # ...of those, how many carried a hasPendingInvitation
+    for attrs in scrape_batch:
+        if attrs.get("_phase0_kind") != "conn_sent":
+            continue
+        norm = _normalize_linkedin_url(attrs["linkedin_url"])
+        degree = degree_lookup.get(norm, "")
+        # Only judge rows actually observed this scrape (degree present).
+        if not degree:
+            continue
+        conn_sent_matched += 1
+        if pending_lookup.get(norm):
+            pending_signal_seen += 1
+        if degree == "1st":
+            continue
+        if pending_lookup.get(norm) != "false":
+            continue
+        last_sent = (attrs.get("last_contact_date") or "")[:10]
+        # "at least SUSPECTED_STALE_MIN_AGE_DAYS old" → <= so an invite sent
+        # exactly on the cutoff date is included (conservative: never younger).
+        if last_sent and last_sent <= suspect_cutoff:
+            suspected_ids.append(str(attrs["record_id"]))
+
+    # Silent-blind guard: on the sales_nav backend the SN CSV always carries
+    # hasPendingInvitation. If we observed CONNECTION_SENT rows yet the column
+    # was empty on ALL of them, this alarm is blind (column renamed upstream, or
+    # the legacy `regular` backend that omits it) — say so loudly rather than
+    # report a quiet "no suspected-stale rows", which would read as all-clear.
+    if backend == "sales_nav" and conn_sent_matched and pending_signal_seen == 0:
+        click.echo(
+            f"  ⚠ phase0_suspected_stale_degree is BLIND this run: "
+            f"hasPendingInvitation was empty on all {conn_sent_matched} matched "
+            f"CONNECTION_SENT row(s) — the SN CSV column may have been renamed. "
+            f"The stale-degree reconcile alarm cannot evaluate.",
+            err=True,
+        )
+    if suspected_ids:
+        _escalate_phase0_suspected_stale_degree(
+            attio=attio,
+            backend=backend,
+            record_ids=suspected_ids,
+        )
+        click.echo(
+            f"  ⚠ {len(suspected_ids)} CONNECTION_SENT row(s) scraped as "
+            f"invite-resolved (hasPendingInvitation=false) but NOT 1st-degree — "
+            f"likely a stale SN degree or a declined invite. "
+            f"phase0_suspected_stale_degree queue row opened for manual "
+            f"reconcile against LinkedIn 'My Network'.",
+            err=True,
+        )
     click.echo(f"  Checked {len(scrape_batch)} profiles, {accepted} accepted.")
     _echo_phase0_prospect_summary(
         checked=len(prospect_cands),
