@@ -33,6 +33,14 @@ py-modules = ["cli"]
 include = ["clients*", "content*", "models*", "scripts*", "workflows*"]
 
 [project.optional-dependencies]
+# Optional Gmail email-response detection (clients/gmail.py, PR-243).
+# Off by default; only needed if the operator enables Gmail reply detection.
+# google-auth is already a core dep; these two are lazy-imported so the core
+# install and the mocked tests stay lean.
+gmail = [
+    "google-api-python-client>=2.0",
+    "google-auth-oauthlib>=1.0",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.4.0",
