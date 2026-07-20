@@ -78,6 +78,21 @@ class ICPConfig:
     consulting_firm_keywords: list[str]
     consulting_title_keywords: list[str]
     ops_override_keywords: list[str]
+    # PR-222 Rec E: high-confidence COMPANY/EMPLOYER disqualifier families
+    # (academic institutions, government, healthcare providers, direct
+    # competitors, freelance/no-employer). Company-keyed hard rejects, no
+    # OPS_OVERRIDE bypass — the disqualifying fact is the employer, not the
+    # title. See workflows.quality_gate._match_disqualifier.
+    academic_company_keywords: list[str]
+    government_keywords: list[str]
+    healthcare_provider_keywords: list[str]
+    competitor_company_keywords: list[str]
+    freelance_employer_keywords: list[str]
+    # PR-238: medical / regulatory / clinical-affairs TITLE disqualifier family.
+    # Title-keyed (a pharma/biotech clinical-affairs function is not the
+    # ops/production buyer), OPS_OVERRIDE disjoint-span bypass still rescues
+    # genuine manufacturing-ops titles.
+    medical_regulatory_title_keywords: list[str]
 
     # LLM qualifier prompt slots (P2b). The narrative, ICP-specific pieces of
     # the LLM tiebreaker's system prompt. The render lives in
@@ -252,6 +267,12 @@ def load_icp_config() -> ICPConfig:
         consulting_firm_keywords=_str_list(dq, "consulting_firm_keywords", section_name="disqualifiers"),
         consulting_title_keywords=_str_list(dq, "consulting_title_keywords", section_name="disqualifiers"),
         ops_override_keywords=_str_list(dq, "ops_override_keywords", section_name="disqualifiers"),
+        academic_company_keywords=_str_list(dq, "academic_company_keywords", section_name="disqualifiers"),
+        government_keywords=_str_list(dq, "government_keywords", section_name="disqualifiers"),
+        healthcare_provider_keywords=_str_list(dq, "healthcare_provider_keywords", section_name="disqualifiers"),
+        competitor_company_keywords=_str_list(dq, "competitor_company_keywords", section_name="disqualifiers"),
+        freelance_employer_keywords=_str_list(dq, "freelance_employer_keywords", section_name="disqualifiers"),
+        medical_regulatory_title_keywords=_str_list(dq, "medical_regulatory_title_keywords", section_name="disqualifiers"),
         qualifier_product_summary=_str(qp, "product_summary", section_name="qualifier_prompt"),
         qualifier_geography_requirement=_str(qp, "geography_requirement", section_name="qualifier_prompt"),
         qualifier_lanes=lanes,

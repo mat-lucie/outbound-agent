@@ -121,6 +121,26 @@ def _build_specs(list_id: str) -> list[tuple[str, str, dict]]:
                 "description": "Date industry_vertical was last classified. Lets us re-run the classifier on stale rows.",
             },
         ),
+        (
+            # PR-240 language guard: the HQ country code is the canonical source
+            # the fail-closed language guard (workflows.daily_check.
+            # expected_language_for_entry) re-derives the expected DM language
+            # from. Created idempotently — skipped if the workspace already
+            # carries a native `hq_country_code` attribute.
+            "object",
+            "companies",
+            {
+                "title": "HQ Country Code",
+                "api_slug": "hq_country_code",
+                "type": "text",
+                "is_required": False,
+                "is_unique": False,
+                "is_multiselect": False,
+                "default_value": None,
+                "config": {},
+                "description": "ISO country code of the company HQ. Seeds the DM language (PR-240 fail-closed language guard re-derives expected language from it).",
+            },
+        ),
     ]
 
 

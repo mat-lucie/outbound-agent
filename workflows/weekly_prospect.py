@@ -1945,6 +1945,19 @@ def _process_prospects(
             click.echo(f"      → [AGENT QUALIFY] {name} — staged (score={score})")
             summary.setdefault("borderline_staged", 0)
             summary["borderline_staged"] += 1
+            # PR-222 Rec D: attribute infra-driven stagings to their own bucket
+            # (a normal no-client borderline sets none of these flags). Keeps
+            # the cost-ceiling / transient-error / ledger-outage cases greppable
+            # apart from routine borderline staging.
+            if score_result.get("cost_exhausted_staged"):
+                summary.setdefault("cost_exhausted_staged", 0)
+                summary["cost_exhausted_staged"] += 1
+            if score_result.get("llm_error_staged"):
+                summary.setdefault("llm_error_staged", 0)
+                summary["llm_error_staged"] += 1
+            if score_result.get("ledger_unavailable"):
+                summary.setdefault("ledger_unavailable_staged", 0)
+                summary["ledger_unavailable_staged"] += 1
             if borderline_stage is not None:
                 borderline_stage.append({
                     "linkedin_url": prospect_data["linkedin_url"],
@@ -2178,6 +2191,15 @@ def run_weekly_prospecting(
         "net_new_created": 0,
         "restamped_existing": 0,
         "borderline_staged": 0,
+        # PR-222 Rec D: of the borderlines staged (fail-open), how many landed
+        # there because an INFRA signal — not a quality signal — blocked LLM
+        # vetting. Distinct buckets so the operator can tell a cost-ceiling
+        # breach from a transient Haiku error from a budget-ledger outage,
+        # instead of all three vanishing into borderline_staged. A borderline
+        # staged for lack of a client (the normal case) increments none of them.
+        "cost_exhausted_staged": 0,
+        "llm_error_staged": 0,
+        "ledger_unavailable_staged": 0,
         "reprospect_review": 0,
         # Per-verdict-path rejection counts, surfaced in the run summary so
         # sales-weekly / sales-learn can see which filter caught how many.

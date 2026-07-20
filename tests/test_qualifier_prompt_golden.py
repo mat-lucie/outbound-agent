@@ -74,6 +74,12 @@ _BASE_TOY_YAML = textwrap.dedent(
       consulting_firm_keywords: ["accenture"]
       consulting_title_keywords: ["consultant"]
       ops_override_keywords: ["plant manager"]
+      academic_company_keywords: ["university"]
+      government_keywords: ["municipality of"]
+      healthcare_provider_keywords: ["hospital"]
+      competitor_company_keywords: ["rival systems"]
+      freelance_employer_keywords: ["freelance"]
+      medical_regulatory_title_keywords: ["medical affairs"]
     """
 )
 

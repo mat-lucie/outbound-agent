@@ -33,6 +33,8 @@ from models.campaign import (
     get_message,
     personalize,
 )
+from models.email_campaign import detect_language_from_country
+from models.enums import Language
 from models.experiment import get_current_experiment_id
 from models.pipeline import (
     STAGE_RANK,
@@ -336,6 +338,105 @@ def _company_id_for_prospect(
     treated as permissively-unthrottled per §3.8).
     """
     return attio._person_to_company.get(record_id)
+
+
+def expected_language_for_entry(
+    attio: AttioClient,
+    attrs: dict,
+    cache: "RecordCache",
+) -> Language | None:
+    """Re-derive the RAW language an entry's canonical source implies, for the
+    fail-closed language guard (PR-240). This returns the raw expectation only;
+    the narrowed flag decision lives in `language_mismatch_verdict` (both guard
+    call sites route through it so they cannot drift).
+
+    Source of truth is the SAME signal that seeds the stored `language`
+    attribute (scripts/backfill_language.py): the linked company's HQ country,
+    mapped through `models.email_campaign.detect_language_from_country`. The
+    us_mode scoring lane short-circuits to English (its copy is English by
+    construction) with NO company fetch.
+
+    FAIL-OPEN CONTRACT — returns None (never raises) whenever the expected
+    language cannot be determined with confidence:
+      * scoring_lane != "us_mode" AND the entry has no linked company;
+      * the company has no HQ country code, or it maps to no language;
+      * any fetch error while resolving company / HQ country.
+
+    IMPORTANT — the returned value is NOT directly a flag trigger.
+    `detect_language_from_country` returns "en" for EVERY non-LATAM country
+    code AND for malformed codes — None only on an empty/absent code. So an
+    HQ-derived "en" is an unusable catch-all bucket, indistinguishable from a
+    genuine English expectation. That is why `language_mismatch_verdict` — not
+    this function — decides what actually flags, and never treats HQ-derived
+    "en" as an expectation.
+
+    `cache` MUST have been primed for this record (cache.get(record_id)) by the
+    caller so `attio._person_to_company` is populated — same precondition as
+    the per-company throttle lookup.
+    """
+    if (attrs.get("scoring_lane") or "") == "us_mode":
+        return Language.EN
+
+    record_id = str(attrs.get("record_id") or "")
+    if not record_id:
+        return None
+    company_id = _company_id_for_prospect(attio, record_id)
+    if not company_id:
+        return None
+    country_code = attio.company_hq_country_code(company_id)
+    # Fail open on anything but a concrete country-code string. The getter's
+    # contract is str | None; the isinstance is the belt to that suspenders.
+    if not isinstance(country_code, str) or not country_code:
+        return None
+    code = detect_language_from_country(country_code)
+    if not code:
+        return None
+    try:
+        return Language(code)
+    except ValueError:
+        # detect_language_from_country only ever yields es/pt/en, all valid
+        # enum members; guard defensively so an unexpected value fails open.
+        return None
+
+
+def language_mismatch_verdict(
+    stored: Language,
+    expected: Language | None,
+    scoring_lane: str | None,
+) -> bool:
+    """Decide whether a stored-vs-HQ language disagreement is a GENUINE
+    wrong-language incident (skip the send + open a `language_mismatch` row) —
+    as opposed to a benign disagreement the guard must NOT flag.
+
+    Both guard call sites (DM path, connection path) route their decision
+    through this ONE helper so their truth models cannot drift.
+
+    Narrowed to the two proven true-positive classes ONLY:
+
+      1. us_mode lane + stored != EN. The us_mode copy is English by
+         construction, so any non-EN stored value is a real lane violation.
+      2. HQ-derived expected is ES or PT, but stored is EN (an EN message
+         landing on a LATAM contact).
+
+    Everything else FAILS OPEN (returns False). The naive condition
+    (`expected is not None and expected != stored`) produced false positives on:
+
+      * European-parent LATAM subsidiaries — `detect_language_from_country`
+        returns "en" for EVERY non-LATAM code, so an HQ-derived "en" is an
+        unusable catch-all bucket. We therefore NEVER treat HQ-derived "en" as
+        an expectation.
+      * es↔pt person-level overrides — a Brazilian GM at a Mexico-HQ company
+        legitimately stored `pt`. Person-level language truth outranks company
+        HQ, so an es↔pt disagreement is never flagged.
+
+    `expected is None` (undeterminable source) is subsumed by "fails open": with
+    no concrete expectation we never flag, on EITHER branch.
+    """
+    if expected is None:
+        return False
+    if (scoring_lane or "") == "us_mode":
+        return stored != Language.EN
+    return expected in (Language.ES, Language.PT) and stored == Language.EN
 
 
 def _check_company_throttle_or_skip(
@@ -2000,7 +2101,7 @@ def _build_invite_send_data(
 
     Returns `(to_send_data, skip_counts)` where skip_counts has keys
     `company_throttled`, `same_company_run`, `missing_language`,
-    `missing_copy`, `missing_url`.
+    `language_mismatch`, `missing_copy`, `missing_url`.
     """
     to_send_data: list[dict] = []
     seen_company_ids: set[str] = set()
@@ -2008,6 +2109,7 @@ def _build_invite_send_data(
         "company_throttled": 0,
         "same_company_run": 0,
         "missing_language": 0,
+        "language_mismatch": 0,
         "missing_copy": 0,
         "missing_url": 0,
     }
@@ -2080,6 +2182,39 @@ def _build_invite_send_data(
                 err=True,
             )
             counts["missing_language"] += 1
+            continue
+        # PR-240 fail-closed language guard (connection-note render). Mirror the
+        # DM path: verify the resolved language against its seeding signal
+        # (company HQ country / us_mode lane); on a concrete disagreement, skip
+        # + open a `language_mismatch` row instead of shipping a wrong-language
+        # invite. expected is None (never flag) when ambiguous.
+        expected_lang = expected_language_for_entry(attio, attrs, cache)
+        if language_mismatch_verdict(
+            language, expected_lang, attrs.get("scoring_lane")
+        ):
+            # verdict True ⇒ expected_lang is a concrete Language (the helper
+            # fails open to False on None) — assert for the type-checker.
+            assert expected_lang is not None
+            escalate(
+                type="language_mismatch",
+                idempotency_key=f"language_mismatch|{attrs['record_id']}|connection_note",
+                payload={
+                    "record_id": str(attrs["record_id"]),
+                    "persona": persona.value,
+                    "stored_language": language.value,
+                    "expected_language": expected_lang.value,
+                    "scoring_lane": attrs.get("scoring_lane") or None,
+                    "dm_step": "connection_note",
+                },
+                attio=attio,
+            )
+            click.echo(
+                f"  ⚠ Skipping {name or attrs['record_id']}: stored language "
+                f"{language.value!r} ≠ expected {expected_lang.value!r} (HQ/lane) — "
+                f"language_mismatch queue row opened.",
+                err=True,
+            )
+            counts["language_mismatch"] += 1
             continue
         # PR-16 (B-PD-005): wrap get_message in MissingMessageError catch.
         try:
@@ -2318,6 +2453,9 @@ def run_connection_requests(
     )
     skipped_company_throttled = skip_counts["company_throttled"]
     skipped_missing_language = skip_counts["missing_language"]
+    # `.get` guards partial skip_counts from mocked _build_invite_send_data in
+    # tests; production always carries this key.
+    skipped_language_mismatch = skip_counts.get("language_mismatch", 0)
     skipped_missing_copy = skip_counts["missing_copy"]
     skipped_same_company_run = skip_counts["same_company_run"]
     skipped_missing_url = skip_counts["missing_url"]
@@ -2328,6 +2466,7 @@ def run_connection_requests(
         f"  Invite fill: {len(to_send_data)}/{target} slots — skipped "
         f"{skipped_company_throttled} throttled, {skipped_same_company_run} "
         f"same-company(run), {skipped_missing_language} missing-language, "
+        f"{skipped_language_mismatch} language-mismatch, "
         f"{skipped_missing_copy} missing-copy, {skipped_missing_url} missing-url."
     )
 
@@ -2954,6 +3093,12 @@ def run_connection_requests(
             f"Skipped {skipped_missing_language} prospect(s) with missing/invalid "
             f"language — see `missing_language` Operator Review Queue rows."
         )
+    if skipped_language_mismatch:
+        click.echo(
+            f"Skipped {skipped_language_mismatch} prospect(s) whose stored "
+            f"language disagreed with their HQ/lane-derived language — see "
+            f"`language_mismatch` Operator Review Queue rows."
+        )
     if skipped_company_throttled:
         throttle_row_note = (
             "queue rows suppressed (dry-run preview)"
@@ -2975,6 +3120,7 @@ def run_connection_requests(
         "attio_updated": updated,
         "rechecked": len(recheck_data),
         "skipped_missing_language": skipped_missing_language,
+        "skipped_language_mismatch": skipped_language_mismatch,
         "skipped_company_throttled": skipped_company_throttled,
         "skipped_missing_copy": skipped_missing_copy,
         "skipped_same_company_run": skipped_same_company_run,
@@ -3431,6 +3577,7 @@ def run_dm_sequencing(
         "dm3": 0,
         "skipped_corrupted_company": 0,
         "skipped_missing_language": 0,
+        "skipped_language_mismatch": 0,
         "skipped_company_throttled": queue_throttled_count,
         "skipped_missing_copy": 0,
         "dry_run": {"dm1": 0, "dm2": 0, "dm3": 0},
@@ -3494,6 +3641,42 @@ def run_dm_sequencing(
                     err=True,
                 )
                 results["skipped_missing_language"] += 1
+                continue
+            # PR-240 fail-closed language guard: the stored `language` resolved
+            # cleanly, but verify it against its seeding signal (company HQ
+            # country / us_mode lane) before rendering. On a GENUINE
+            # wrong-language incident, skip + open a `language_mismatch` row
+            # rather than risk a wrong-language DM. The narrowed verdict
+            # (language_mismatch_verdict) flags ONLY en-to-LATAM + us_mode lane
+            # violations; es↔pt and HQ-derived "en" never flag (see helper).
+            expected_lang = expected_language_for_entry(attio, attrs, cache)
+            if language_mismatch_verdict(
+                language, expected_lang, attrs.get("scoring_lane")
+            ):
+                # verdict True ⇒ expected_lang is a concrete Language (the
+                # helper fails open to False on None) — assert for the checker.
+                assert expected_lang is not None
+                escalate(
+                    type="language_mismatch",
+                    idempotency_key=f"language_mismatch|{attrs['record_id']}|{step.value}",
+                    payload={
+                        "record_id": str(attrs["record_id"]),
+                        "persona": persona.value,
+                        "stored_language": language.value,
+                        "expected_language": expected_lang.value,
+                        "scoring_lane": attrs.get("scoring_lane") or None,
+                        "dm_step": step.value,
+                    },
+                    attio=attio,
+                )
+                click.echo(
+                    f"  ⚠ Skipping {name or attrs['record_id']} ({step.value}): "
+                    f"stored language {language.value!r} ≠ expected "
+                    f"{expected_lang.value!r} (HQ/lane) — language_mismatch "
+                    f"queue row opened.",
+                    err=True,
+                )
+                results["skipped_language_mismatch"] += 1
                 continue
             # PR-16 (B-PD-005): MissingMessageError → missing_copy queue
             # row + skip. Pre-PR-16 silent Spanish fallback would have
@@ -3879,6 +4062,12 @@ def run_dm_sequencing(
             f"  Skipped {results['skipped_missing_language']} prospect(s) with "
             f"missing/invalid language — see `missing_language` Operator "
             f"Review Queue rows."
+        )
+    if results["skipped_language_mismatch"]:
+        click.echo(
+            f"  Skipped {results['skipped_language_mismatch']} prospect(s) whose "
+            f"stored language disagreed with their HQ/lane-derived language — "
+            f"see `language_mismatch` Operator Review Queue rows."
         )
     if helper_escalate_failures:
         # Wave-1.6.3: paging-level rollup of swallowed escalate() failures

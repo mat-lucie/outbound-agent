@@ -67,7 +67,9 @@ class TestVerdictPathsRegistry:
         assert DISQUALIFIER_VERDICT_PATHS.issubset(VERDICT_PATHS)
 
     def test_disqualifier_slugs_are_registered(self):
-        # Five PR-26 families + disqualifier_consulting.
+        # Five PR-26 families + disqualifier_consulting, plus the PR-222 Rec E
+        # company/employer families and the PR-238 medical/regulatory title
+        # family.
         expected = frozenset({
             "disqualifier_hr",
             "disqualifier_finance",
@@ -75,6 +77,14 @@ class TestVerdictPathsRegistry:
             "disqualifier_pe",
             "disqualifier_state_owned",
             "disqualifier_consulting",
+            # PR-222 Rec E
+            "disqualifier_academic",
+            "disqualifier_government",
+            "disqualifier_healthcare",
+            "disqualifier_competitor",
+            "disqualifier_freelance",
+            # PR-238
+            "disqualifier_medical_regulatory",
         })
         assert expected == DISQUALIFIER_VERDICT_PATHS
 

@@ -650,3 +650,90 @@ disqualifiers:
     - diretor de operações
     - diretor de operacoes
     - diretor de cadeia de suprimentos
+
+  # ── PR-222 Rec E — high-confidence COMPANY / EMPLOYER disqualifier families ──
+  # COMPANY-keyed hard rejects, NO OPS_OVERRIDE bypass. Competitor + freelance
+  # use word-boundary matching (short tokens); academic / government /
+  # healthcare use substring (legal-entity forms vary). Generic-but-functional
+  # values so the mechanism is exercisable under the synthetic Acme ICP.
+
+  # Academic institutions (COMPANY-keyed, substring).
+  academic_company_keywords:
+    - university
+    - universidad
+    - universidade
+    - college
+    - institute of technology
+    - instituto tecnológico
+    - instituto tecnologico
+    - faculty of
+    - facultad de
+
+  # Government / public-sector employers (COMPANY-keyed, substring).
+  government_keywords:
+    - government of
+    - ministry of
+    - ministerio de
+    - ministério de
+    - municipality of
+    - municipio de
+    - secretaría de
+    - secretaria de
+
+  # Healthcare providers — hospitals / clinics (COMPANY-keyed, substring).
+  healthcare_provider_keywords:
+    - hospital
+    - clínica
+    - clinica
+    - medical center
+    - sanatorio
+
+  # Direct competitors matched on COMPANY name (word-boundary). Distinct from
+  # the scoring-time competitor_keywords — a competitor employer is a hard
+  # reject, not a withheld bonus.
+  competitor_company_keywords:
+    - competitor inc
+    - rival systems
+    - aps vendor
+    - scheduling software co
+
+  # Freelance / no-employer placeholders (COMPANY-keyed, word-boundary).
+  freelance_employer_keywords:
+    - freelance
+    - freelancer
+    - self-employed
+    - self employed
+    - independent contractor
+    - open to work
+    - autónomo
+    - autonomo
+    - por cuenta propia
+
+  # ── PR-238 — medical / regulatory / clinical-affairs TITLE family ──
+  # TITLE-keyed (word-boundary). Clinical-affairs / regulatory functions in a
+  # pharma/biotech context are not the ops/production buyer. A genuine
+  # manufacturing-ops title is rescued by the OPS_OVERRIDE disjoint-span bypass.
+  medical_regulatory_title_keywords:
+    # English
+    - medical affairs
+    - regulatory affairs
+    - pharmacovigilance
+    - clinical affairs
+    - clinical operations
+    - clinical research
+    - market access
+    - drug safety
+    - medical science liaison
+    # Spanish
+    - asuntos médicos
+    - asuntos medicos
+    - asuntos regulatorios
+    - farmacovigilancia
+    - acceso al mercado
+    # Portuguese
+    - assuntos médicos
+    - assuntos medicos
+    - assuntos regulatórios
+    - assuntos regulatorios
+    - farmacovigilância
+    - acesso ao mercado
