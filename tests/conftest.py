@@ -142,11 +142,113 @@ def _isolate_recheck_cache(monkeypatch, tmp_path):
 
     Without this, tests that exercise daily_check would read/write the real
     ~/.outbound-agent/recheck_cache.json and contaminate one another (and the
-    user's live cache).
+    user's live cache). ``_LOCK_FILE`` is patched alongside (ported from
+    upstream PR-224): ``_exclusive_lock`` creates it on first use, so leaving
+    it unpatched drops a real ``~/.outbound-agent/recheck_cache.lock`` (a
+    fake-HOME sweep of the suite confirmed the leak).
     """
     from workflows import recheck_cache
 
     monkeypatch.setattr(recheck_cache, "CACHE_FILE", tmp_path / "recheck_cache.json")
+    monkeypatch.setattr(recheck_cache, "_LOCK_FILE", tmp_path / "recheck_cache.lock")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_safety_limits(monkeypatch, tmp_path):
+    """Redirect the daily-limits ledger file to a per-test temp path.
+
+    Ported from upstream PR-223. Without this, any test that reaches
+    ``get_remaining()`` / ``record_connections()`` — e.g. via
+    ``run_connection_requests`` — reads and writes the operator's real
+    ``~/.outbound-agent/daily_limits.json``. That made multi-row invite tests
+    fail only on days when production runs had already consumed the real cap
+    (the ledger trims the invite target, so a 2-row batch collapses to 1 row),
+    and risked test runs charging fake sends against the live ledger. Tests
+    that need specific ledger state (test_safety_limits.py's
+    ``_patch_limits_file``) stack their own setattr on top of this baseline.
+    """
+    from workflows import safety_limits
+
+    monkeypatch.setattr(safety_limits, "LIMITS_DIR", tmp_path)
+    monkeypatch.setattr(safety_limits, "LIMITS_FILE", tmp_path / "daily_limits.json")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_audit_dir(monkeypatch, tmp_path):
+    """Redirect the audit JSONL dir to a per-test temp path.
+
+    Ported from upstream PR-224. Without this, every test that enters a real
+    ``AuditLogger`` — directly or transitively via CLI / daily / weekly
+    integration paths — writes a ``run-<date>-<id>.jsonl`` of fixture events
+    into the operator's real ``~/.outbound-agent/audit/`` (a fake-HOME sweep of
+    the suite left such files behind), polluting the forensic log that
+    ``resume_from_audit`` / ``audit_stats`` read in production. Opt-in setattrs
+    (test_audit.py) stack on top; the deliberate real-HOME F-PR-3 bootstrap
+    read in test_migrations_idempotent.py uses its own ``Path.home()`` constant
+    (``F_PR_3_AUDIT_DIR``) and is read-only, so it is unaffected.
+    """
+    from workflows import audit
+
+    monkeypatch.setattr(audit, "AUDIT_DIR", tmp_path / "audit")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_run_lock_dir(monkeypatch, tmp_path):
+    """Redirect the default run-lock dir to a per-test temp path.
+
+    Ported from upstream PR-224. Without this, tests that reach
+    ``acquire_run_lock`` / ``run_with_lock`` without an explicit ``lock_dir``
+    — the email-daily and learn CLI paths do (a fake-HOME sweep left
+    ``locks/*.lock`` files behind) — create lock files in the operator's real
+    ``~/.outbound-agent/locks/`` and could collide with a genuinely running
+    production lock, failing the test or confusing stale-holder triage.
+    test_run_lock.py passes ``lock_dir`` explicitly and stacks fine.
+    """
+    from workflows import run_lock
+
+    monkeypatch.setattr(run_lock, "DEFAULT_LOCK_DIR", tmp_path / "locks")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_association_sent_state(monkeypatch, tmp_path):
+    """Redirect the association-outreach sent-state file to a per-test temp path.
+
+    Ported from upstream PR-224. Without this, tests that call
+    ``get_pending_association_emails`` / ``run_association_outreach`` unpatched
+    read the operator's real ``~/.outbound-agent/association_outreach_sent.json``
+    — pass/fail would depend on which contacts production has already marked
+    sent — and the divergence-repair path could write fixture entries back into
+    the live file. Per-test ``patch(...)`` calls stack on top of this baseline.
+    """
+    from workflows import association_outreach
+
+    monkeypatch.setattr(
+        association_outreach,
+        "SENT_STATE_FILE",
+        tmp_path / "association_outreach_sent.json",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_dispatch_dirs(monkeypatch, tmp_path):
+    """Redirect the LLM-dispatch inbox/outbox dirs to per-test temp paths.
+
+    Ported from upstream PR-224. ``request_llm_dispatch`` has no env gate of
+    its own — a single call without explicit ``inbox_dir``/``outbox_dir``
+    writes a request file into the operator's real
+    ``~/.outbound-agent/llm_dispatch/inbox/`` and could consume a stale
+    production outbox response as its result. No current test reaches the
+    defaults unpatched (the fake-HOME sweep showed no leak), so this is
+    defense-in-depth against the same class of bug the sibling fixtures fix.
+    test_llm_dispatch.py's explicit dirs and test_llm_dispatch_callers.py's
+    setattrs stack on top.
+    """
+    from workflows import llm_dispatch
+
+    dispatch_dir = tmp_path / "llm_dispatch"
+    monkeypatch.setattr(llm_dispatch, "DEFAULT_DISPATCH_DIR", dispatch_dir)
+    monkeypatch.setattr(llm_dispatch, "DEFAULT_INBOX_DIR", dispatch_dir / "inbox")
+    monkeypatch.setattr(llm_dispatch, "DEFAULT_OUTBOX_DIR", dispatch_dir / "outbox")
 
 
 @pytest.fixture(autouse=True)
