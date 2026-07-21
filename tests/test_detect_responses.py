@@ -907,3 +907,58 @@ class TestAutoRepairIntegration:
         assert call.kwargs["entry_attributes"]["stage"] == PipelineStage.RESPONDED.value
         assert result["drift_auto_repaired"] == 0
         assert result["detected"] == 1
+
+
+class TestSelfEchoGuard:
+    """`_looks_like_self_echo` distinguishes our own DM echoed back (the
+    PR-241 dup-DM1 case) from a genuine reply. Pure, module-level."""
+
+    def test_own_template_matches(self):
+        from models.campaign import load_messages
+        from workflows.detect_responses import _looks_like_self_echo
+        template = load_messages()["operations_leaders"]["dm1"]["es"]
+        echoed = template.replace("[Name]", "René").replace("[Company]", "Acme Foods")
+        assert _looks_like_self_echo(echoed) is not None
+
+    def test_genuine_short_reply_does_not_match(self):
+        from workflows.detect_responses import _looks_like_self_echo
+        assert _looks_like_self_echo("Gracias René, me interesa") is None
+
+    def test_genuine_longer_reply_does_not_match(self):
+        from workflows.detect_responses import _looks_like_self_echo
+        assert _looks_like_self_echo(
+            "Hola, gracias por escribir. Me interesa saber más, "
+            "cuándo podemos agendar una llamada?"
+        ) is None
+
+    def test_empty_body_returns_none(self):
+        from workflows.detect_responses import _looks_like_self_echo
+        assert _looks_like_self_echo("") is None
+
+    def test_template_load_failure_fails_open(self, monkeypatch, capsys):
+        # A missing/corrupt messages.json must NOT crash all of
+        # detect_responses. The guard hoists + caches the template token sets;
+        # on load failure it warns loudly ONCE and fails OPEN (returns None) so
+        # manual-reply flips proceed without the self-echo check this run
+        # rather than the whole run crashing.
+        import workflows.detect_responses as dr
+
+        def _boom():
+            raise FileNotFoundError("messages.json missing")
+
+        dr._reset_self_echo_template_cache()
+        monkeypatch.setattr(dr, "load_messages", _boom, raising=False)
+        monkeypatch.setattr("models.campaign.load_messages", _boom)
+        try:
+            # A body that WOULD match a template if templates loaded — but the
+            # load fails, so the guard fails open and returns None.
+            assert dr._looks_like_self_echo("hola rene me interesa mucho") is None
+            out = capsys.readouterr()
+            combined = out.out + out.err
+            assert "self-echo guard offline" in combined
+            # Second call must NOT re-warn (warn-once per run).
+            assert dr._looks_like_self_echo("otra vez") is None
+            out2 = capsys.readouterr()
+            assert "self-echo guard offline" not in (out2.out + out2.err)
+        finally:
+            dr._reset_self_echo_template_cache()

@@ -180,6 +180,50 @@ def _check_experiment_id_immutability(
 
 STRICT_PRE_INVITE_DEGREE_CHECK_ENV = "STRICT_PRE_INVITE_DEGREE_CHECK"
 
+# ---------------------------------------------------------------------------
+# Pattern-A recency quarantine (PR-241 René RCA)
+# ---------------------------------------------------------------------------
+
+# A 1st-degree row that only became a prospect within this window is a
+# suspected URL-variant duplicate (the weekly ingest re-created an existing
+# person under a new LinkedIn vanity slug). Flipping it Pattern-A → ACCEPTED
+# would re-start a cadence on someone who already completed one. Skip the flip
+# and escalate instead. Old records still flip (legitimate silent-acceptance
+# Pattern-A) — a missing/unparseable timestamp is NEVER quarantined.
+PATTERN_A_QUARANTINE_DAYS = 14
+
+
+def _prospect_committed_within_days(
+    committed_at: str | None, *, today: date, days: int,
+) -> bool:
+    """True iff `committed_at` parses to a date within the last `days`.
+
+    Missing or unparseable → False (NOT quarantined): old records must keep
+    the legitimate Pattern-A flip. Accepts ISO date or datetime strings.
+    """
+    if not committed_at:
+        return False
+    raw = str(committed_at).strip()
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        committed_date = parsed.date()
+    except ValueError:
+        try:
+            committed_date = date.fromisoformat(raw[:10])
+        except ValueError:
+            # Present-but-unparseable is NOT silently equivalent to absent.
+            # Still return False (don't quarantine on a value we can't trust),
+            # but name the raw value so a malformed timestamp is observable
+            # rather than indistinguishable from a missing one.
+            click.echo(
+                f"  ⚠ prospect_committed_at present but unparseable "
+                f"({committed_at!r}) — treating as NOT within the Pattern-A "
+                f"quarantine window (no quarantine); value may need repair.",
+                err=True,
+            )
+            return False
+    return (today - committed_date).days < days
+
 
 class ConfigError(RuntimeError):
     """Pre-invite degree check is missing a required configuration value
@@ -844,6 +888,10 @@ def _pre_invite_degree_check(
     still_to_invite: list[dict] = []
     already_connected: list[dict] = []
     failed_to_flip: list[dict] = []
+    # PR-241 René RCA: 1st-degree rows quarantined out of the Pattern-A flip
+    # because they only became prospects within PATTERN_A_QUARANTINE_DAYS
+    # (suspected URL-variant duplicates). Surfaced in the summary.
+    pattern_a_quarantined: list[dict] = []
     # Wave-1.6.2 FIX-B (adversarial EXT-SB-3 IMPORTANT): tally failed
     # `experiment_id_immutability_violation` escalate() calls so the
     # end-of-function summary surfaces them. Mirrors FIX-A at
@@ -866,6 +914,54 @@ def _pre_invite_degree_check(
         norm = _normalize_linkedin_url(row["linkedInUrl"])
         degree = degree_lookup.get(norm, "")
         if degree == "1st":
+            # Pattern-A recency quarantine (PR-241 René RCA). A 1st-degree row
+            # that only became a prospect within PATTERN_A_QUARANTINE_DAYS is a
+            # suspected URL-variant duplicate — flipping it to ACCEPTED would
+            # re-start a cadence on someone who already completed one. Skip
+            # today (no invite, stage unchanged) and escalate for triage. A
+            # missing/unparseable timestamp is NOT quarantined: old records
+            # must keep the legitimate silent-acceptance Pattern-A flip.
+            if _prospect_committed_within_days(
+                row.get("prospect_committed_at"),
+                today=today_op,
+                days=PATTERN_A_QUARANTINE_DAYS,
+            ):
+                pattern_a_quarantined.append(row)
+                click.echo(
+                    f"  ⚠ Pattern-A quarantine: {row['linkedInUrl']} "
+                    f"(record_id={row.get('record_id')!r}) became a prospect "
+                    f"within {PATTERN_A_QUARANTINE_DAYS}d and is already "
+                    f"1st-degree — suspected URL-variant duplicate. NOT "
+                    f"flipping to ACCEPTED; escalating for operator review.",
+                    err=True,
+                )
+                if row.get("record_id"):
+                    try:
+                        escalate(
+                            type="pattern_a_suspected_duplicate",
+                            idempotency_key=str(row["record_id"]),
+                            payload={
+                                "record_id": str(row["record_id"]),
+                                "entry_id": str(row.get("entry_id") or ""),
+                                "linkedin_url": row["linkedInUrl"],
+                                "name": str(row.get("name") or ""),
+                                "company": str(row.get("company") or ""),
+                                "prospect_committed_at": str(
+                                    row.get("prospect_committed_at") or ""
+                                ),
+                                "degree": "1st",
+                            },
+                            attio=attio,
+                        )
+                    except Exception as esc_exc:  # noqa: BLE001 — never block the batch
+                        click.echo(
+                            f"  ⚠ escalate(pattern_a_suspected_duplicate) failed "
+                            f"for record_id={row.get('record_id')!r} "
+                            f"[{type(esc_exc).__name__}]: {esc_exc}. Row still "
+                            f"held out of invite + flip; continuing batch.",
+                            err=True,
+                        )
+                continue
             # PR-21 (Lesson 6): use direct key access — KeyError propagates
             # as a caller bug. `run_connection_requests` MUST populate both
             # keys on every `to_send_data` row. See module docstring contract.
@@ -1361,7 +1457,9 @@ def _pre_invite_degree_check(
         click.echo(
             f"  Pattern-A: flipped {pending_flipped_count} pending"
             f"→CONNECTION_SENT, {len(already_connected)} already-1st-degree"
-            f"→ACCEPTED, {len(failed_to_flip)} failed."
+            f"→ACCEPTED, {len(failed_to_flip)} failed, "
+            f"{len(pattern_a_quarantined)} quarantined (suspected "
+            f"URL-variant duplicate, escalated)."
         )
         if audit_logger is not None:
             # Best-effort: this event fires AFTER every Pattern-A flip is

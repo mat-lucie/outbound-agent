@@ -294,7 +294,7 @@ class TestInnovationDisqualifier:
         # dropped to avoid mislabeling LATAM commercial-liaison titles
         # ("Gerente de Vinculación Comercial").
         assert _match_disqualifier(
-            "gerente de vinculación comercial", "sigma alimentos"
+            "gerente de vinculación comercial", "acme foods"
         ) is None
 
 

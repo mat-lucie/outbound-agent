@@ -190,7 +190,7 @@ def _make_commit_attio_mock():
 _PROSPECT_DATA = {
     "name": "Juan García",
     "title": "Gerente de Planta",
-    "company": "Sigma Alimentos",
+    "company": "Acme Foods",
     "location": "Monterrey, Mexico",
     "linkedin_url": "https://www.linkedin.com/in/juan-garcia",
     "employee_count": "500",
@@ -199,7 +199,7 @@ _PROSPECT_DATA = {
 _RAW_CSV_ROW = {
     "fullName": "Juan García",
     "title": "Gerente de Planta",
-    "companyName": "Sigma Alimentos",
+    "companyName": "Acme Foods",
     "defaultProfileUrl": "https://www.linkedin.com/in/juan-garcia",
 }
 
@@ -1222,3 +1222,198 @@ class TestCanonicalUrlDedupPrecheck:
         attio.search_person_by_linkedin.assert_called_once()
         assert summary["added"] == 1
         assert summary["duplicates"] == 0
+
+
+class TestNormalizePersonName:
+    """The name normalizer feeding the name+company duplicate gate (PR-241
+    René RCA). Pure, module-level, testable."""
+
+    def test_accent_fold_and_lowercase(self):
+        from workflows.weekly_prospect import _normalize_person_name
+        assert _normalize_person_name("René de la Cruz") == "rene de la cruz"
+
+    def test_strip_suffix_after_space_anchored_separators(self):
+        from workflows.weekly_prospect import _normalize_person_name
+        assert _normalize_person_name("René de la Cruz - CEO") == "rene de la cruz"
+        assert _normalize_person_name("René de la Cruz | Acme Foods") == "rene de la cruz"
+
+    def test_parenthetical_nickname_not_truncated(self):
+        from workflows.weekly_prospect import _normalize_person_name
+        assert (
+            _normalize_person_name("René (Beto) de la Cruz")
+            == "rene (beto) de la cruz"
+        )
+
+    def test_hyphen_inside_name_not_truncated(self):
+        from workflows.weekly_prospect import _normalize_person_name
+        assert _normalize_person_name("Ana Núñez-Vidal") == "ana nunez-vidal"
+
+    def test_collapse_whitespace(self):
+        from workflows.weekly_prospect import _normalize_person_name
+        assert _normalize_person_name("  RENÉ   DE  LA  CRUZ ") == "rene de la cruz"
+
+    def test_empty_is_empty(self):
+        from workflows.weekly_prospect import _normalize_person_name
+        assert _normalize_person_name("") == ""
+
+    def test_idempotent(self):
+        from workflows.weekly_prospect import _normalize_person_name
+        once = _normalize_person_name("José Müller - VP")
+        assert _normalize_person_name(once) == once
+
+
+class TestReprospectReviewCsv:
+    """The reprospect_review CSV must accept BOTH layer-3 rows (no `reason`)
+    and the new name+company-gate rows (with `reason`) without an
+    extrasaction='raise' ValueError."""
+
+    def test_mixed_rows_write_without_crash(self, tmp_path):
+        import csv
+
+        from workflows.weekly_prospect import _write_reprospect_review_csv
+        rows = [
+            {  # layer-3 shape: no "reason" key at all
+                "name": "Ana Torres",
+                "company": "Acme Foods",
+                "title": "Plant Manager",
+                "linkedin_url": "https://linkedin.com/in/ana-torres",
+                "record_id": "rec-A",
+                "score": 61,
+                "persona": "operations_leaders",
+                "language": "es",
+            },
+            {  # name+company-gate shape: carries "reason"
+                "name": "René de la Cruz",
+                "company": "Acme Metals",
+                "title": "Director",
+                "linkedin_url": "https://linkedin.com/in/rene-2",
+                "record_id": "rec-B",
+                "score": 72,
+                "persona": "operations_leaders",
+                "language": "es",
+                "reason": "name+company match — suspected URL-variant duplicate of rec-B0",
+            },
+        ]
+        path = tmp_path / "reprospect_review.csv"
+        _write_reprospect_review_csv(path, rows)
+        with path.open(newline="") as f:
+            out = list(csv.DictReader(f))
+        assert "reason" in out[0]
+        assert out[0]["reason"] == ""  # layer-3 row filled with restval
+        assert out[1]["reason"].startswith("name+company match")
+
+
+def _mk_record(rid):
+    from clients.crm.base import Record
+    return Record(record_id=rid, object="people", attributes={}, raw={})
+
+
+def _mk_info(name, company, url):
+    from clients.crm.base import RecordInfo
+    return RecordInfo(
+        name=name, company=company, linkedin_url=url, industry=None, title="",
+    )
+
+
+class TestBuildNameIndex:
+    """`_build_name_index` builds the run-start normalized-name → records map
+    from the pipeline's person records. Accent- and suffix-bridging is by
+    construction — the normalizer is applied at build time, so a live accent-
+    SENSITIVE search is never needed. The fork resolves company EAGERLY via
+    `crm.extract_person_info` (no lazy per-hit fetch)."""
+
+    def test_index_keys_are_normalized(self):
+        from workflows.weekly_prospect import _build_name_index
+        crm = MagicMock()
+        rec = _mk_record("rec-1")
+        crm.bulk_fetch_persons.return_value = {"rec-1": rec}
+        crm.extract_person_info.return_value = _mk_info(
+            "Sam Rivera", "Sample Corp", "https://www.linkedin.com/in/sam-rivera",
+        )
+        entries = [MagicMock(record_id="rec-1")]
+        index = _build_name_index(crm, entries)
+        assert "sam rivera" in index
+        rid, canon, company = index["sam rivera"][0]
+        assert rid == "rec-1"
+        assert canon == "https://linkedin.com/in/sam-rivera"
+        assert company == "Sample Corp"  # resolved eagerly in the fork
+
+    def test_multiple_records_same_name(self):
+        from workflows.weekly_prospect import _build_name_index
+        crm = MagicMock()
+        recs = {"rec-1": _mk_record("rec-1"), "rec-2": _mk_record("rec-2")}
+        crm.bulk_fetch_persons.return_value = recs
+        infos = {
+            "rec-1": _mk_info("Juan Pérez", "Acme", "https://www.linkedin.com/in/juan-perez-1"),
+            "rec-2": _mk_info("Juan Perez", "Acme", "https://www.linkedin.com/in/juan-perez-2"),
+        }
+        crm.extract_person_info.side_effect = lambda rec: infos[rec.record_id]
+        entries = [MagicMock(record_id="rec-1"), MagicMock(record_id="rec-2")]
+        index = _build_name_index(crm, entries)
+        # Accented and ASCII spellings collapse to the same key.
+        assert len(index["juan perez"]) == 2
+
+    def test_extract_failure_skips_record(self):
+        # A record that raises in extract_person_info is left out (degrade open).
+        from workflows.weekly_prospect import _build_name_index
+        crm = MagicMock()
+        crm.bulk_fetch_persons.return_value = {"rec-1": _mk_record("rec-1")}
+        crm.extract_person_info.side_effect = RuntimeError("malformed record")
+        index = _build_name_index(crm, [MagicMock(record_id="rec-1")])
+        assert index == {}
+
+
+class TestFindNameCompanyDuplicateLocal:
+    """`_find_name_company_duplicate` is a local O(1) lookup against the
+    prebuilt index — NO live search. It catches the exact accent+suffix
+    variants the old accent-SENSITIVE search missed."""
+
+    def _index(self):
+        # Stored: accented name "Sam Rivera" at rec-1, company "Sample Corp Río".
+        return {
+            "sam rivera": [
+                ("rec-1", "https://linkedin.com/in/sam-rivera", "Sample Corp Río"),
+            ],
+        }
+
+    def test_ascii_candidate_matches_accented_stored_same_company(self):
+        from workflows.weekly_prospect import _find_name_company_duplicate
+        hit = _find_name_company_duplicate(
+            self._index(),
+            "Sam Rivera - Managing Director", "Sample Corp Rio",
+            candidate_canonical_url="https://linkedin.com/in/sam-rivera-2",
+        )
+        assert hit == "rec-1"
+
+    def test_same_canonical_url_not_flagged(self):
+        from workflows.weekly_prospect import _find_name_company_duplicate
+        hit = _find_name_company_duplicate(
+            self._index(), "Sam Rivera", "Sample Corp Río",
+            candidate_canonical_url="https://linkedin.com/in/sam-rivera",
+        )
+        assert hit is None
+
+    def test_different_company_not_flagged(self):
+        from workflows.weekly_prospect import _find_name_company_duplicate
+        hit = _find_name_company_duplicate(
+            self._index(), "Sam Rivera", "Acme Foods",
+            candidate_canonical_url="https://linkedin.com/in/sam-rivera-2",
+        )
+        assert hit is None
+
+    def test_no_name_hit_returns_none(self):
+        from workflows.weekly_prospect import _find_name_company_duplicate
+        hit = _find_name_company_duplicate(
+            self._index(), "Someone Else", "Sample Corp",
+            candidate_canonical_url="https://linkedin.com/in/someone-else",
+        )
+        assert hit is None
+
+    def test_no_candidate_company_returns_none(self):
+        # Without a company we cannot distinguish a real dup from a namesake.
+        from workflows.weekly_prospect import _find_name_company_duplicate
+        hit = _find_name_company_duplicate(
+            self._index(), "Sam Rivera", "",
+            candidate_canonical_url="https://linkedin.com/in/sam-rivera-2",
+        )
+        assert hit is None

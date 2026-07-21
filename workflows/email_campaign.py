@@ -242,7 +242,8 @@ def run_email_daily(
     for stage in ACTIVE_STAGES:
         results = attio.search_people(
             filter_={"email_campaign_stage": stage.value},
-            limit=500,
+            limit=50_000,
+            fail_if_truncated=True,
         )
         for record in results:
             values = record.get("values", {})

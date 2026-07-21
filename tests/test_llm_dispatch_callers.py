@@ -241,8 +241,8 @@ def test_industry_classifier_via_dispatch(dispatch_env):
     _drive_outbox_once(inbox, outbox, raw_text="Food & Beverage")
 
     result = classify_industry(
-        "Sigma Alimentos",
-        domain="sigma-alimentos.com",
+        "Acme Foods",
+        domain="acme-foods.com",
         use_llm_dispatch=True,
     )
     # Depends on INDUSTRY_LABELS containing "Food & Beverage" (it does

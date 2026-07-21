@@ -82,8 +82,13 @@ class TestSlugInventory:
         #     reconcile alarm — a CONNECTION_SENT row the SN scrape reports as
         #     invite-resolved (hasPendingInvitation=false) but still not
         #     1st-degree; the operator cross-references against LinkedIn).
-        # New count: 89 + 1 + 2 + 1 = 93.
-        assert len(ESCALATION_TYPES) == 93
+        # feat/port-reliability-primitives (port of upstream #241) added 2 more:
+        #   - pattern_a_suspected_duplicate (pre_invite_check quarantines a
+        #     1st-degree row committed <14d — suspected URL-variant duplicate).
+        #   - manual_reply_suppressed_self_echo (detect_responses suppresses a
+        #     manual-reply flip whose last message is our own DM echoed back).
+        # New count: 89 + 1 + 2 + 1 + 2 = 95.
+        assert len(ESCALATION_TYPES) == 95
 
     def test_no_duplicate_slugs(self):
         assert len(ESCALATION_TYPES) == len(ESCALATION_TYPES_SET)
@@ -144,6 +149,43 @@ class TestPayloadValidation:
                 "error_class": "AttioPermanentError",
                 "error_msg": "...",
                 "retry_count": 5,
+            },
+        )
+
+    def test_pattern_a_suspected_duplicate_schema(self):
+        # Registered → missing fields raise; complete payload validates.
+        with pytest.raises(EscalationSchemaError, match="missing required fields"):
+            escalation._validate_payload_against_typeddict(
+                "pattern_a_suspected_duplicate", {"record_id": "rec"}
+            )
+        escalation._validate_payload_against_typeddict(
+            "pattern_a_suspected_duplicate",
+            {
+                "record_id": "rec",
+                "entry_id": "ent",
+                "linkedin_url": "https://linkedin.com/in/x",
+                "name": "René",
+                "company": "Acme Foods",
+                "prospect_committed_at": "2026-06-28",
+                "degree": "1st",
+            },
+        )
+
+    def test_manual_reply_suppressed_self_echo_schema(self):
+        with pytest.raises(EscalationSchemaError, match="missing required fields"):
+            escalation._validate_payload_against_typeddict(
+                "manual_reply_suppressed_self_echo", {"record_id": "rec"}
+            )
+        escalation._validate_payload_against_typeddict(
+            "manual_reply_suppressed_self_echo",
+            {
+                "record_id": "rec",
+                "entry_id": "ent",
+                "name": "René",
+                "stage": "DM1 Sent",
+                "total_messages": 3,
+                "expected": 1,
+                "matched_template_id": "operations_leaders/dm1/es",
             },
         )
 
@@ -446,3 +488,195 @@ class TestMissingAttioCredentials:
                     "auto_mergeable": False,
                 },
             )
+
+
+def _transient_500():
+    import httpx
+    request = httpx.Request("POST", "https://api.attio.com/v2/x")
+    response = httpx.Response(500, request=request)
+    return httpx.HTTPStatusError("500", request=request, response=response)
+
+
+class TestEscalateTransient500Retry:
+    """Escalation queue-row writes survive transient Attio 5xx (PR-259).
+
+    Regression for the daily-run crashes: a single transient 500 on the
+    operator_review_queue query or create killed the run mid-Part-A before any
+    invites were sent, forcing a full re-run (~50 profile-scrape visits). Both
+    `_find_existing_row` and `_create_row` now flow through
+    `clients.attio.request_with_retry`.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self, monkeypatch):
+        import clients.attio as attio_mod
+        monkeypatch.setattr(attio_mod.time, "sleep", lambda _s: None)
+
+    def test_company_throttled_survives_transient_500_on_create(self, mock_attio):
+        """The crash class, replayed: query ok, create 500s twice."""
+        create_failures = [_transient_500(), _transient_500()]
+
+        def _request(method, path, json=None, **kwargs):
+            if path.endswith("/records/query"):
+                return {"data": []}
+            if create_failures:
+                raise create_failures.pop(0)
+            return {"data": {"values": json["data"]["values"],
+                             "id": {"record_id": "rec_created"}}}
+
+        mock_attio._request.side_effect = _request
+        result = escalation.escalate(
+            type="company_throttled",
+            idempotency_key="company-throttled|rec_p|2026-07-20",
+            payload={
+                "record_id": "rec_p",
+                "company_id": "rec_c",
+                "throttle_date": "2026-07-20",
+                "window_days": 30,
+            },
+            attio=mock_attio,
+        )
+        assert result["id"]["record_id"] == "rec_created"
+
+    def test_survives_transient_500_on_idempotency_query(self, mock_attio):
+        query_failures = [_transient_500()]
+        existing_row = {"id": {"record_id": "rec_existing"}}
+
+        def _request(method, path, json=None, **kwargs):
+            if path.endswith("/records/query"):
+                if query_failures:
+                    raise query_failures.pop(0)
+                return {"data": [existing_row]}
+            raise AssertionError(f"unexpected call: {method} {path}")
+
+        mock_attio._request.side_effect = _request
+        result = escalation.escalate(
+            type="dedup_review",
+            idempotency_key="dedup-retry-1",
+            payload={
+                "canonical_linkedin_url": "url",
+                "record_ids": ["a", "b"],
+                "conflict_shape": "x",
+                "auto_mergeable": False,
+            },
+            attio=mock_attio,
+        )
+        assert result is existing_row
+
+    def test_persistent_500_still_raises_after_bounded_attempts(self, mock_attio):
+        import httpx
+
+        calls = {"n": 0}
+
+        def _request(method, path, json=None, **kwargs):
+            calls["n"] += 1
+            raise _transient_500()
+
+        mock_attio._request.side_effect = _request
+        with pytest.raises(httpx.HTTPStatusError):
+            escalation.escalate(
+                type="dedup_review",
+                idempotency_key="dedup-retry-2",
+                payload={
+                    "canonical_linkedin_url": "url",
+                    "record_ids": ["a", "b"],
+                    "conflict_shape": "x",
+                    "auto_mergeable": False,
+                },
+                attio=mock_attio,
+            )
+        assert calls["n"] == 5  # bounded — not infinite
+
+    def test_400_on_create_raises_immediately(self, mock_attio):
+        import httpx
+
+        calls = {"n": 0}
+
+        def _request(method, path, json=None, **kwargs):
+            if path.endswith("/records/query"):
+                return {"data": []}
+            calls["n"] += 1
+            request = httpx.Request("POST", "https://api.attio.com/v2/x")
+            response = httpx.Response(400, request=request)
+            raise httpx.HTTPStatusError("400", request=request, response=response)
+
+        mock_attio._request.side_effect = _request
+        with pytest.raises(httpx.HTTPStatusError):
+            escalation.escalate(
+                type="dedup_review",
+                idempotency_key="dedup-retry-3",
+                payload={
+                    "canonical_linkedin_url": "url",
+                    "record_ids": ["a", "b"],
+                    "conflict_shape": "x",
+                    "auto_mergeable": False,
+                },
+                attio=mock_attio,
+            )
+        assert calls["n"] == 1
+
+    def test_lost_response_create_that_landed_returns_row_without_duplicate(
+        self, mock_attio
+    ):
+        """The ambiguous-500 case: Attio commits the row, the response is lost.
+        The retry must find the landed row via uniqueness_key and NOT re-POST
+        (uniqueness_key has no server-side unique constraint, so a blind
+        re-POST would duplicate the queue row)."""
+        landed_row = {"id": {"record_id": "rec_landed"}}
+        state = {"created": 0, "queries": 0}
+
+        def _request(method, path, json=None, **kwargs):
+            if path.endswith("/records/query"):
+                state["queries"] += 1
+                # First query: escalate()'s idempotency check — row absent.
+                # Later queries: the post-failure probe — row landed.
+                return {"data": []} if state["queries"] == 1 else {"data": [landed_row]}
+            state["created"] += 1
+            raise _transient_500()  # response lost; write committed server-side
+
+        mock_attio._request.side_effect = _request
+        result = escalation.escalate(
+            type="dedup_review",
+            idempotency_key="dedup-landed-1",
+            payload={
+                "canonical_linkedin_url": "url",
+                "record_ids": ["a", "b"],
+                "conflict_shape": "x",
+                "auto_mergeable": False,
+            },
+            attio=mock_attio,
+        )
+        assert result is landed_row
+        assert state["created"] == 1  # never re-POSTed
+
+    def test_probe_failure_does_not_block_create_retry(self, mock_attio):
+        """Under a rough patch the probe itself may 500 — that must not crash
+        escalate(); the create retry proceeds."""
+        state = {"queries": 0, "creates": 0}
+
+        def _request(method, path, json=None, **kwargs):
+            if path.endswith("/records/query"):
+                state["queries"] += 1
+                if state["queries"] == 1:
+                    return {"data": []}  # idempotency check: absent
+                raise _transient_500()  # probe fails
+            state["creates"] += 1
+            if state["creates"] == 1:
+                raise _transient_500()
+            return {"data": {"values": json["data"]["values"],
+                             "id": {"record_id": "rec_created"}}}
+
+        mock_attio._request.side_effect = _request
+        result = escalation.escalate(
+            type="dedup_review",
+            idempotency_key="dedup-probe-fail-1",
+            payload={
+                "canonical_linkedin_url": "url",
+                "record_ids": ["a", "b"],
+                "conflict_shape": "x",
+                "auto_mergeable": False,
+            },
+            attio=mock_attio,
+        )
+        assert result["id"]["record_id"] == "rec_created"
+        assert state["creates"] == 2

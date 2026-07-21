@@ -547,8 +547,14 @@ def open_daily_run(
     # malformed counter on a prior row fails closed (MalformedDailyRunRow)
     # BEFORE any row is created — same rule as attach_daily_run.
     prior_rows = query_todays_rows(crm, date_str, actual_machine)
+    # Baseline is computed from ALL prior rows and is INDEPENDENT of archiving —
+    # _archive_stray_rows below only marks + releases lock keys, never touches
+    # counters, so the caps math here stays exact (LOAD-BEARING INVARIANT).
     baseline_counters = _merged_counters(prior_rows)
     if prior_rows:
+        # No active row exists yet (the create is below), so pass "" — none of
+        # prior_rows can be the active row.
+        marked = _archive_stray_rows(crm, prior_rows, active_record_id="")
         print(
             f"WARN: {len(prior_rows)} prior daily_run row(s) already exist "
             f"for {date_str!r}/{actual_machine!r}: "
@@ -557,7 +563,9 @@ def open_daily_run(
             f"(connections={baseline_counters['connections']}, "
             f"messages={baseline_counters['messages']}, "
             f"visits={baseline_counters['visits']}) so the daily caps "
-            f"cannot reset. Investigate and archive the stray rows.",
+            f"cannot reset. "
+            f"{marked} terminal stray row(s) auto-marked [superseded] "
+            f"(counters still counted; running/completed rows untouched).",
             file=sys.stderr,
         )
 
@@ -736,6 +744,93 @@ def _takeover_stale_row(
             )[:4096],
         },
     )
+
+
+_SUPERSEDED_MARKER = "[superseded]"
+
+
+def _archive_stray_rows(
+    crm: CRMProvider,
+    prior_rows: list[Record],
+    active_record_id: str,
+) -> int:
+    """Auto-mark terminal stray daily_run rows so they stop nagging on every run.
+
+    A crash mid-run (e.g. the PR-239 transient Sheets 503 that killed a
+    `daily` run mid-Phase-0) leaves a terminal ``failed``/``aborted`` row
+    behind. On every subsequent same-day run its presence prints the prior-row
+    WARN. This marks each such stray with a ``[superseded]`` note in
+    ``failure_details`` and releases its 2-part running-lock (if still held) via
+    ``_released_uniqueness_key`` — the same lock-release mechanism
+    ``_takeover_stale_row`` uses — so it no longer needs manual archiving.
+
+    LOAD-BEARING INVARIANT: archived strays MUST still feed ``_merged_counters``.
+    This function ONLY appends a marker + re-keys the uniqueness_key. It does NOT
+    zero any counter and does NOT remove rows from ``prior_rows`` — the caller's
+    baseline math (``_merged_counters(prior_rows)``) is computed independently
+    and is unchanged by archiving. The daily caps must never reset.
+
+    Scope guard: only rows with status in {failed, aborted} that are NOT the
+    active row are touched. running/completed rows and the active row are never
+    modified. Idempotent: a row whose ``failure_details`` already contains
+    ``[superseded]`` is skipped (no second marker, no second PATCH), so repeated
+    runs issue no redundant writes.
+
+    Returns the number of rows marked (for the softened WARN).
+    """
+    marked = 0
+    for row in prior_rows:
+        record_id = row.record_id
+        if not record_id or record_id == active_record_id:
+            continue
+        status = _row_status(row)
+        if status not in ("failed", "aborted"):
+            continue
+        attrs = row.attributes
+        existing_details = _attr_text(attrs, "failure_details")
+        if _SUPERSEDED_MARKER in existing_details:
+            continue  # already archived — idempotent skip
+
+        run_date = _attr_text(attrs, "run_date")
+        machine_id = _attr_text(attrs, "machine_id")
+        # The marker note must survive the 4096-char clamp: failure_details
+        # is often already AT the clamp (a full traceback from _close), so
+        # appending then slicing would cut the marker off and the idempotency
+        # guard above would never trip — re-PATCHing forever. Truncate the
+        # EXISTING text to leave headroom instead.
+        marker_note = (
+            f"\n{_SUPERSEDED_MARKER} auto-marked by a later "
+            f"run on {datetime.now(UTC).isoformat()}; superseded stray, "
+            f"counters still count toward today's caps."
+        )
+        patch_values: dict[str, str] = {
+            "failure_details": (
+                existing_details[: 4096 - len(marker_note)] + marker_note
+            ).strip()
+        }
+        # Only re-key if the row still holds the 2-part running-lock. A row
+        # closed via _close already carries the released 4-part key; re-keying
+        # it again would be a no-op churn (and the marker check above already
+        # makes the whole op idempotent).
+        released_key = _released_uniqueness_key(status, run_date, machine_id, record_id)
+        if _attr_text(attrs, "uniqueness_key") != released_key:
+            patch_values["uniqueness_key"] = released_key
+
+        # Best-effort: the janitor must never block the run it is cleaning
+        # up for. A failed mark just means the WARN nags again next run —
+        # harmless (the counters invariant holds regardless of marking).
+        try:
+            crm.update_object_record("daily_run", record_id, patch_values)
+        except Exception as exc:  # noqa: BLE001 — cleanup is non-critical
+            print(
+                f"  WARN: could not mark stray daily_run row {record_id} as "
+                f"superseded ({type(exc).__name__}: {exc}); will retry on the "
+                f"next run.",
+                file=sys.stderr,
+            )
+            continue
+        marked += 1
+    return marked
 
 
 def _query_existing_row(crm: CRMProvider, key: str) -> dict | None:
@@ -1085,7 +1180,11 @@ def attach_daily_run(
     ``read_only`` (e.g. a --dry-run send-dms, or the no-sender-id early return
     preview): attach to the row as a SNAPSHOT — do NOT reopen and do NOT close
     on exit, so a terminal row's prior status is never rewritten. A missing row
-    still raises NoDailyRunRow.
+    still raises NoDailyRunRow. Note: a read-only attach also never archives
+    terminal stray rows (the ``_archive_stray_rows`` sweep below is gated on
+    ``not read_only``) — a snapshot preview must not mutate the CRM, so stray
+    cleanup is deferred to the next writable run. This is a deliberate
+    deviation from upstream, which archived unconditionally.
     """
     actual_date = run_date or date.today()
     actual_machine = derive_machine_id(machine_id)
@@ -1105,6 +1204,23 @@ def attach_daily_run(
     # raises before any write, so a malformed terminal row never gets flipped
     # to "running" and stranded holding the 2-part lock with no close path.
     run = _attach_from_row(crm, run_id, row, all_rows=rows)
+
+    # Auto-mark terminal strays (NOT the active/canonical row, which is about to
+    # be reopened). Runs AFTER _attach_from_row's strict-counter validation so a
+    # malformed sibling still fails closed BEFORE any write (mirrors open_daily_run,
+    # where _merged_counters validates the baseline before archiving). Counters
+    # are untouched: _attach_from_row already merged ALL sibling counters into the
+    # baseline, so archiving cannot reset caps (LOAD-BEARING INVARIANT — see
+    # _archive_stray_rows).
+    if not read_only and len(rows) > 1:
+        marked = _archive_stray_rows(crm, rows, active_record_id=record_id)
+        if marked:
+            print(
+                f"WARN: {marked} terminal stray daily_run row(s) auto-marked "
+                f"[superseded] for {date_str!r}/{actual_machine!r}; their "
+                f"counters still count toward today's caps (baseline unchanged).",
+                file=sys.stderr,
+            )
 
     if read_only:
         # Snapshot attach: no reopen, no close — never rewrite a terminal row.

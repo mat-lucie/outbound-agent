@@ -674,6 +674,7 @@ def _llm_qualify(
         if anthropic_client is None:
             from workflows.llm_dispatch import (
                 CostCeilingExhausted,
+                LLMBudgetLedgerUnavailable,
                 request_llm_dispatch,
             )
 
@@ -688,6 +689,24 @@ def _llm_qualify(
                         'Return JSON: {"pass": bool, "icp_lane": int|null, "rationale": str}'
                     ),
                 )
+            except LLMBudgetLedgerUnavailable as exc:
+                # Ledger INFRA failure — the cap could not be consulted,
+                # so the dispatch never ran. Distinct from a real LLM
+                # failure and from cap exhaustion: the caller
+                # (score_prospect) routes this to the agent staging path
+                # when agent_gate=True (PR-216 incident fix) instead
+                # of rejecting the prospect.
+                logger.warning(
+                    "LLM qualifier budget ledger unavailable (step=%s): %s",
+                    exc.step, exc.error,
+                )
+                return {
+                    "pass": False,
+                    "icp_lane": None,
+                    "rationale": f"LLM budget ledger unavailable: {exc.error}",
+                    "llm_failed": True,
+                    "ledger_unavailable": True,
+                }
             except CostCeilingExhausted as exc:
                 # Distinct verdict_path so operators see cost-ceiling
                 # breaches separately from transient LLM errors (per
@@ -1172,7 +1191,25 @@ def score_prospect(
             llm_result = _llm_qualify(prospect_data, persona_config, anthropic_client)
             result["icp_lane"] = llm_result.get("icp_lane")
             result["llm_rationale"] = llm_result.get("rationale")
-            if llm_result.get("cost_exhausted"):
+            if llm_result.get("ledger_unavailable") and agent_gate:
+                # Budget-ledger INFRA failure with a staging-capable caller
+                # (the weekly flow): fail OPEN to the agent staging path.
+                # The prospect lands in weekly_borderline_<date>.jsonl and
+                # the operator qualifies it via weekly-finalize — an infra
+                # outage is not a prospect-quality signal, and no dispatch
+                # ran so §3.7 is not bypassed (PR-216 incident fix:
+                # borderlines were silently rejected with no artifact).
+                # Cap exhaustion never reaches this branch — it carries
+                # cost_exhausted, handled fail-closed below.
+                result["pass"] = None  # sentinel: pending agent qualification
+                result["needs_agent_qualification"] = True
+                result["qualification_prompt"] = render_qualification_prompt(
+                    prospect_data, persona_config,
+                )
+                result["ledger_unavailable"] = True
+                # verdict_path stays None until the agent fills it in —
+                # same contract as the agent_gate staging branch below.
+            elif llm_result.get("cost_exhausted"):
                 # Distinct from generic LLM error so operators see cost-
                 # ceiling breaches as their own bucket (per silent-failure-
                 # hunter HIGH). Fall back to deterministic threshold for

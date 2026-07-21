@@ -2,6 +2,7 @@
 
 import logging
 import os
+import random
 import time
 from collections.abc import Callable
 from typing import Any
@@ -12,6 +13,93 @@ import httpx
 from models.pipeline import STAGE_RANK, PipelineStage
 
 logger = logging.getLogger(__name__)
+
+
+# request_with_retry backoff shape: min(BASE * 2^attempt, MAX) scaled by a
+# uniform jitter factor in [0.5, 1.5) — so an individual sleep can reach
+# 1.5 × _RETRY_MAX_WAIT. Jitter survives the cap on purpose (no thundering herd
+# of synchronized retries against an already-struggling Attio).
+_RETRY_BASE_WAIT = 1.0
+_RETRY_MAX_WAIT = 30.0
+
+
+def request_with_retry(
+    attio: "AttioClient",
+    method: str,
+    path: str,
+    *,
+    attempts: int = 5,
+    recheck: Callable[[], dict | None] | None = None,
+    **kwargs,
+) -> dict:
+    """Bounded jittered-exponential retry around ``attio._request``.
+
+    ``_request`` already retries 429/502/503 and connection errors internally,
+    but a transient **500** raises on the first attempt (unless a caller opts
+    into ``retry_500`` — the operator_review_queue writes deliberately do NOT,
+    they route through this wrapper instead so the recheck below can guard the
+    non-idempotent create). That class crashed the daily run mid-Part-A three
+    times on operator_review_queue writes (PR-259), each time before any
+    invites were sent, forcing full re-runs. This wrapper covers 500s and also
+    survives ``_request`` exhausting its own inner retries.
+
+    Retries ONLY on transient failure classes:
+      - ``httpx.HTTPStatusError`` with a 5xx status
+      - ``httpx.TransportError`` (connection/read/timeout errors)
+    4xx and non-httpx exceptions propagate immediately — retrying a caller bug
+    can't fix it and would mask it.
+
+    ``recheck``: optional zero-arg callable invoked before each RETRY (never
+    before the first attempt). If it returns a non-None dict, that value is
+    returned instead of re-issuing the request. This is the safety valve for
+    non-idempotent writes: a create whose response was lost to a 500/timeout
+    may still have committed server-side, and blindly re-POSTing would
+    duplicate it — the recheck lets the caller probe for the landed write first
+    (escalation._create_row passes a uniqueness_key lookup).
+
+    Module-level rather than a method deliberately: escalation tests drive a
+    bare ``MagicMock()`` client, which would silently auto-mock a
+    ``request_with_retry`` METHOD (returning a MagicMock, bypassing the retry
+    logic and ``_request`` entirely). As a free function the real retry loop
+    always runs, exercised against the mocked ``_request``.
+    """
+    if attempts < 1:
+        raise ValueError(f"attempts must be >= 1, got {attempts}")
+    for attempt in range(attempts):
+        if attempt and recheck is not None:
+            found = recheck()
+            if found is not None:
+                return found
+        try:
+            return attio._request(method, path, **kwargs)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500 or attempt == attempts - 1:
+                raise
+            status = str(exc.response.status_code)
+        except httpx.TransportError as exc:
+            if attempt == attempts - 1:
+                raise
+            status = type(exc).__name__
+        wait = min(_RETRY_BASE_WAIT * (2 ** attempt), _RETRY_MAX_WAIT) * (
+            0.5 + random.random()
+        )
+        logger.warning(
+            "request_with_retry: %s %s failed with %s "
+            "(attempt %d/%d) — retrying in %.1fs",
+            method, path, status, attempt + 1, attempts, wait,
+        )
+        time.sleep(wait)
+    raise AssertionError("unreachable: loop always returns or raises")
+
+
+class AttioResultTruncated(RuntimeError):
+    """A paginated query hit its ``limit`` with records (possibly) remaining.
+
+    Raised only when the caller passed ``fail_if_truncated=True`` — full-sweep
+    callers prefer a loud failure over a silently incomplete result set
+    (PR-234: suppression sweeps, per-stage campaign queries, and list-scan
+    exports must not drop the tail past their fetch ceiling).
+    """
 
 
 def _is_stage_regression(prior_stage: str, new_stage: str) -> bool:
@@ -275,13 +363,27 @@ class AttioClient:
         """
         return self._field_mapping.get(engine_field, engine_field)
 
-    def _request(self, method: str, path: str, retries: int = 3, **kwargs) -> dict:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        retries: int = 3,
+        *,
+        retry_500: bool = False,
+        **kwargs,
+    ) -> dict:
+        # retry_500 is OPT-IN and only for idempotent call sites (reads,
+        # linkedin-keyed assert upserts): Attio 500s are transient in practice
+        # (PR-256 weekly-finalize crash loop), but a 500 on a non-idempotent
+        # POST (note/record create) may have committed server-side, so blanket
+        # retry would risk double-writes.
+        retryable = (429, 500, 502, 503) if retry_500 else (429, 502, 503)
         for attempt in range(retries):
             try:
                 resp = self._client.request(method, path, **kwargs)
-                if resp.status_code in (429, 502, 503):
-                    wait = 2 ** attempt * 5
-                    time.sleep(wait)
+                if resp.status_code in retryable:
+                    if attempt < retries - 1:
+                        time.sleep(2 ** attempt * 5)
                     continue
                 resp.raise_for_status()
                 return resp.json() if resp.content else {}
@@ -295,29 +397,84 @@ class AttioClient:
 
     # ── People records ────────────────────────────────────────
 
-    def search_people(self, filter_: dict | None = None, limit: int = 50) -> list[dict]:
-        """Search person records with optional filter. Auto-paginates."""
+    def _query_paginated(
+        self,
+        path: str,
+        filter_: dict | None,
+        limit: int,
+        *,
+        fail_if_truncated: bool = False,
+    ) -> list[dict]:
+        """Shared pagination loop for the record/entry query endpoints.
+
+        Pages through ``path`` until ``limit`` records are collected or the API
+        returns a short page (exhausted). With ``fail_if_truncated=True``,
+        raises :class:`AttioResultTruncated` when records remain past ``limit``
+        (probing one extra page when the count lands exactly on the limit, so a
+        complete result never raises). Full-sweep callers (suppression sweep,
+        per-stage campaign queries, list-scan exports) use this so a silently
+        truncated sweep becomes a loud operator-visible failure (PR-234).
+        """
         all_records: list[dict] = []
         page_size = min(limit, 100)
         offset: int = 0
+        exhausted = False
 
         while len(all_records) < limit:
             body: dict = {"limit": page_size, "offset": offset}
             if filter_:
                 body["filter"] = filter_
-            data = self._request("POST", "/objects/people/records/query", json=body)
+            data = self._request("POST", path, json=body, retry_500=True)
             records = data.get("data", [])
             all_records.extend(records)
             if len(records) < page_size:
+                exhausted = True
                 break
             offset += len(records)
 
+        if fail_if_truncated and len(all_records) >= limit:
+            truncated = len(all_records) > limit
+            if not truncated and not exhausted:
+                # Exactly ``limit`` records with a full final page — a complete
+                # result is indistinguishable from a truncated one without
+                # probing the next page. One extra request here (boundary case
+                # only) avoids a false-positive crash when the true count lands
+                # exactly on the limit.
+                body = {"limit": page_size, "offset": offset}
+                if filter_:
+                    body["filter"] = filter_
+                probe = self._request("POST", path, json=body, retry_500=True)
+                truncated = bool(probe.get("data", []))
+            if truncated:
+                raise AttioResultTruncated(
+                    f"query {path} hit its scan limit ({limit}) with more "
+                    f"records remaining — raise the limit so the sweep sees "
+                    f"every record"
+                )
         return all_records[:limit]
 
-    def get_person(self, record_id: str) -> dict | None:
-        """Get a person record by its record ID. Returns None if not found."""
+    def search_people(
+        self,
+        filter_: dict | None = None,
+        limit: int = 50,
+        *,
+        fail_if_truncated: bool = False,
+    ) -> list[dict]:
+        """Search person records with optional filter. Auto-paginates."""
+        return self._query_paginated(
+            "/objects/people/records/query", filter_, limit,
+            fail_if_truncated=fail_if_truncated,
+        )
+
+    def get_person(self, record_id: str, *, retry_500: bool = True) -> dict | None:
+        """Get a person record by its record ID. Returns None if not found.
+
+        ``retry_500=False`` opts back out of transient-500 retry — the
+        fail-open bulk fetch uses it so a systemic Attio outage fails fast per
+        record instead of blocking hours in backoff sleeps.
+        """
         try:
-            data = self._request("GET", f"/objects/people/records/{record_id}")
+            data = self._request("GET", f"/objects/people/records/{record_id}", retry_500=retry_500)
             return data.get("data", data)
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
@@ -350,7 +507,13 @@ class AttioClient:
             metrics.bulk_fetch_records_requested += len(ids)
         result: dict[str, dict] = {}
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_to_id = {pool.submit(self.get_person, rid): rid for rid in ids}
+            # retry_500=False: this path is fail-open per record, so under a
+            # systemic 500 outage retrying would burn the full backoff budget
+            # per record (hours across a weekly sweep) and still end in the
+            # same degraded result — fail fast and let the metrics surface it.
+            future_to_id = {
+                pool.submit(self.get_person, rid, retry_500=False): rid for rid in ids
+            }
             for future in as_completed(future_to_id):
                 rid = future_to_id[future]
                 try:
@@ -409,7 +572,8 @@ class AttioClient:
 
     def update_person(self, record_id: str, attributes: dict) -> dict:
         """Update an existing person record."""
-        data = self._request("PATCH", f"/objects/people/records/{record_id}", json={"data": {"values": attributes}})
+        # Same-values PATCH is idempotent — safe to retry a transient 500.
+        data = self._request("PATCH", f"/objects/people/records/{record_id}", json={"data": {"values": attributes}}, retry_500=True)
         return data.get("data", {})
 
     def upsert_person(self, matching_attribute: str, attributes: dict) -> dict:
@@ -441,11 +605,13 @@ class AttioClient:
                     return self.update_person(record_id, attributes)
             return self.create_person(attributes)
         # Fallback: use the native PUT upsert for truly unique attributes (email, record_id)
+        # The native upsert is assert-by-key (idempotent) — safe to retry a 500.
         data = self._request(
             "PUT",
             "/objects/people/records",
             params={"matching_attribute": matching_attribute},
             json={"data": {"values": attributes}},
+            retry_500=True,
         )
         return data.get("data", {})
 
@@ -488,7 +654,7 @@ class AttioClient:
     def get_company(self, record_id: str) -> dict | None:
         """Get a company record by its record ID. Returns None if not found."""
         try:
-            data = self._request("GET", f"/objects/companies/records/{record_id}")
+            data = self._request("GET", f"/objects/companies/records/{record_id}", retry_500=True)
             return data.get("data", data)
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
@@ -606,25 +772,20 @@ class AttioClient:
         list_id: str | None = None,
         filter_: dict | None = None,
         limit: int = 50000,
+        *,
+        fail_if_truncated: bool = False,
     ) -> list[dict]:
-        """Query entries in a list (pipeline) with optional filters. Auto-paginates."""
+        """Query entries in a list (pipeline) with optional filters. Auto-paginates.
+
+        With ``fail_if_truncated=True`` a full-list sweep that hits ``limit``
+        with entries remaining raises :class:`AttioResultTruncated` instead of
+        silently dropping the tail (PR-234).
+        """
         lid = list_id or os.environ.get("ATTIO_LIST_ID", "")
-        all_entries: list[dict] = []
-        page_size = min(limit, 100)
-        offset: int = 0
-
-        while len(all_entries) < limit:
-            body: dict = {"limit": page_size, "offset": offset}
-            if filter_:
-                body["filter"] = filter_
-            data = self._request("POST", f"/lists/{lid}/entries/query", json=body)
-            entries = data.get("data", [])
-            all_entries.extend(entries)
-            if len(entries) < page_size:
-                break
-            offset += len(entries)
-
-        return all_entries[:limit]
+        return self._query_paginated(
+            f"/lists/{lid}/entries/query", filter_, limit,
+            fail_if_truncated=fail_if_truncated,
+        )
 
     def add_list_entry(
         self,

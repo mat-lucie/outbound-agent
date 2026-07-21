@@ -4,8 +4,41 @@ import contextlib
 import json
 import os
 import shutil
+import time
+from collections.abc import Callable
+from typing import TypeVar
 
 import gspread
+
+_T = TypeVar("_T")
+
+# gspread APIError statuses worth retrying: transient Google backend / rate-limit
+# responses (429 rate-limit, 500/502/503 backend). A crash on ws.clear() from a
+# one-off 503 took down a whole `daily` run mid-Phase-0 (PR-239 incident), so
+# the mutating Sheets calls now ride a small backoff instead of propagating.
+_RETRYABLE_SHEETS_STATUS = frozenset({429, 500, 502, 503})
+_SHEETS_RETRY_BACKOFF = (5, 10, 20)  # seconds between attempts; mirrors clients/attio.py
+
+
+def _with_retry(fn: Callable[[], _T], *, attempts: int = 3) -> _T:
+    """Run ``fn`` with retry on transient gspread ``APIError`` statuses.
+
+    Retries only when the APIError's response status is in
+    ``_RETRYABLE_SHEETS_STATUS`` (429/500/502/503), sleeping 5/10/20s between
+    attempts (mirrors the cadence of ``clients/attio.py``'s ``_request``; that
+    helper is httpx-specific and not reusable here). A non-retryable status
+    (e.g. 403 permission) re-raises immediately; the final attempt re-raises
+    whatever it hit. ``fn`` takes no args — close over the call at the site.
+    """
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except gspread.exceptions.APIError as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status not in _RETRYABLE_SHEETS_STATUS or attempt == attempts - 1:
+                raise
+            time.sleep(_SHEETS_RETRY_BACKOFF[min(attempt, len(_SHEETS_RETRY_BACKOFF) - 1)])
+    raise AssertionError("unreachable")  # pragma: no cover
 
 CREDENTIALS_DIR = os.path.join(os.path.dirname(__file__), "..", "credentials")
 OAUTH_CREDENTIALS = os.path.join(CREDENTIALS_DIR, "google-oauth.json")
@@ -161,8 +194,8 @@ def write_prospects_to_sheet(
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=worksheet_name, rows=len(rows) + 1, cols=len(columns))
 
-    ws.clear()
+    _with_retry(ws.clear)
     data = [columns] + [[row.get(col, "") for col in columns] for row in rows]
-    ws.update(data, "A1")
+    _with_retry(lambda: ws.update(data, "A1"))
 
     return f"https://docs.google.com/spreadsheets/d/{sid}"

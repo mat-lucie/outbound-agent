@@ -192,7 +192,11 @@ class CRMProvider(abc.ABC):
 
     @abc.abstractmethod
     def search_people(
-        self, filter_: dict[str, Any] | None = None, limit: int = 50
+        self,
+        filter_: dict[str, Any] | None = None,
+        limit: int = 50,
+        *,
+        fail_if_truncated: bool = False,
     ) -> list[Record]:
         """Search person records, optionally filtered, auto-paginating up to
         ``limit``.
@@ -201,6 +205,13 @@ class CRMProvider(abc.ABC):
             filter_: Vendor-shaped filter (e.g. ``{"linkedin": <url>}``), or
                 ``None`` for an unfiltered scan.
             limit: Maximum records to return.
+            fail_if_truncated: When ``True``, a full-sweep read that hits
+                ``limit`` with records still remaining raises
+                :class:`ResultTruncatedError` instead of returning a silently
+                incomplete set — the same guarantee ``query_list_entries``
+                gives (PR-234). Callers that treat "no match" as ground truth
+                (e.g. de-dup / suppression sweeps) pass ``True`` so a capped
+                read can never masquerade as an empty result.
 
         Returns: a list of person :class:`Record` (possibly empty).
         """
@@ -328,6 +339,8 @@ class CRMProvider(abc.ABC):
         list_id: str | None = None,
         filter_: dict[str, Any] | None = None,
         limit: int = 50000,
+        *,
+        fail_if_truncated: bool = False,
     ) -> list[Entry]:
         """Query the pipeline list's entries, optionally filtered,
         auto-paginating up to ``limit``.
@@ -335,6 +348,10 @@ class CRMProvider(abc.ABC):
         ``list_id`` selects the list; ``None`` means the adapter's configured
         default pipeline list. Returns normalized :class:`Entry` objects (stage
         + flat attribute map), the staged-cadence rows the engine iterates.
+
+        With ``fail_if_truncated=True`` a full-sweep read that hits ``limit``
+        with entries remaining raises :class:`ResultTruncatedError` instead of
+        returning a silently incomplete set (PR-234).
         """
 
     @abc.abstractmethod

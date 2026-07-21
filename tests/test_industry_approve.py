@@ -90,13 +90,13 @@ class TestListPending:
         attio = MagicMock()
         attio._request.return_value = {
             "data": [
-                _queue_row("Sigma Alimentos", "Food & Beverage", 0.55, "q-1"),
+                _queue_row("Acme Foods", "Food & Beverage", 0.55, "q-1"),
                 _queue_row("Cementra", "Construction", 0.62, "q-2"),
             ]
         }
         rows = list_pending_industry_low_confidence(_provider_over(attio))
         assert len(rows) == 2
-        assert rows[0]["company_name"] == "Sigma Alimentos"
+        assert rows[0]["company_name"] == "Acme Foods"
         assert rows[0]["queue_record_id"] == "q-1"
         assert rows[0]["suggested_vertical"] == "Food & Beverage"
         assert rows[0]["confidence"] == 0.55
@@ -123,10 +123,10 @@ class TestListPending:
     def test_dict_payload_passthrough(self):
         attio = MagicMock()
         attio._request.return_value = {
-            "data": [_queue_row("Sigma", payload_serialized=False)]
+            "data": [_queue_row("Acme Foods", payload_serialized=False)]
         }
         rows = list_pending_industry_low_confidence(_provider_over(attio))
-        assert rows[0]["company_name"] == "Sigma"
+        assert rows[0]["company_name"] == "Acme Foods"
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -138,15 +138,15 @@ class TestApprove:
     def test_writes_company_then_resolves_queue(self):
         attio = MagicMock()
         attio._request.return_value = {
-            "data": [_queue_row("Sigma Alimentos", record_id="q-99")]
+            "data": [_queue_row("Acme Foods", record_id="q-99")]
         }
         attio.search_companies.return_value = [
-            _company_record("co-42", "Sigma Alimentos"),
+            _company_record("co-42", "Acme Foods"),
         ]
         writer = MagicMock()
 
         result = approve_industry_classification(
-            "Sigma Alimentos",
+            "Acme Foods",
             vertical="Food & Beverage",
             crm=_provider_over(attio),
             attio=attio,
@@ -185,7 +185,7 @@ class TestApprove:
         writer = MagicMock()
         with pytest.raises(InvalidVerticalError):
             approve_industry_classification(
-                "Sigma Alimentos",
+                "Acme Foods",
                 vertical="Not A Real Label",
                 crm=_provider_over(attio),
                 attio=attio,
@@ -202,7 +202,7 @@ class TestApprove:
         writer = MagicMock()
         with pytest.raises(IndustryRowNotFoundError):
             approve_industry_classification(
-                "Sigma Alimentos",
+                "Acme Foods",
                 vertical="Food & Beverage",
                 crm=_provider_over(attio),
                 attio=attio,
@@ -215,13 +215,13 @@ class TestApprove:
     def test_company_not_found_raises_before_queue_write(self):
         attio = MagicMock()
         attio._request.return_value = {
-            "data": [_queue_row("Sigma Alimentos")]
+            "data": [_queue_row("Acme Foods")]
         }
         attio.search_companies.return_value = []
         writer = MagicMock()
         with pytest.raises(CompanyNotFoundError):
             approve_industry_classification(
-                "Sigma Alimentos",
+                "Acme Foods",
                 vertical="Food & Beverage",
                 crm=_provider_over(attio),
                 attio=attio,
@@ -233,16 +233,16 @@ class TestApprove:
     def test_ambiguous_company_raises_before_queue_write(self):
         attio = MagicMock()
         attio._request.return_value = {
-            "data": [_queue_row("Sigma Alimentos")]
+            "data": [_queue_row("Acme Foods")]
         }
         attio.search_companies.return_value = [
-            _company_record("co-1", "Sigma Alimentos"),
-            _company_record("co-2", "Sigma Alimentos"),
+            _company_record("co-1", "Acme Foods"),
+            _company_record("co-2", "Acme Foods"),
         ]
         writer = MagicMock()
         with pytest.raises(AmbiguousCompanyError) as exc:
             approve_industry_classification(
-                "Sigma Alimentos",
+                "Acme Foods",
                 vertical="Food & Beverage",
                 crm=_provider_over(attio),
                 attio=attio,
@@ -254,16 +254,16 @@ class TestApprove:
     def test_record_id_override_bypasses_lookup(self):
         attio = MagicMock()
         attio._request.return_value = {
-            "data": [_queue_row("Sigma Alimentos", record_id="q-9")]
+            "data": [_queue_row("Acme Foods", record_id="q-9")]
         }
         # Two matches would normally raise — override resolves it.
         attio.search_companies.return_value = [
-            _company_record("co-1", "Sigma Alimentos"),
-            _company_record("co-2", "Sigma Alimentos"),
+            _company_record("co-1", "Acme Foods"),
+            _company_record("co-2", "Acme Foods"),
         ]
         writer = MagicMock()
         result = approve_industry_classification(
-            "Sigma Alimentos",
+            "Acme Foods",
             vertical="Food & Beverage",
             crm=_provider_over(attio),
             attio=attio,
@@ -284,10 +284,10 @@ class TestApprove:
         story."""
         attio = MagicMock()
         attio._request.return_value = {
-            "data": [_queue_row("Sigma Alimentos", record_id="q-partial")]
+            "data": [_queue_row("Acme Foods", record_id="q-partial")]
         }
         attio.search_companies.return_value = [
-            _company_record("co-42", "Sigma Alimentos"),
+            _company_record("co-42", "Acme Foods"),
         ]
         writer = MagicMock()
         # First call (Companies) succeeds, second call (queue) raises.
@@ -295,7 +295,7 @@ class TestApprove:
 
         with pytest.raises(RuntimeError, match="attio 5xx on queue write"):
             approve_industry_classification(
-                "Sigma Alimentos",
+                "Acme Foods",
                 vertical="Food & Beverage",
                 crm=_provider_over(attio),
                 attio=attio,
@@ -312,19 +312,19 @@ class TestApprove:
         assert second_intent.object == "operator_review_queue"
 
     def test_name_normalization_matches_attio_record(self):
-        """Operator passes 'sigma alimentos' (lowercase, trailing space) and
-        the Attio record holds 'Sigma Alimentos'. normalize_company_name
+        """Operator passes 'acme foods' (lowercase, trailing space) and
+        the Attio record holds 'Acme Foods'. normalize_company_name
         must equate them so the lookup succeeds."""
         attio = MagicMock()
         attio._request.return_value = {
-            "data": [_queue_row("Sigma Alimentos")]
+            "data": [_queue_row("Acme Foods")]
         }
         attio.search_companies.return_value = [
-            _company_record("co-42", "Sigma Alimentos"),
+            _company_record("co-42", "Acme Foods"),
         ]
         writer = MagicMock()
         result = approve_industry_classification(
-            "sigma alimentos ",  # operator input
+            "acme foods ",  # operator input
             vertical="Food & Beverage",
             crm=_provider_over(attio),
             attio=attio,
@@ -342,11 +342,11 @@ class TestReject:
     def test_marks_queue_rejected_without_company_write(self):
         attio = MagicMock()
         attio._request.return_value = {
-            "data": [_queue_row("Sigma Alimentos", record_id="q-r1")]
+            "data": [_queue_row("Acme Foods", record_id="q-r1")]
         }
         writer = MagicMock()
         result = reject_industry_classification(
-            "Sigma Alimentos",
+            "Acme Foods",
             rationale="LLM guessed F&B but they're a holding company",
             crm=_provider_over(attio),
             attio=attio,
@@ -368,12 +368,12 @@ class TestReject:
         attio = MagicMock()
         with pytest.raises(ValueError, match="non-empty rationale"):
             reject_industry_classification(
-                "Sigma Alimentos", rationale="", crm=_provider_over(attio),
+                "Acme Foods", rationale="", crm=_provider_over(attio),
                 attio=attio,
             )
         with pytest.raises(ValueError, match="non-empty rationale"):
             reject_industry_classification(
-                "Sigma Alimentos", rationale="   ", crm=_provider_over(attio),
+                "Acme Foods", rationale="   ", crm=_provider_over(attio),
                 attio=attio,
             )
 
@@ -382,7 +382,7 @@ class TestReject:
         attio._request.return_value = {"data": []}
         with pytest.raises(IndustryRowNotFoundError):
             reject_industry_classification(
-                "Sigma Alimentos", rationale="not a mfg",
+                "Acme Foods", rationale="not a mfg",
                 crm=_provider_over(attio), attio=attio,
             )
 
@@ -444,16 +444,16 @@ class TestAttioWriterAuthorization:
         from clients.attio_writer import AttioWriter
         attio = MagicMock()
         attio._request.return_value = {
-            "data": [_queue_row("Sigma Alimentos")]
+            "data": [_queue_row("Acme Foods")]
         }
         attio.search_companies.return_value = [
-            _company_record("co-42", "Sigma Alimentos"),
+            _company_record("co-42", "Acme Foods"),
         ]
         # Patch the actual PATCH HTTP path so the test doesn't hit network,
         # but let the registry check run.
         with patch.object(AttioWriter, "_patch_with_retry", return_value={"data": {}}):
             result = approve_industry_classification(
-                "Sigma Alimentos",
+                "Acme Foods",
                 vertical="Food & Beverage",
                 crm=_provider_over(attio),
                 attio=attio,

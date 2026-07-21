@@ -77,7 +77,9 @@ class TestPeopleReads:
 
         result = provider.search_people(filter_={"linkedin": "x"}, limit=10)
 
-        inner.search_people.assert_called_once_with(filter_={"linkedin": "x"}, limit=10)
+        inner.search_people.assert_called_once_with(
+            filter_={"linkedin": "x"}, limit=10, fail_if_truncated=False
+        )
         assert len(result) == 1
         rec = result[0]
         assert isinstance(rec, Record)
@@ -273,7 +275,7 @@ class TestQueryListEntries:
         result = provider.query_list_entries(list_id="list-X", limit=100)
 
         inner.query_list_entries.assert_called_once_with(
-            list_id="list-X", filter_=None, limit=100
+            list_id="list-X", filter_=None, limit=100, fail_if_truncated=False,
         )
         assert len(result) == 1
         entry = result[0]

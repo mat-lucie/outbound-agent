@@ -26,6 +26,7 @@ from models.pipeline import PipelineStage
 from workflows.cadence import derive_cadence_lane
 from workflows.company_matcher import extract_real_domain, match_or_create_company
 from workflows.escalation import escalate
+from workflows.identity_match import normalize_for_match
 from workflows.industry_classifier import build_anthropic_client
 from workflows.quality_gate import (
     DISQUALIFIER_VERDICT_PATHS,
@@ -211,6 +212,164 @@ def _matches_target_company(company_name: str, target_fragments: set[str]) -> bo
         if shorter in longer and len(shorter) >= max(5, len(longer) * 0.4):
             return True
     return False
+
+
+def _normalize_person_name(name: str) -> str:
+    """Normalize a person name for the name+company duplicate gate.
+
+    URL-keyed dedup can't catch a re-created prospect under a different
+    LinkedIn vanity slug (same human, new URL — the PR-241 René case).
+    This normalizer feeds the secondary name+company gate so those get caught.
+
+    Steps:
+      1. Strip anything after a SPACE-ANCHORED decorative separator (" - ",
+         " | ") — LinkedIn names carry a title/company suffix ("René - CEO",
+         "René | Acme Foods"). Separators are space-anchored so a compound surname
+         ("Núñez-Vidal") and a parenthetical nickname ("René (Beto) de la
+         Cruz") are NOT truncated.
+      2. Diacritic fold + lowercase + whitespace collapse — delegated to
+         `identity_match.normalize_for_match`, the canonical accent-fold for
+         this codebase, so this does not add yet another near-duplicate
+         normalizer.
+
+    Pure function (module-level, testable). Idempotent.
+    """
+    if not name:
+        return ""
+    # Cut at the first space-anchored decorative separator only.
+    for sep in (" - ", " | "):
+        idx = name.find(sep)
+        if idx != -1:
+            name = name[:idx]
+    return normalize_for_match(name)
+
+
+# A normalized-name → list of (record_id, canonical_url, company_name) for
+# every person already in the pipeline list. Company is resolved eagerly here
+# (the fork's `bulk_fetch_persons` returns full Records, so `extract_person_info`
+# yields the company name in the same pass with no extra fetch — unlike the
+# upstream, which left it lazy because company was a separate record reference).
+NameIndex = dict[str, list[tuple[str, str, str]]]
+
+
+def _build_name_index(crm: CRMProvider, existing_entries: list[Entry]) -> NameIndex:
+    """Build the run-start normalized-name → records map for the dedup gate.
+
+    Why a LOCAL index and not a live search (empirically verified upstream):
+    Attio's `search_people(name $contains ...)` is accent-SENSITIVE, so a
+    suffixed ASCII needle ("Sam Rivera - Managing Director") does NOT match
+    the stored accented "Sam Rivera" — the exact suffix/accent variant this
+    gate exists to catch. Applying `_normalize_person_name` to BOTH sides at
+    build time bridges accents AND suffixes by construction, and the per-
+    candidate check becomes an O(1) dict lookup with no network call.
+
+    One bulk read of the pipeline's person records at run start goes through the
+    vendor-neutral `CRMProvider` contract (`bulk_fetch_persons` →
+    `{record_id: Record}`, `extract_person_info` → normalized name/company/URL).
+    Per-record fetch failures are isolated by `bulk_fetch_persons` and simply
+    leave that record out of the index (it then can't be a dedup hit — the same
+    degrade-open posture the URL gate takes). A malformed record that raises in
+    `extract_person_info` is skipped for the same reason.
+    """
+    record_ids = {e.record_id for e in existing_entries if e.record_id}
+    index: NameIndex = {}
+    if not record_ids:
+        return index
+    persons = crm.bulk_fetch_persons(record_ids)
+    extract_failures = 0
+    for rid, record in persons.items():
+        try:
+            info = crm.extract_person_info(record)
+        except Exception as exc:  # noqa: BLE001 — degrade open, skip this record
+            extract_failures += 1
+            logger.warning(
+                "name_index: could not extract info for record_id=%r (%s: %s) "
+                "— left out of the dedup gate",
+                rid, type(exc).__name__, exc,
+            )
+            continue
+        norm_name = _normalize_person_name(info.name or "")
+        if not norm_name:
+            continue
+        canonical = _canonical_linkedin_url(info.linkedin_url) if info.linkedin_url else ""
+        index.setdefault(norm_name, []).append((rid, canonical, info.company or ""))
+    # Aggregate alarm for PARTIAL systemic degradation: the per-record warnings
+    # above scatter, and the "index empty" alarm below only fires on TOTAL
+    # emptiness. A non-trivial fraction of records silently dropped still
+    # weakens the dedup gate (each dropped record can't be a dedup hit), so
+    # surface the count once as a single summary line.
+    if extract_failures:
+        logger.warning(
+            "name_index: %d of %d fetched record(s) skipped on "
+            "extract_person_info failure — the name+company dedup gate is "
+            "weaker this run (each skipped record can't be a dedup hit)",
+            extract_failures, len(persons),
+        )
+    if existing_entries and not index:
+        logger.warning(
+            "name_index empty: %d entries scanned, 0 resolved to a person "
+            "name — the name+company dedup gate will not fire this run",
+            len(existing_entries),
+        )
+    return index
+
+
+def _find_name_company_duplicate(
+    name_index: NameIndex,
+    candidate_name: str,
+    candidate_company: str,
+    *,
+    candidate_canonical_url: str,
+) -> str | None:
+    """Return the record_id of a suspected URL-variant duplicate, or None.
+
+    O(1) lookup against the prebuilt `name_index` (no live search). A hit is a
+    duplicate iff:
+      - its normalized name matches the candidate's (accents + LinkedIn suffix
+        already folded on both sides at index-build time), AND
+      - its canonical LinkedIn URL differs from the candidate's (a same-URL hit
+        is the URL-gate's job — never flag it here), AND
+      - its company matches the candidate's (case/accent-insensitive).
+
+    Company is compared from the index (resolved eagerly at build time). Never
+    auto-merges — the caller stages the hit for operator review.
+    """
+    norm_candidate = _normalize_person_name(candidate_name)
+    if not norm_candidate:
+        return None
+    norm_company = _normalize_person_name(candidate_company)
+    if not norm_company:
+        # Without a company we cannot distinguish a real duplicate from a
+        # namesake — do not stage on name alone (over-eager on common names).
+        return None
+    for hit_rid, hit_canonical, hit_company in name_index.get(norm_candidate, []):
+        # Same canonical URL → this is the URL gate's territory, not ours.
+        if hit_canonical and hit_canonical == candidate_canonical_url:
+            continue
+        if _normalize_person_name(hit_company) == norm_company:
+            return hit_rid
+    return None
+
+
+# The reprospect_review CSV carries two row shapes: layer-3 rows (existing
+# person, no list entry) which have NO "reason" key, and name+company-gate rows
+# which DO. "reason" is in fieldnames and restval="" fills the layer-3 rows, so
+# DictWriter's default extrasaction='raise' never trips (a single staged
+# name+company duplicate used to ValueError the whole finalize phase).
+_REPROSPECT_REVIEW_FIELDNAMES = [
+    "name", "company", "title", "linkedin_url", "record_id",
+    "score", "persona", "language", "reason",
+]
+
+
+def _write_reprospect_review_csv(path, rows: list[dict]) -> None:
+    """Write staged re-prospect candidates to `path` (mixed row shapes safe)."""
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=_REPROSPECT_REVIEW_FIELDNAMES, restval="",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _get_all_searches(personas_data: dict) -> list[tuple[str, str, str]]:
@@ -1674,6 +1833,7 @@ def _process_prospects(
     existing_entries: list[Entry] | None = None,
     seen_urls_midmarket: set[str] | None = None,
     in_list_canonical_urls: set[str] | None = None,
+    name_index: NameIndex | None = None,
 ) -> None:
     """Score, dedup, and load prospects into Attio. Mutates summary and seen_urls in place.
 
@@ -1872,6 +2032,46 @@ def _process_prospects(
                 })
             continue
 
+        # Secondary dedup gate (PR-241 René RCA): URL-keyed dedup above cannot
+        # catch a re-created prospect under a DIFFERENT LinkedIn vanity slug
+        # (same human, new URL). Look the candidate up in the run-start name
+        # index (normalized on both sides so accents + LinkedIn suffixes bridge
+        # by construction — the old live search was accent-SENSITIVE and missed
+        # exactly these variants). A hit under a different URL that shares a
+        # company is a suspected URL-variant duplicate. Do NOT auto-merge —
+        # stage into the same reprospect_review flow as layer 3 so an operator
+        # decides.
+        dup_record_id = None
+        if name_index is not None:
+            dup_record_id = _find_name_company_duplicate(
+                name_index,
+                prospect_data["name"], prospect_data["company"],
+                candidate_canonical_url=canonical,
+            )
+        if dup_record_id:
+            click.echo(
+                f"      → name+company match with {dup_record_id} — suspected "
+                f"URL-variant duplicate; staged for manual review (not committed)"
+            )
+            summary.setdefault("reprospect_review", 0)
+            summary["reprospect_review"] += 1
+            if reprospect_review is not None:
+                reprospect_review.append({
+                    "name": prospect_data["name"],
+                    "company": prospect_data["company"],
+                    "title": prospect_data["title"],
+                    "linkedin_url": prospect_data["linkedin_url"],
+                    "record_id": dup_record_id,
+                    "score": score_result.get("score"),
+                    "persona": score_result.get("persona"),
+                    "language": score_result.get("language"),
+                    "reason": (
+                        f"name+company match — suspected URL-variant duplicate "
+                        f"of {dup_record_id}"
+                    ),
+                })
+            continue
+
         if dry_run:
             click.echo(
                 f"      → [DRY RUN] Would add: score={score_result['score']}, "
@@ -2034,6 +2234,14 @@ def run_weekly_prospecting(
     in_list_canonical_urls = _load_in_list_canonical_urls(crm, existing_entries)
     click.echo(f"  {len(in_list_canonical_urls)} canonical URLs resolved for dedup.\n")
 
+    # Run-start name index for the name+company duplicate gate (PR-241 René
+    # RCA). Built ONCE from the pipeline's person records so the per-candidate
+    # check is an O(1) local lookup — a live Attio name search is accent-
+    # SENSITIVE and misses the suffix/accent variants this gate exists to catch.
+    # See _build_name_index for the full rationale.
+    name_index = _build_name_index(crm, existing_entries)
+    click.echo(f"  {len(name_index)} distinct names indexed for name+company dedup.\n")
+
     for i, (persona_key, geo_key, sn_url) in enumerate(searches, 1):
         click.echo(f"[{i}/{len(searches)}] {persona_key} / {geo_key}")
         click.echo(f"  URL: {sn_url[:80]}...")
@@ -2067,6 +2275,7 @@ def run_weekly_prospecting(
             existing_entries=existing_entries,
             seen_urls_midmarket=seen_urls_midmarket,
             in_list_canonical_urls=in_list_canonical_urls,
+            name_index=name_index,
         )
         click.echo()
 
@@ -2082,11 +2291,7 @@ def run_weekly_prospecting(
     if reprospect_review:
         review_path = EXPORTS_DIR / f"weekly_reprospect_review_{today}.csv"
         review_path.parent.mkdir(parents=True, exist_ok=True)
-        with review_path.open("w", newline="") as f:
-            fieldnames = ["name", "company", "title", "linkedin_url", "record_id", "score", "persona", "language"]
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(reprospect_review)
+        _write_reprospect_review_csv(review_path, reprospect_review)
         click.echo(f"  Staged {len(reprospect_review)} re-prospect candidates for review → {review_path}")
 
     # Summary

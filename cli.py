@@ -2040,8 +2040,8 @@ def industry_approve_cmd(
     Examples:
 
         industry-approve                                       # list pending rows
-        industry-approve "Sigma Alimentos" --approve --vertical "Food & Beverage"
-        industry-approve "Sigma Alimentos" --reject --rationale="not a manufacturer"
+        industry-approve "Acme Foods" --approve --vertical "Food & Beverage"
+        industry-approve "Acme Foods" --reject --rationale="not a manufacturer"
     """
     from workflows.industry_approve import (
         AmbiguousCompanyError,
