@@ -153,6 +153,7 @@ ESCALATION_TYPES: tuple[str, ...] = (
     # ---- Prospect-daily (§4.1) ----
     "company_throttled",
     "missing_language",
+    "language_mismatch",
     "missing_copy",
     "corrupted_company_invite_skipped",
     "missing_language_for_classification",
@@ -626,10 +627,15 @@ class DisqualifierMatchPayload(TypedDict):
 
     Emitted by `workflows.weekly_prospect._process_prospects` when
     `score_prospect` returns `verdict_path` in
-    `DISQUALIFIER_VERDICT_PATHS` (one of `disqualifier_hr`,
+    `DISQUALIFIER_VERDICT_PATHS`. Original 6 (PR-26): `disqualifier_hr`,
     `disqualifier_finance`, `disqualifier_innovation`,
     `disqualifier_pe`, `disqualifier_state_owned`,
-    `disqualifier_consulting`).
+    `disqualifier_consulting`. PR-222 Rec E adds 5 deterministic
+    pre-LLM company/employer families: `disqualifier_academic`,
+    `disqualifier_government`, `disqualifier_healthcare`,
+    `disqualifier_competitor`, `disqualifier_freelance`. PR-238 adds the
+    medical/regulatory/clinical-affairs title family:
+    `disqualifier_medical_regulatory`.
 
     `matched_keyword` is the specific keyword that fired — operators
     audit keyword false-positives without re-running the matcher.
@@ -765,6 +771,39 @@ class MissingLanguagePayload(TypedDict):
     language_value: str | None
     dm_step: str
     error_msg: str
+
+
+# ---- Prospect-daily — language guard (fail-closed, PR-240) ----
+
+class LanguageMismatchPayload(TypedDict):
+    """`language_mismatch` — emitted by the fail-closed language guard in
+    `workflows.daily_check.run_dm_sequencing` /
+    `run_connection_requests` when the entry's stored `language`
+    disagrees with the language re-derived from its canonical source
+    (the linked company's HQ country, via
+    `models.email_campaign.detect_language_from_country`; or the
+    us_mode scoring lane → English short-circuit).
+
+    Motivation: nothing validated the stored `language` attribute
+    against its seeding signal before send, so a wrong value could ship a
+    wrong-language DM. On a GENUINE mismatch the guard fails CLOSED — the
+    prospect is skipped and this row is opened for an operator to
+    reconcile the attribute — rather than guessing which side is right.
+
+    `stored_language` is the (valid) enum value resolve_language
+    returned; `expected_language` is the source-derived value they
+    disagree with. `scoring_lane` and `dm_step` carry triage context.
+
+    Idempotency key: f"language_mismatch|{record_id}|{step}" — one row
+    per prospect per step, matching the sibling missing_language /
+    missing_copy guards so retries within a run don't duplicate rows.
+    """
+    record_id: str
+    persona: str | None
+    stored_language: str
+    expected_language: str
+    scoring_lane: str | None
+    dm_step: str
 
 
 # ---- Prospect-daily — per-company throttle (PR-13) ----
@@ -1270,6 +1309,7 @@ ESCALATION_SCHEMAS: dict[str, type] = {
     "experiment_id_immutability_violation": ExperimentIdImmutabilityViolationPayload,
     "disqualifier_match": DisqualifierMatchPayload,
     "missing_language": MissingLanguagePayload,
+    "language_mismatch": LanguageMismatchPayload,
     "missing_copy": MissingMessagePayload,
     "icp2_geo_violation": Icp2GeoViolationPayload,
     "recent_outreach_map_empty": RecentOutreachMapEmptyPayload,

@@ -306,6 +306,32 @@ CONSULTING_TITLE_KEYWORDS = _ICP.consulting_title_keywords
 # manufacturing operations.
 OPS_OVERRIDE_KEYWORDS = _ICP.ops_override_keywords
 
+# ── PR-222 Rec E: high-confidence COMPANY / EMPLOYER disqualifier families ──
+# Academics, government/state entities, hospitals, direct competitors, and
+# freelancers are deterministic from the company NAME alone. Each fires a typed
+# `disqualifier_*` Operator Review Queue row (reversible, auditable) — same
+# machinery as STATE_OWNED / CONSULTING_FIRM, with NO OPS_OVERRIDE bypass (the
+# disqualifying fact is the employer, not the title). Company-name families use
+# substring match since legal-entity forms vary; the competitor and freelance
+# families are word-boundary matched because their short tokens would otherwise
+# substring-fire inside unrelated names. Values are operator ICP DATA, sourced
+# from config (config/icp.yaml → icp.example.yaml).
+ACADEMIC_COMPANY_KEYWORDS = _ICP.academic_company_keywords
+GOVERNMENT_KEYWORDS = _ICP.government_keywords
+HEALTHCARE_PROVIDER_KEYWORDS = _ICP.healthcare_provider_keywords
+COMPETITOR_COMPANY_KEYWORDS = _ICP.competitor_company_keywords
+FREELANCE_EMPLOYER_KEYWORDS = _ICP.freelance_employer_keywords
+
+# ── PR-238: medical / regulatory / clinical-affairs TITLE disqualifier family ──
+# A pharma/biotech clinical-affairs function (medical/regulatory affairs,
+# pharmacovigilance, clinical operations, market access) runs drug safety /
+# regulatory submissions / clinical programs — NOT a plant's production
+# schedule. The industry classifier keeps pharma MANUFACTURERS in-ICP, so the
+# gap is at the TITLE level. Word-boundary matched (like the other title
+# families); a genuine manufacturing-ops title is rescued by the OPS_OVERRIDE
+# disjoint-span bypass. Values are operator ICP DATA, sourced from config.
+MEDICAL_REGULATORY_TITLE_KEYWORDS = _ICP.medical_regulatory_title_keywords
+
 
 def _find_first_match(
     text: str, keywords: list[str], *, word_boundary: bool
@@ -376,7 +402,37 @@ def _match_disqualifier(title_lower: str, company_lower: str) -> tuple[str, str]
     co_consult = _find_first_match(company_lower, CONSULTING_FIRM_KEYWORDS, word_boundary=True)
     if co_consult is not None:
         return ("disqualifier_consulting", co_consult[2])
-    # Title-based: pick the EARLIEST match across the four families so
+    # PR-222 Rec E company/employer families (no OPS_OVERRIDE bypass — the
+    # disqualifying fact is the employer, not the title). Competitor and
+    # freelance use word-boundary matching for their short tokens; academic /
+    # government / healthcare-provider use substring because legal-entity forms
+    # vary. Ordered AFTER state/pe/consulting so those keep priority on overlap.
+    co_competitor = _find_first_match(
+        company_lower, COMPETITOR_COMPANY_KEYWORDS, word_boundary=True
+    )
+    if co_competitor is not None:
+        return ("disqualifier_competitor", co_competitor[2])
+    co_academic = _find_first_match(
+        company_lower, ACADEMIC_COMPANY_KEYWORDS, word_boundary=False
+    )
+    if co_academic is not None:
+        return ("disqualifier_academic", co_academic[2])
+    co_government = _find_first_match(
+        company_lower, GOVERNMENT_KEYWORDS, word_boundary=False
+    )
+    if co_government is not None:
+        return ("disqualifier_government", co_government[2])
+    co_healthcare = _find_first_match(
+        company_lower, HEALTHCARE_PROVIDER_KEYWORDS, word_boundary=False
+    )
+    if co_healthcare is not None:
+        return ("disqualifier_healthcare", co_healthcare[2])
+    co_freelance = _find_first_match(
+        company_lower, FREELANCE_EMPLOYER_KEYWORDS, word_boundary=True
+    )
+    if co_freelance is not None:
+        return ("disqualifier_freelance", co_freelance[2])
+    # Title-based: pick the EARLIEST match across the families so
     # the verdict_path reflects the dominant signal in the title.
     title_matches: list[tuple[str, tuple[int, int, str]]] = []
     fin = _find_first_match(title_lower, FINANCE_KEYWORDS, word_boundary=True)
@@ -391,6 +447,15 @@ def _match_disqualifier(title_lower: str, company_lower: str) -> tuple[str, str]
     consult = _find_first_match(title_lower, CONSULTING_TITLE_KEYWORDS, word_boundary=True)
     if consult is not None:
         title_matches.append(("disqualifier_consulting", consult))
+    # PR-238: medical / regulatory / clinical-affairs title family. Behaves like
+    # the other bypassable title families — the OPS_OVERRIDE disjoint-span rule
+    # below rescues a genuine manufacturing-ops title that only incidentally
+    # carries a "medical" token (e.g. medical-device manufacturing ops).
+    medreg = _find_first_match(
+        title_lower, MEDICAL_REGULATORY_TITLE_KEYWORDS, word_boundary=True
+    )
+    if medreg is not None:
+        title_matches.append(("disqualifier_medical_regulatory", medreg))
     if not title_matches:
         return None
     slug, (dq_start, dq_end, dq_kw) = min(title_matches, key=lambda x: x[1][0])
@@ -441,6 +506,14 @@ VERDICT_PATHS: frozenset[str] = frozenset({
     "disqualifier_pe",
     "disqualifier_state_owned",
     "disqualifier_consulting",
+    # PR-222 Rec E company/employer families
+    "disqualifier_academic",
+    "disqualifier_government",
+    "disqualifier_healthcare",
+    "disqualifier_competitor",
+    "disqualifier_freelance",
+    # PR-238 medical / regulatory / clinical-affairs title family
+    "disqualifier_medical_regulatory",
 })
 
 DISQUALIFIER_VERDICT_PATHS: frozenset[str] = frozenset({
@@ -450,6 +523,14 @@ DISQUALIFIER_VERDICT_PATHS: frozenset[str] = frozenset({
     "disqualifier_pe",
     "disqualifier_state_owned",
     "disqualifier_consulting",
+    # PR-222 Rec E company/employer families
+    "disqualifier_academic",
+    "disqualifier_government",
+    "disqualifier_healthcare",
+    "disqualifier_competitor",
+    "disqualifier_freelance",
+    # PR-238 medical / regulatory / clinical-affairs title family
+    "disqualifier_medical_regulatory",
 })
 
 
@@ -948,8 +1029,19 @@ def score_prospect(
     # PR-25: ops_industrial_joint only fires when industry status is "confirmed".
     # A low_confidence or unknown classification must not trigger the combined
     # +30 bonus — that would reward an unverified industry signal.
+    #
+    # PR-230 double-count fix: the joint flag must ALSO exclude titles the role
+    # chain classifies FIRST (global-only, decision-maker) — the step-2 elif
+    # chain gives those their own role credit, but step 4's joint branch keyed
+    # on this flag alone stacked +30 ON TOP of the +28 decision-maker credit for
+    # hybrid titles ("VP General Manager ... (production)" matches both),
+    # producing totals whose breakdown didn't reconcile and deterministic passes
+    # the calibration disabled. The joint case is an INFLUENCER-tier signal; this
+    # makes the flag match the branch the role chain actually takes.
     is_ops_industrial_joint = (
-        is_influencer
+        not is_global_only
+        and not is_decision_maker
+        and is_influencer
         and is_ops_domain
         and bool(industry)
         and industry in IN_ICP_INDUSTRIES
@@ -1100,6 +1192,20 @@ def score_prospect(
         persona = _classify_persona(title)
     language = _detect_language(location, name)
 
+    # Decomposition invariant (PR-230 double-count fix): every point in the
+    # score must be attributed to exactly one component. The joint-bonus
+    # double-count shipped totals whose breakdowns didn't sum to the total —
+    # wrong scores that LOOKED explainable. Fail loud on any future drift: a
+    # breakdown that doesn't reconcile is a scoring bug, not a display bug.
+    _component_sum = sum(component_scores.values())
+    if _component_sum != score:
+        raise RuntimeError(
+            f"score_prospect decomposition does not reconcile: components sum "
+            f"to {_component_sum} but score is {score} "
+            f"(title={title!r}, breakdown={component_scores}). This is a "
+            "scoring bug — every delta must be written to component_scores."
+        )
+
     final_score = max(0, min(100, score))
     component_scores["total"] = final_score
 
@@ -1210,20 +1316,48 @@ def score_prospect(
                 # verdict_path stays None until the agent fills it in —
                 # same contract as the agent_gate staging branch below.
             elif llm_result.get("cost_exhausted"):
-                # Distinct from generic LLM error so operators see cost-
-                # ceiling breaches as their own bucket (per silent-failure-
-                # hunter HIGH). Fall back to deterministic threshold for
-                # `pass` so borderlines aren't silently dropped.
-                result["pass"] = final_score >= 60
-                result["verdict_path"] = "borderline_cost_exhausted"
+                # Cost-ceiling breach mid-run: no LLM verdict exists. Same class
+                # of infra signal as the ledger outage above — an unqualified
+                # borderline must NOT commit at the deterministic threshold
+                # (score>=60 is a coin-flip). PR-222 Rec D: fail CLOSED to
+                # STAGING, mirroring the ledger treatment — with a staging-
+                # capable caller (agent_gate: the weekly flow) the prospect
+                # lands in weekly_borderline_<date>.jsonl for operator
+                # qualification. Distinct `cost_exhausted_staged` flag so the
+                # staged bucket is greppable apart from the ledger/error
+                # buckets. Cap exhaustion never calls the LLM, so spend
+                # semantics stay fail-closed. Without a staging caller (tests)
+                # fail CLOSED to reject rather than commit unvetted at >=60.
+                if agent_gate:
+                    result["pass"] = None  # sentinel: pending agent qualification
+                    result["needs_agent_qualification"] = True
+                    result["qualification_prompt"] = render_qualification_prompt(
+                        prospect_data, persona_config,
+                    )
+                    result["cost_exhausted_staged"] = True
+                    # verdict_path stays None until the agent fills it in.
+                else:
+                    result["pass"] = False
+                    result["verdict_path"] = "borderline_cost_exhausted"
             elif llm_result.get("llm_failed"):
-                # Distinct verdict path so operators can spot transient
-                # Haiku failures and re-qualify, instead of treating them
-                # as a real reject. Fall back to deterministic threshold
-                # for the `pass` decision so borderlines aren't silently
-                # dropped — same behavior as the no-client path.
-                result["pass"] = final_score >= 60
-                result["verdict_path"] = "borderline_llm_error"
+                # Transient Haiku failure (rate-limit, parse error): no verdict
+                # exists. PR-222 Rec D: same fail-CLOSED-to-STAGING treatment as
+                # cost-exhaustion — an infra blip is not a prospect-quality
+                # signal, so stage (not commit, not silently reject) when a
+                # staging-capable caller is present. Distinct `llm_error_staged`
+                # flag for its own bucket. Without a staging caller (tests) fail
+                # CLOSED to reject rather than commit unvetted at score>=60.
+                if agent_gate:
+                    result["pass"] = None  # sentinel: pending agent qualification
+                    result["needs_agent_qualification"] = True
+                    result["qualification_prompt"] = render_qualification_prompt(
+                        prospect_data, persona_config,
+                    )
+                    result["llm_error_staged"] = True
+                    # verdict_path stays None until the agent fills it in.
+                else:
+                    result["pass"] = False
+                    result["verdict_path"] = "borderline_llm_error"
             else:
                 result["pass"] = llm_result["pass"]
                 result["verdict_path"] = "borderline_pass" if llm_result["pass"] else "borderline_reject"

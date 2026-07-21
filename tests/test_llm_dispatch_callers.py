@@ -144,8 +144,9 @@ def test_quality_gate_borderline_dispatch_timeout_routes_llm_error(
     )
     assert result["verdict_path"] == "borderline_llm_error"
     assert "LLM qualifier error" in (result.get("llm_rationale") or "")
-    # The deterministic-threshold fallback decides `pass` (score=64 >=60).
-    assert result["pass"] is True
+    # PR-222 Rec D: a non-staging caller (no agent_gate) now fails CLOSED — the
+    # borderline is rejected, never committed unvetted at score>=60.
+    assert result["pass"] is False
 
 
 def test_quality_gate_borderline_cost_exhausted_routes_distinct_path(
@@ -183,8 +184,9 @@ def test_quality_gate_borderline_cost_exhausted_routes_distinct_path(
     )
     assert result["verdict_path"] == "borderline_cost_exhausted"
     assert "cost ceiling exhausted" in (result.get("llm_rationale") or "").lower()
-    # Deterministic-threshold fallback decides `pass` (score=64 >=60).
-    assert result["pass"] is True
+    # PR-222 Rec D: without a staging caller a cost-ceiling breach fails CLOSED
+    # to a reject (never an unvetted commit), keeping its distinct verdict path.
+    assert result["pass"] is False
 
 
 # ── response_classifier.classify_reply_llm ─────────────────────────────

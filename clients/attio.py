@@ -3,6 +3,7 @@
 import logging
 import os
 import random
+import sys
 import time
 from collections.abc import Callable
 from typing import Any
@@ -346,6 +347,12 @@ class AttioClient:
         # _company_corruption_cache so the corruption lookup can hop from
         # a person id to the right cached flag.
         self._person_to_company: dict[str, str] = {}
+        # company_record_id → ISO HQ country code (upper-case) or None when the
+        # company record carries no `hq_country_code`. Populated lazily by
+        # company_hq_country_code(); mirrors _company_cache's memoization so the
+        # DM/connection language guard (PR-240) costs at most one company fetch
+        # per distinct company per run.
+        self._company_hq_country_cache: dict[str, str | None] = {}
         # Count of stage-regressing add_list_entry PATCHes the defense-in-depth
         # backstop neutralized over this client's lifetime. A batch orchestrator
         # can read this after a run and escalate if it fired — escalate() can't
@@ -660,6 +667,58 @@ class AttioClient:
             if e.response.status_code == 404:
                 return None
             raise
+
+    def company_hq_country_code(self, company_id: str) -> str | None:
+        """Return the linked company's ISO HQ country code (upper-cased),
+        or None when it can't be determined.
+
+        This is the SAME signal that seeds the entry `language` attribute
+        (scripts/backfill_language.py) — the company's `hq_country_code`
+        array — surfaced here so the DM/connection language guard (PR-240)
+        can recompute the expected language from source and compare it to
+        the stored value.
+
+        Fail-open contract: returns None (never raises) when `company_id`
+        is empty, the company record is missing, the record lacks a
+        `hq_country_code`, or the fetch errors. Callers MUST treat None as
+        "unknown — never flag a mismatch" so a sparsely-populated attribute
+        can never manufacture a false positive.
+        """
+        if not company_id:
+            return None
+        if company_id in self._company_hq_country_cache:
+            return self._company_hq_country_cache[company_id]
+
+        code: str | None = None
+        try:
+            record = self.get_company(company_id)
+            if record:
+                values = record.get("values", {})
+                country_list = values.get("hq_country_code") or []
+                if country_list:
+                    first = country_list[0]
+                    raw = (
+                        first.get("country_code", "")
+                        if isinstance(first, dict)
+                        else str(first)
+                    )
+                    raw = (raw or "").strip().upper()
+                    code = raw or None
+        except Exception as exc:  # noqa: BLE001 — fail-open contract above
+            # Fail open: a transient error — or an off-shape `hq_country_code`
+            # value (data drift) — must NOT be read as a language mismatch, and
+            # per the docstring this getter never raises. Surface on stderr (no
+            # silent swallow) and cache None so we don't hammer the API on
+            # retries this run.
+            print(
+                f"  WARN: company_hq_country_code({company_id!r}) hit "
+                f"{type(exc).__name__}: {exc}. Treating HQ country as unknown.",
+                file=sys.stderr,
+            )
+            code = None
+
+        self._company_hq_country_cache[company_id] = code
+        return code
 
     def get_list_attributes(self, list_id: str) -> list[dict]:
         """Live attribute definitions for a list

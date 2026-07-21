@@ -830,8 +830,10 @@ class TestHybridHaikuGate:
             anthropic_client=client,
         )
         assert result["verdict_path"] == "borderline_llm_error"
-        # Pass falls back to deterministic threshold, NOT the LLM's reject
-        assert result["pass"] is (result["score"] >= 60)
+        # PR-222 Rec D: a non-staging caller (explicit anthropic_client, no
+        # agent_gate) now fails CLOSED — the borderline is rejected, never
+        # committed unvetted at score>=60.
+        assert result["pass"] is False
 
     def test_llm_real_reject_sets_borderline_reject_verdict_path(self):
         """When Haiku actually returns pass=false, verdict_path is borderline_reject
@@ -906,9 +908,11 @@ class TestLedgerUnavailableRouting:
         # verdict_path stays None until the agent fills it in (staging contract).
         assert result.get("verdict_path") is None
 
-    def test_no_agent_gate_keeps_llm_error_contract(self, monkeypatch):
-        """Callers without a staging path keep the pre-existing behavior:
-        deterministic fallback + retryable borderline_llm_error verdict."""
+    def test_no_agent_gate_llm_error_fails_closed(self, monkeypatch):
+        """PR-222 Rec D: callers without a staging path now fail CLOSED — a
+        non-agent_gate LLM/ledger error rejects the borderline (never an
+        unvetted score>=60 commit) while keeping the retryable
+        borderline_llm_error verdict for operator visibility."""
         monkeypatch.setenv("OUTBOUND_USE_LLM_DISPATCH", "1")
         with patch(
             "workflows.llm_dispatch.request_llm_dispatch",
@@ -920,12 +924,14 @@ class TestLedgerUnavailableRouting:
                 agent_gate=False,
             )
         assert result["verdict_path"] == "borderline_llm_error"
-        assert result["pass"] is (result["score"] >= 60)
+        assert result["pass"] is False
 
-    def test_generic_dispatch_failure_not_staged(self, monkeypatch):
-        """A non-ledger dispatch failure (e.g. subagent timeout at the
-        parent) keeps borderline_llm_error even with agent_gate=True —
-        the fail-open is scoped to ledger infra failures only."""
+    def test_generic_dispatch_failure_stages_under_agent_gate(self, monkeypatch):
+        """PR-222 Rec D: a transient (non-ledger) dispatch failure is an infra
+        blip, not a prospect-quality signal, so with a staging-capable caller it
+        now fails OPEN to staging too — carrying the distinct `llm_error_staged`
+        flag (vs the ledger case's `ledger_unavailable`). Pre-222 this kept
+        borderline_llm_error at score>=60; that unvetted-commit path is gone."""
         from workflows.llm_dispatch import LLMDispatchFailed
         monkeypatch.setenv("OUTBOUND_USE_LLM_DISPATCH", "1")
         with patch(
@@ -937,11 +943,18 @@ class TestLedgerUnavailableRouting:
                 persona_config=self.ENTERPRISE_PERSONA,
                 agent_gate=True,
             )
-        assert result.get("needs_agent_qualification") is None
-        assert result["verdict_path"] == "borderline_llm_error"
+        assert result["needs_agent_qualification"] is True
+        assert result["pass"] is None
+        assert result["llm_error_staged"] is True
+        assert result.get("ledger_unavailable") is None
+        assert result.get("verdict_path") is None
 
-    def test_cost_exhausted_stays_fail_closed(self, monkeypatch):
-        """CostCeilingExhausted keeps its own verdict path and never stages."""
+    def test_cost_exhausted_stages_under_agent_gate(self, monkeypatch):
+        """PR-222 Rec D: a cost-ceiling breach is an INFRA signal, not a
+        prospect-quality one — with a staging-capable caller it now fails OPEN
+        to staging (mirroring the ledger treatment) instead of committing an
+        unvetted borderline at score>=60. Distinct `cost_exhausted_staged`
+        flag so the bucket stays greppable apart from the ledger case."""
         from decimal import Decimal as _D
 
         from workflows.llm_dispatch import CostCeilingExhausted as _CCE
@@ -955,7 +968,30 @@ class TestLedgerUnavailableRouting:
                 persona_config=self.ENTERPRISE_PERSONA,
                 agent_gate=True,
             )
+        assert result["needs_agent_qualification"] is True
+        assert result["pass"] is None
+        assert result["cost_exhausted_staged"] is True
+        # verdict_path stays None until the agent fills it in (staging contract).
+        assert result.get("verdict_path") is None
+
+    def test_cost_exhausted_no_agent_gate_fails_closed(self, monkeypatch):
+        """Without a staging caller a cost-ceiling breach fails CLOSED to a
+        reject (never an unvetted commit), keeping its own verdict path."""
+        from decimal import Decimal as _D
+
+        from workflows.llm_dispatch import CostCeilingExhausted as _CCE
+        monkeypatch.setenv("OUTBOUND_USE_LLM_DISPATCH", "1")
+        with patch(
+            "workflows.llm_dispatch.request_llm_dispatch",
+            side_effect=_CCE("quality_gate_haiku", _D("5.00"), _D("5.00")),
+        ):
+            result = score_prospect(
+                dict(self.BORDERLINE_PROSPECT),
+                persona_config=self.ENTERPRISE_PERSONA,
+                agent_gate=False,
+            )
         assert result.get("needs_agent_qualification") is None
+        assert result["pass"] is False
         assert result["verdict_path"] == "borderline_cost_exhausted"
 
 

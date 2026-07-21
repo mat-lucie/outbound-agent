@@ -456,3 +456,60 @@ disqualifiers:
     - head of supply chain
     - s&op
     - sales and operations planning
+
+  # ── PR-222 Rec E — high-confidence COMPANY / EMPLOYER disqualifier families ──
+  # These match the COMPANY name (not the title) and are HARD rejects with NO
+  # OPS_OVERRIDE bypass: the disqualifying fact is the employer. Competitor and
+  # freelance use word-boundary matching (short tokens); academic / government /
+  # healthcare use substring (legal-entity forms vary). Replace the placeholders
+  # below with the organization kinds you never sell into.
+
+  # Academic institutions (COMPANY-keyed, substring). A senior "innovation"
+  # title at a university is still an academic employer, not a plant buyer.
+  academic_company_keywords:
+    - university
+    - college
+    - institute of technology
+
+  # Government / public-sector employers (COMPANY-keyed, substring). Procurement
+  # runs via public tender, not cold outreach.
+  government_keywords:
+    - government of
+    - ministry of
+    - municipality of
+
+  # Healthcare providers — hospitals / clinics (COMPANY-keyed, substring). A
+  # drug/device MANUFACTURER stays in-ICP; this catches care providers only.
+  healthcare_provider_keywords:
+    - hospital
+    - clinic
+    - medical center
+
+  # Direct competitors matched on the COMPANY name (word-boundary). Distinct
+  # from the scoring-time competitor_keywords (which only withholds credit) —
+  # a competitor employer is a hard reject. Replace with your rivals' names.
+  competitor_company_keywords:
+    - competitor inc
+    - rival systems
+
+  # Freelance / no-employer placeholders (COMPANY-keyed, word-boundary). A
+  # self-employment string has no plant to sell into.
+  freelance_employer_keywords:
+    - freelance
+    - freelancer
+    - self-employed
+    - self employed
+    - independent contractor
+    - open to work
+
+  # ── PR-238 — medical / regulatory / clinical-affairs TITLE family ──
+  # TITLE-keyed (word-boundary). A pharma/biotech clinical-affairs function runs
+  # drug safety / regulatory submissions / clinical programs — not a plant's
+  # production schedule. A genuine manufacturing-ops title is rescued by the
+  # OPS_OVERRIDE disjoint-span bypass. Replace with the non-buyer functions in
+  # your target verticals, if any.
+  medical_regulatory_title_keywords:
+    - medical affairs
+    - regulatory affairs
+    - clinical operations
+    - pharmacovigilance

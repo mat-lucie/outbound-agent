@@ -87,8 +87,13 @@ class TestSlugInventory:
         #     1st-degree row committed <14d — suspected URL-variant duplicate).
         #   - manual_reply_suppressed_self_echo (detect_responses suppresses a
         #     manual-reply flip whose last message is our own DM echoed back).
-        # New count: 89 + 1 + 2 + 1 + 2 = 95.
-        assert len(ESCALATION_TYPES) == 95
+        # feat/port-qualifier-family (PR-240 port) added 1 more:
+        #   - language_mismatch (fail-closed language guard — stored `language`
+        #     disagrees with its HQ/lane-derived expected language at DM /
+        #     connection render time; skip + queue row instead of a
+        #     wrong-language send).
+        # New count: 89 + 1 + 2 + 1 + 2 + 1 = 96.
+        assert len(ESCALATION_TYPES) == 96
 
     def test_no_duplicate_slugs(self):
         assert len(ESCALATION_TYPES) == len(ESCALATION_TYPES_SET)
