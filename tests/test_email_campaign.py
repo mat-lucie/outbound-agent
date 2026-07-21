@@ -205,6 +205,66 @@ class TestRunEmailDaily:
 
     @patch("workflows.email_campaign.date")
     @patch("workflows.email_campaign._build_linkedin_collision_set")
+    def test_resend_id_captured_on_send(self, mock_collision, mock_date):
+        """PR-243: the Resend message id is stamped onto the person for
+        future thread-based reply matching."""
+        mock_date.today.return_value = date(2026, 4, 7)  # Tuesday
+        mock_date.fromisoformat = date.fromisoformat
+        mock_collision.return_value = set()
+
+        attio = MagicMock()
+        attio.search_people.side_effect = [
+            [_make_attio_person("r1", "John", "Doe", "john@acme.com", "queued")],
+            [],
+            [],
+        ]
+
+        resend = MagicMock()
+        resend.send_email.return_value = {"id": "resend-abc-123"}
+
+        run_email_daily(attio, resend, dry_run=False, auto_confirm=True)
+
+        update_args = attio.update_person.call_args[0]
+        assert update_args[1]["email_last_resend_id"] == "resend-abc-123"
+
+    @patch("workflows.email_campaign.date")
+    @patch("workflows.email_campaign._build_linkedin_collision_set")
+    def test_resend_id_400_falls_back_without_key(self, mock_collision, mock_date):
+        """PR-243: until the Attio attribute exists, a 400 on the write
+        including email_last_resend_id must retry without it — the stage
+        advance MUST land or the prospect gets a duplicate email next run."""
+        import httpx
+
+        mock_date.today.return_value = date(2026, 4, 7)  # Tuesday
+        mock_date.fromisoformat = date.fromisoformat
+        mock_collision.return_value = set()
+
+        attio = MagicMock()
+        attio.search_people.side_effect = [
+            [_make_attio_person("r1", "John", "Doe", "john@acme.com", "queued")],
+            [],
+            [],
+        ]
+
+        resp_400 = httpx.Response(400, request=httpx.Request("PATCH", "https://api.example.com/x"))
+        attio.update_person.side_effect = [
+            httpx.HTTPStatusError("400", request=resp_400.request, response=resp_400),
+            {},
+        ]
+
+        resend = MagicMock()
+        resend.send_email.return_value = {"id": "resend-abc-123"}
+
+        result = run_email_daily(attio, resend, dry_run=False, auto_confirm=True)
+
+        assert result["sent"] == 1
+        assert attio.update_person.call_count == 2
+        retry_attrs = attio.update_person.call_args_list[1][0][1]
+        assert "email_last_resend_id" not in retry_attrs
+        assert retry_attrs["email_campaign_stage"] == "email1_sent"
+
+    @patch("workflows.email_campaign.date")
+    @patch("workflows.email_campaign._build_linkedin_collision_set")
     def test_skips_collision_contacts(self, mock_collision, mock_date):
         mock_date.today.return_value = date(2026, 4, 7)  # Tuesday
         mock_date.fromisoformat = date.fromisoformat
@@ -385,3 +445,28 @@ class TestEmailPlaceholderGuard:
 
         with pytest.raises(UnresolvedPlaceholderError):
             run_email_daily(attio, resend=None, dry_run=True)
+
+
+class TestReplyScanMaps:
+    """Phase 0.6 (PR-243) stage-selection + classification maps."""
+
+    def test_reply_scan_stages_exclude_queued_and_terminals(self):
+        from models.email_campaign import REPLY_SCAN_STAGES, EmailStage
+
+        # Nothing sent yet -> not scannable.
+        assert EmailStage.QUEUED not in REPLY_SCAN_STAGES
+        # Terminal reply stages are excluded (the idempotency marker guards
+        # them anyway); scanning them would be wasted work.
+        assert EmailStage.RESPONDED not in REPLY_SCAN_STAGES
+        assert EmailStage.NOT_INTERESTED not in REPLY_SCAN_STAGES
+        assert EmailStage.UNSUBSCRIBED not in REPLY_SCAN_STAGES
+        # Everyone who received >= 1 email is scannable.
+        assert EmailStage.EMAIL1_SENT in REPLY_SCAN_STAGES
+        assert EmailStage.COMPLETED in REPLY_SCAN_STAGES
+
+    def test_classification_map_routes_negative_to_hard_stop(self):
+        from models.email_campaign import EMAIL_CLASS_TO_STAGE, EmailStage
+
+        assert EMAIL_CLASS_TO_STAGE["negative"] == EmailStage.NOT_INTERESTED
+        for cls in ("positive", "question", "neutral", "defensive"):
+            assert EMAIL_CLASS_TO_STAGE[cls] == EmailStage.RESPONDED

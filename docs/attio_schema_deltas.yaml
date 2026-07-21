@@ -1594,3 +1594,45 @@ attributes:
     status: shipped
     write_owner_module: workflows.followup_state
     note: "Deal-side twin of linkedin_outreach.awaiting_reply_nudge_count."
+
+  # ---------- People: email response detection (Phase 0.6, PR-243) ----------
+  # Provisioned by `scripts/setup_attio_schema.py --feature phase06`. OFF by
+  # default (no Gmail token => detector no-ops). The three response attrs are
+  # written via AttioWriter (§3.15 registry-gated); email_last_resend_id is
+  # written via direct attio.update_person on the email lane (registry entry
+  # exists for manifest parity only).
+  - object: people
+    slug: email_response_classification
+    type: select
+    options: [positive, question, neutral, negative, defensive]
+    pr_id: PR-243
+    status: shipped
+    write_owner_module: workflows.detect_email_responses.detect_email_responses
+    note: "Classifier verdict for a detected inbound email reply (Phase 0.6). Same taxonomy as linkedin_outreach.response_classification."
+
+  - object: people
+    slug: email_response_received_at
+    type: datetime
+    options: null
+    pr_id: PR-243
+    status: shipped
+    write_owner_module: workflows.detect_email_responses.detect_email_responses
+    note: "Gmail internalDate of the detected reply. Doubles as the Phase 0.6 idempotency marker: set => person is never re-scanned."
+
+  - object: people
+    slug: last_email_response_text
+    type: long_text
+    options: null
+    pr_id: PR-243
+    status: shipped
+    write_owner_module: workflows.detect_email_responses.detect_email_responses
+    note: "Reply body (quoted history stripped, truncated to 1000 chars). Full text lives in the auto-created CRM note."
+
+  - object: people
+    slug: email_last_resend_id
+    type: text
+    options: null
+    pr_id: PR-243
+    status: shipped
+    write_owner_module: workflows.email_campaign.run_email_daily
+    note: "Resend message id of the most recent outreach email (previously discarded). Enables future thread-id reply matching. Written via direct attio.update_person (email-lane convention, not AttioWriter); registry entry exists for manifest parity. Forward-compat: sends fall back to writing without this key until the attribute exists in the workspace."

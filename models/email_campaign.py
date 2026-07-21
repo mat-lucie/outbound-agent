@@ -53,6 +53,29 @@ NEXT_STAGE: dict[EmailStep, EmailStage] = {
 # Stages that are still "active" in the campaign (not terminal)
 ACTIVE_STAGES = {EmailStage.QUEUED, EmailStage.EMAIL1_SENT, EmailStage.EMAIL2_SENT}
 
+# Stages where the prospect has received at least one email and could reply.
+# Phase 0.6 (workflows.detect_email_responses) scans Gmail for these; QUEUED
+# is excluded (nothing sent yet), and the terminal reply stages are excluded
+# via the email_response_received_at idempotency marker anyway. (PR-243)
+REPLY_SCAN_STAGES = {
+    EmailStage.EMAIL1_SENT,
+    EmailStage.EMAIL2_SENT,
+    EmailStage.EMAIL3_SENT,
+    EmailStage.COMPLETED,
+}
+
+# Classification -> terminal stage for detected email replies. Mirrors the
+# LinkedIn map in detect_responses (negative -> hard stop; everything else
+# -> RESPONDED for a human to pick up). Email has no DEFENSIVE_HOLD
+# equivalent in v1 — defensive replies also route to RESPONDED. (PR-243)
+EMAIL_CLASS_TO_STAGE: dict[str, EmailStage] = {
+    "negative": EmailStage.NOT_INTERESTED,
+    "defensive": EmailStage.RESPONDED,
+    "positive": EmailStage.RESPONDED,
+    "question": EmailStage.RESPONDED,
+    "neutral": EmailStage.RESPONDED,
+}
+
 # Daily cap for new contacts entering the sequence
 EMAIL_DAILY_CAP = 20
 

@@ -161,6 +161,7 @@ def cli():
 )
 def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profile_scraper_id, sales_nav_profile_scraper_id, inbox_scraper_id, skip_dms, skip_followups, force_weekend, allow_stale):
     """Daily check: send connections, queue DMs, detect responses."""
+    from clients.gmail import GmailClient, GmailCredentialsMissing
     from clients.phantombuster import PhantomBusterClient
     from models.business_calendar import is_send_day, operator_today
     from models.run_mode import RunMode
@@ -180,6 +181,7 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
         MalformedDailyRunRow,
         open_daily_run,
     )
+    from workflows.detect_email_responses import detect_email_responses
     from workflows.detect_responses import NoCSVHalt, detect_responses
     from workflows.escalation import escalate
     from workflows.metrics import DailyRunMetrics
@@ -513,6 +515,53 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                         click.echo(f"Detected {resp_result.get('detected', 0)} new responses.\n")
                     else:
                         click.echo("Skipping (no PB_INBOX_SCRAPER_ID set)\n")
+
+                    # Phase 0.6: Detect email responses (Gmail read-only,
+                    # PR-243). Email counterpart of Phase 0.5 — without it,
+                    # an emailed rejection never reaches the CRM and the
+                    # sequencer keeps emailing the prospect. OFF by default:
+                    # no Gmail token => skip (Gmail is an optional data
+                    # source, not part of the CRM contract).
+                    click.echo("--- Phase 0.6: Detect Email Responses ---")
+                    if mode.is_dry_run():
+                        click.echo("Skipping (dry run)\n")
+                    elif os.environ.get("OUTBOUND_DISABLE_EMAIL_RESPONSE_DETECTION"):
+                        click.echo(
+                            "Skipping (OUTBOUND_DISABLE_EMAIL_RESPONSE_DETECTION set)\n"
+                        )
+                    else:
+                        try:
+                            gmail_client = GmailClient.from_credentials()
+                        except GmailCredentialsMissing:
+                            gmail_client = None
+                        if gmail_client is None:
+                            click.echo("Skipping (no Gmail credentials)\n")
+                        else:
+                            # detect_email_responses writes via AttioWriter +
+                            # direct update_person; stays on the raw
+                            # AttioClient, converted at the boundary like
+                            # Phase 0.5.
+                            email_resp = detect_email_responses(
+                                _attio_inner_client(crm), gmail_client,
+                            )
+                            click.echo(
+                                f"Detected {email_resp.get('detected', 0)} "
+                                f"new email responses."
+                            )
+                            # Failure/skip rollup (mirrors Phase 0.5's
+                            # end-of-phase visibility): a swallowed write or a
+                            # run of auto-reply skips must not be invisible in
+                            # the run log.
+                            for _key, _label in (
+                                ("gmail_errors", "Gmail error(s) — affected prospects retry next run"),
+                                ("attio_update_failures", "CRM write failure(s) — see stderr / attio_write_failed queue"),
+                                ("auto_generated_skipped", "auto-reply/bounce message(s) skipped"),
+                                ("no_start_timestamp", "prospect(s) unscannable — no email_campaign_started/last_sent timestamp"),
+                            ):
+                                _n = email_resp.get(_key, 0)
+                                if _n:
+                                    click.echo(f"  ⚠ {_n} {_label}", err=_key not in ("auto_generated_skipped", "no_start_timestamp"))
+                            click.echo("")
 
                     # Pipeline-starvation check (PR-43).
                     click.echo("--- Pipeline starvation check ---")

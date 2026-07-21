@@ -86,6 +86,7 @@ ESCALATION_TYPES: tuple[str, ...] = (
     "pending_pb_verification",
     "resend_delivery_failed",
     "dm_sequencing_blocked_on_reply_failure",
+    "email_response_detected",
 
     # ---- Advertiser (§4.3 + §4.7) ----
     "defensive_classification_review",
@@ -779,6 +780,26 @@ class AwaitingReplyResolvedPayload(TypedDict):
     nudge_count: int
 
 
+# ---- Salesman-daily Phase 0.6: email_response_detected payload ----
+
+
+class EmailResponseDetectedPayload(TypedDict):
+    """`email_response_detected` — Phase 0.6 detected a prospect reply to
+    an outreach email and auto-flipped their email_campaign_stage.
+
+    Emitter: workflows/detect_email_responses.py. Idempotency key is
+    `f"email-reply|{record_id}|{received_date}"`. The row is the
+    operator's cue to read the full reply (CRM note on the person) and
+    take over the thread — the agent never auto-replies to email.
+    """
+    record_id: str
+    email: str
+    classification: str
+    new_stage: str
+    reply_excerpt: str
+    detected_on: str
+
+
 class MissingLanguagePayload(TypedDict):
     """`missing_language` — emitted by consumers of
     `models.resolution.resolve_language` when the Attio `language`
@@ -1315,6 +1336,7 @@ class StaleConnectionSentPayload(TypedDict):
 # coverage as downstream PRs add their own TypedDicts.
 ESCALATION_SCHEMAS: dict[str, type] = {
     "configuration_decision": ConfigurationDecisionPayload,
+    "email_response_detected": EmailResponseDetectedPayload,
     "awaiting_reply_resolved": AwaitingReplyResolvedPayload,
     "attio_write_failed": AttioWriteFailedPayload,
     "mcp_scope_insufficient": McpScopeInsufficientPayload,
