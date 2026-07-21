@@ -1,4 +1,4 @@
-# outbound-agent
+# outbound-sales-agent
 
 A CRM-agnostic, config-driven autonomous outbound engine extracted from a
 production B2B sales system. It runs a staged LinkedIn + email cadence against
