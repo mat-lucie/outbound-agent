@@ -384,6 +384,50 @@ class TestEvaluatePipelineStarvation:
         assert out["invite_eligible_pool"] == 0
 
 
+class TestPoolMetricsMalformedScore:
+    """PR-217: `_pool_metrics` is a read-only observability pass and must not
+    crash on one corrupt quality_score. The eligibility refactor briefly flipped
+    the chain to score-gate-first with strict=True, so a malformed non-None
+    non-numeric score on a not-send-eligible PROSPECT would raise ValueError from
+    int(score) and crash the whole starvation-monitor pass. These pin the
+    restored (pre-refactor) behavior: the row is silently skipped — counted in no
+    pool and never commit-tracked — and no exception escapes."""
+
+    _TODAY = date(2026, 5, 21)
+
+    def test_malformed_score_not_send_eligible_skipped_no_raise(self):
+        # stage PROSPECT, malformed score, NOT send-eligible (merged_into loser),
+        # and it carries a commit stamp — the exact class that used to raise.
+        row = {
+            "stage": PipelineStage.PROSPECT.value,
+            "quality_score": "abc",
+            "experiment_id_frozen_at": None,
+            "merged_into": "winner-1",
+            "prospect_committed_at": "2026-05-19",
+        }
+        out = st._pool_metrics([row], self._TODAY)
+        assert out == {
+            "invite_eligible_pool": 0,
+            "quarantined_pool": 0,
+            "most_recent_commit": None,  # malformed rows are never commit-tracked
+        }
+
+    def test_malformed_score_send_eligible_skipped_no_raise(self):
+        # Same malformed score but the row IS send-eligible (plain PROSPECT):
+        # still skipped without crashing — the malformed gate fires first.
+        row = {
+            "stage": PipelineStage.PROSPECT.value,
+            "quality_score": "abc",
+            "experiment_id_frozen_at": None,
+        }
+        out = st._pool_metrics([row], self._TODAY)
+        assert out == {
+            "invite_eligible_pool": 0,
+            "quarantined_pool": 0,
+            "most_recent_commit": None,
+        }
+
+
 # ====================================================================
 # Daily-check + pre-invite-check filter behavior
 # ====================================================================
