@@ -3,9 +3,11 @@ schema max (2026-06-11 incident: 197 stale profiles → PB rejected the whole
 launch with "numberOfProfilesPerLaunch => is more than maximum" → BLIND run
 → no recheck_cache stamping → identical oversized launch every run after).
 
-The fix caps each run's scrape batch at PHASE0_MAX_PROFILES_PER_LAUNCH,
-oldest invites first, and defers the tail to subsequent runs — scraped rows
-get stamped fresh, so the tail rotates in instead of re-queueing."""
+The fix caps each run's scrape batch at PHASE0_MAX_PROFILES_PER_LAUNCH and
+defers the rest to subsequent runs — scraped rows get stamped fresh, so the
+deferred set rotates in instead of re-queueing. Within the cap the batch is
+filled NEWEST-invite first after reserving PHASE0_EXPIRING_RESERVE slots for
+the oldest about-to-expire invites (Leak-A fix, PR-209)."""
 
 from __future__ import annotations
 
@@ -156,6 +158,62 @@ def test_oldest_invites_win_the_capped_slots(monkeypatch):
     for e in oldest:
         assert e["linkedin_url"] in submitted
     assert result["deferred"] == 5
+
+
+def test_newest_invites_win_when_backlog(monkeypatch):
+    """Leak-A regression: on a backlog day the NEWEST invites must be scraped,
+    not deferred behind the older tail. Fresh acceptances cluster in the first
+    days post-invite — pure oldest-first (pre-PR-209) starved them."""
+    mid = _conn_sent_batch(PHASE0_MAX_PROFILES_PER_LAUNCH, days_ago=8)
+    newest = _conn_sent_batch(10, days_ago=1, start=900)
+    entries = mid + newest  # 60 > cap → 10 must be deferred
+    pb = _mock_pb(_csv_for(entries))
+    result, _mock_rc, sheet_calls, _mock_esc = _run_phase0(entries, pb, monkeypatch)
+
+    submitted = {row["profileUrl"] for row in sheet_calls[0]}
+    # Every newest invite is checked; the deferred band is the middle-aged tail.
+    for e in newest:
+        assert e["linkedin_url"] in submitted
+    assert result["deferred"] == len(entries) - PHASE0_MAX_PROFILES_PER_LAUNCH
+
+
+def test_expiring_reserve_still_checked_under_fresh_pressure(monkeypatch):
+    """The expiring reserve guarantees about-to-age-out invites still get a
+    last-chance check even when a large fresh pool competes for the budget."""
+    from workflows.daily_check import PHASE0_EXPIRING_RESERVE
+
+    newest = _conn_sent_batch(60, days_ago=1)
+    expiring = _conn_sent_batch(5, days_ago=13, start=900)
+    entries = newest + expiring  # expiring listed LAST: only the reserve saves them
+    pb = _mock_pb(_csv_for(entries))
+    result, _mock_rc, sheet_calls, _mock_esc = _run_phase0(entries, pb, monkeypatch)
+
+    submitted = {row["profileUrl"] for row in sheet_calls[0]}
+    for e in expiring:  # 5 expiring ≤ reserve → all protected
+        assert e["linkedin_url"] in submitted
+    assert len(expiring) <= PHASE0_EXPIRING_RESERVE
+    assert result["deferred"] == len(entries) - PHASE0_MAX_PROFILES_PER_LAUNCH
+
+
+def test_expiring_reserve_is_capped_not_unbounded(monkeypatch):
+    """When the expiring set exceeds the reserve, EXACTLY PHASE0_EXPIRING_RESERVE
+    slots go to expiring invites — the reserve is a cap, so the newest invites
+    keep the majority of the budget (regression guard against the reserve
+    growing to swallow the fresh fill)."""
+    from workflows.daily_check import PHASE0_EXPIRING_RESERVE
+
+    newest = _conn_sent_batch(40, days_ago=1)
+    expiring = _conn_sent_batch(20, days_ago=13, start=900)  # 20 > 15 reserve
+    entries = newest + expiring
+    pb = _mock_pb(_csv_for(entries))
+    result, _mock_rc, sheet_calls, _mock_esc = _run_phase0(entries, pb, monkeypatch)
+
+    submitted = {row["profileUrl"] for row in sheet_calls[0]}
+    expiring_urls = {e["linkedin_url"] for e in expiring}
+    # Reserve caps the expiring slice; the remaining 35 go newest-first.
+    assert len(submitted & expiring_urls) == PHASE0_EXPIRING_RESERVE
+    assert len(sheet_calls[0]) == PHASE0_MAX_PROFILES_PER_LAUNCH
+    assert result["deferred"] == len(entries) - PHASE0_MAX_PROFILES_PER_LAUNCH
 
 
 def test_batch_at_or_under_cap_is_untrimmed(monkeypatch, capsys):

@@ -567,8 +567,12 @@ def test_close_with_warn_succeeds_on_first_retry():
 
 def test_open_daily_run_stale_same_machine_takeover():
     """A status=running row from the SAME machine older than
-    STALE_RUN_TAKEOVER_HOURS is marked abandoned and the new run opens fresh.
-    (L4-4.)"""
+    STALE_RUN_TAKEOVER_HOURS is marked aborted and the new run opens fresh.
+    (L4-4.)
+
+    PR-210: ``aborted`` (not ``abandoned``) because the daily_run.status select
+    has no ``abandoned`` option — writing it rejects the update and re-wedges the
+    lock."""
     stale_started = (datetime.now(UTC) - timedelta(hours=STALE_RUN_TAKEOVER_HOURS + 1)).isoformat()
 
     crm = MagicMock()
@@ -602,7 +606,11 @@ def test_open_daily_run_stale_same_machine_takeover():
     obj, rid, values = crm.update_object_record.call_args_list[0][0]
     assert obj == "daily_run"
     assert rid == "stale_rec_123"
-    assert values["status"] == "abandoned"
+    assert values["status"] == "aborted"
+    # The released uniqueness_key must carry the SAME status it writes, or the
+    # row would keep the running-lock. Guards the abandoned→aborted fix (PR-210).
+    assert values["uniqueness_key"].startswith("aborted|")
+    assert values["uniqueness_key"].endswith("|stale_rec_123")
 
 
 def test_open_daily_run_cross_machine_stale_raises_concurrent():

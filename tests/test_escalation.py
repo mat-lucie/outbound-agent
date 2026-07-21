@@ -77,8 +77,13 @@ class TestSlugInventory:
         #     PROSPECT sweep flags a Pattern-A regression — a 1st-degree
         #     PROSPECT that already carries DM depth — instead of flipping it
         #     to ACCEPTED and wiping its cadence depth).
-        # New count: 89 + 1 + 2 = 92.
-        assert len(ESCALATION_TYPES) == 92
+        # feat/port-phase0-scrape (port of upstream #208) added 1 more:
+        #   - phase0_suspected_stale_degree (detect_accepted_connections
+        #     reconcile alarm — a CONNECTION_SENT row the SN scrape reports as
+        #     invite-resolved (hasPendingInvitation=false) but still not
+        #     1st-degree; the operator cross-references against LinkedIn).
+        # New count: 89 + 1 + 2 + 1 = 93.
+        assert len(ESCALATION_TYPES) == 93
 
     def test_no_duplicate_slugs(self):
         assert len(ESCALATION_TYPES) == len(ESCALATION_TYPES_SET)

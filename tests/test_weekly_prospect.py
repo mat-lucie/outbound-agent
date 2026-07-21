@@ -179,6 +179,11 @@ def _make_commit_attio_mock():
     attio.upsert_person.return_value = {"id": {"record_id": "person-X"}}
     attio.add_list_entry.return_value = None
     attio.create_note.return_value = None
+    # PR-207 default: the record is NOT yet in the pipeline list. The truth-based
+    # already-listed guard in _commit_prospect consults query_list_entries on
+    # paths that pass no in_list_record_ids snapshot (e.g. weekly_finalize_cmd);
+    # an un-stubbed MagicMock would fail normalization / read truthy.
+    attio.query_list_entries.return_value = []
     return attio
 
 
@@ -428,6 +433,99 @@ class TestCommitProspect:
                 "2026-04-19",
             )
         assert exc_info.value.response.status_code == 429
+
+
+# A raw list-entry JSON whose parent record matches the person upserted by
+# `_make_commit_attio_mock` (record_id="person-X"); parse_entry reads the
+# record_id off `id.record_id`.
+_EXISTING_RAW_ENTRY = {"id": {"record_id": "person-X", "entry_id": "entry-existing"}}
+
+
+class TestReStampTerminalGuard:
+    """Weekly must never re-stamp a record that already owns a pipeline entry.
+
+    PR-207 (re-stamp incident): `weekly_finalize_cmd` commits borderline
+    passers via `_commit_prospect` with NO `in_list_record_ids` snapshot, so the
+    snapshot-membership skip was a dead no-op on that path — an existing entry
+    got PATCHed back to a fresh stage/dm_step=0, wiping cadence depth. The guard
+    must be grounded in CRM truth, not in whether the caller built a snapshot.
+    """
+
+    def test_finalize_path_skips_restamp_of_already_listed_record(self):
+        """No caches passed (the finalize path): if the record already owns a
+        list entry, _commit_prospect must skip the add entirely — no re-stamp.
+        """
+        attio = _make_commit_attio_mock()
+        # Record already owns an entry; the finalize path passes no snapshot, so
+        # the guard queries the CRM directly and filters in-memory.
+        attio.query_list_entries.return_value = [_EXISTING_RAW_ENTRY]
+        summary: dict = {}
+
+        ok = _commit_prospect(
+            _crm(attio),
+            _PROSPECT_DATA,
+            _RAW_CSV_ROW,
+            _SCORE_RESULT,
+            "list-id",
+            "2026-06-25",
+            summary=summary,
+            # No in_list_record_ids, no existing_entries — the finalize path.
+        )
+
+        assert ok is True
+        # The existing entry must NOT be re-stamped.
+        attio.add_list_entry.assert_not_called()
+        # And it is churn, not net-new supply.
+        assert summary.get("restamped_existing") == 1
+        assert summary.get("net_new_created", 0) == 0
+
+    def test_finalize_path_skips_via_existing_entries_cache(self):
+        """When the finalize path supplies existing_entries (one list fetch, no
+        in_list_record_ids), the guard resolves membership in-memory and skips.
+        """
+        attio = _make_commit_attio_mock()
+        crm = _crm(attio)
+        existing_entry = crm._to_entry(_EXISTING_RAW_ENTRY)
+
+        ok = _commit_prospect(
+            crm,
+            _PROSPECT_DATA,
+            _RAW_CSV_ROW,
+            _SCORE_RESULT,
+            "list-id",
+            "2026-06-25",
+            existing_entries=[existing_entry],
+            # in_list_record_ids intentionally omitted (the finalize shape).
+        )
+
+        assert ok is True
+        attio.add_list_entry.assert_not_called()
+
+    def test_guard_fails_closed_when_truth_lookup_errors(self):
+        """If the no-snapshot truth lookup errors, the guard must NOT assume
+        net-new and re-stamp — it skips the commit (returns False) instead.
+        """
+        import httpx
+
+        attio = _make_commit_attio_mock()
+        attio.query_list_entries.side_effect = httpx.HTTPStatusError(
+            "rate limited",
+            request=httpx.Request("GET", "https://api.attio.com/v2/lists/x/entries"),
+            response=httpx.Response(429),
+        )
+
+        ok = _commit_prospect(
+            _crm(attio),
+            _PROSPECT_DATA,
+            _RAW_CSV_ROW,
+            _SCORE_RESULT,
+            "list-id",
+            "2026-06-25",
+            # No caches — forces the direct CRM lookup, which errors here.
+        )
+
+        assert ok is False
+        attio.add_list_entry.assert_not_called()
 
 
 class TestProspectEntryAttrsPersistence:

@@ -62,6 +62,9 @@ class TestWeeklyFinalize:
         mock_attio.__enter__ = MagicMock(return_value=mock_attio)
         mock_attio.__exit__ = MagicMock(return_value=False)
         mock_attio.upsert_person.return_value = {"id": {"record_id": "rec-abc"}}
+        # PR-207: the finalize path pre-fetches the list once for the re-stamp
+        # guard; these are net-new commits, so the list reports no entries.
+        mock_attio.query_list_entries.return_value = []
 
         with (
             patch("cli.os.environ.get", side_effect=lambda k, d="": "" if k == "ATTIO_LIST_ID" else d),
@@ -88,6 +91,9 @@ class TestWeeklyFinalize:
         mock_attio.__enter__ = MagicMock(return_value=mock_attio)
         mock_attio.__exit__ = MagicMock(return_value=False)
         mock_attio.upsert_person.return_value = {"id": {"record_id": "rec-abc"}}
+        # PR-207: the finalize path pre-fetches the list once for the re-stamp
+        # guard; these are net-new commits, so the list reports no entries.
+        mock_attio.query_list_entries.return_value = []
 
         with (
             patch("clients.attio.AttioClient", return_value=mock_attio),

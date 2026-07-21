@@ -1842,6 +1842,21 @@ def weekly_finalize_cmd(batch: str, dry_run: bool):
     missing = 0
 
     with _crm_provider() as crm:
+        # PR-207: pre-fetch the pipeline list once so the truth-based
+        # already-listed guard in _commit_prospect resolves in-memory (no
+        # per-prospect CRM scan) and a borderline already in the pipeline is
+        # never re-stamped back to a fresh stage. This CLI path passed no
+        # snapshot, so the re-stamp skip was a silent no-op (re-stamp incident).
+        existing_entries = (
+            crm.query_list_entries(list_id=list_id) if not dry_run else None
+        )
+        if existing_entries is not None:
+            # Surface the snapshot size — a suspiciously low count is the tell
+            # that the guard is running against a truncated/empty list.
+            click.echo(
+                f"  Pre-fetched {len(existing_entries)} pipeline entries for the "
+                "re-stamp guard."
+            )
         for entry in staged:
             url = entry["linkedin_url"]
             verdict = verdicts_by_url.get(url)
@@ -1890,6 +1905,7 @@ def weekly_finalize_cmd(batch: str, dry_run: bool):
                 list_id,
                 today,
                 anthropic_client=anthropic_client,
+                existing_entries=existing_entries,
             )
             if ok:
                 passed += 1

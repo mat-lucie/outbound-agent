@@ -51,7 +51,7 @@ from typing import Literal, NotRequired, TypedDict
 # work as documented.
 
 # ==================================================================
-# ESCALATION_TYPES — the 83 valid `type` values for queue rows.
+# ESCALATION_TYPES — the 84 valid `type` values for queue rows.
 # ==================================================================
 #
 # Grouping reflects the lens that owns each slug (per plan §4 lens
@@ -185,6 +185,7 @@ ESCALATION_TYPES: tuple[str, ...] = (
     # re-joins stale rows). Per-launch csvName bust prevents future
     # occurrences; this escalation surfaces any residual blind runs.
     "phase0_stale_scrape",
+    "phase0_suspected_stale_degree",
 
     # ---- Phase 0 PROSPECT sweep (Defect 2) ----
     # Emitted by workflows.daily_check.detect_accepted_connections when a
@@ -497,6 +498,24 @@ class Phase0StaleScrapePayload(TypedDict):
     dedup_marker_present: bool
     container_id: str
     log_excerpt: str
+
+
+class Phase0SuspectedStaleDegreePayload(TypedDict):
+    """`phase0_suspected_stale_degree` — emitted by
+    `workflows.daily_check.detect_accepted_connections` (PR-208) when the Sales
+    Nav scrape reports a CONNECTION_SENT row as invite-resolved
+    (hasPendingInvitation="false") yet still NOT 1st-degree. That set is
+    {declined/withdrawn invites} ∪ {accepted invites whose degree the scraper is
+    mis-reading}; the SN scraper's connectionDegree lags the live graph, so an
+    accepted connection can read "2nd" for days. Visibility only — the operator
+    cross-references against LinkedIn "My Network"; no stage change is made
+    (pending="false" alone cannot distinguish accepted from declined). Aggregated
+    to one row/day, mirroring `stale_connection_sent`.
+    """
+    run_date: str
+    backend: str
+    count: int
+    record_ids: list
 
 
 class ExperimentIdImmutabilityViolationPayload(TypedDict):
@@ -1184,6 +1203,7 @@ ESCALATION_SCHEMAS: dict[str, type] = {
     "phase0_scrape_timeout": Phase0ScrapeTimeoutPayload,
     "phase0_scrape_failed": Phase0ScrapeFailedPayload,
     "phase0_stale_scrape": Phase0StaleScrapePayload,
+    "phase0_suspected_stale_degree": Phase0SuspectedStaleDegreePayload,
     "experiment_id_immutability_violation": ExperimentIdImmutabilityViolationPayload,
     "disqualifier_match": DisqualifierMatchPayload,
     "missing_language": MissingLanguagePayload,
