@@ -1094,6 +1094,101 @@ class TestWeeklyScrapeCsvNameBust:
         assert pb.download_result_csv.call_args.kwargs.get("csv_name") == csv_name
 
 
+class TestDeepScrapeWindow:
+    """A deeper --batch-size must actually reach past the recycled top-of-search
+    window (PR-252): the numberOfProfiles cap has to track batch_size (a fixed
+    floor silently clips deep scrapes) and the completion timeout has to scale
+    with it.
+    """
+
+    def _launch(self, monkeypatch, batch_size):
+        from workflows.weekly_prospect import _launch_and_download
+
+        monkeypatch.setenv("PB_LI_SESSION_COOKIE", "cookie-abc")
+        pb = MagicMock()
+        pb.launch_agent.return_value = MagicMock()
+        pb.download_result_csv.return_value = "firstName,lastName\nA,B\n"
+        _launch_and_download(pb, "agent-1", "https://linkedin.com/sales/search/x", batch_size)
+        return pb
+
+    def test_number_of_profiles_tracks_deep_batch_size(self, monkeypatch):
+        pb = self._launch(monkeypatch, 300)
+        launch_args = pb.launch_agent.call_args.args[1]
+        assert launch_args["numberOfProfiles"] == 300
+        assert launch_args["numberOfResultsPerSearch"] == 300
+        assert launch_args["numberOfLinesPerLaunch"] == 300
+
+    def test_number_of_profiles_keeps_floor_at_default_batch(self, monkeypatch):
+        pb = self._launch(monkeypatch, 100)
+        assert pb.launch_agent.call_args.args[1]["numberOfProfiles"] == 200
+
+    def test_max_wait_scales_with_batch_size(self, monkeypatch):
+        pb = self._launch(monkeypatch, 300)
+        assert pb.wait_for_completion.call_args.kwargs.get("max_wait") == 1800
+
+    def test_max_wait_floor_at_default_batch(self, monkeypatch):
+        pb = self._launch(monkeypatch, 100)
+        assert pb.wait_for_completion.call_args.kwargs.get("max_wait") == 600
+
+
+class TestLedgerUnavailableAlarm:
+    """PR-216 deferred surfacing: when the LLM budget ledger is down mid-run the
+    qualifier fails OPEN (borderlines land in the staged artifact), and the
+    weekly run must surface a loud "LLM QUALIFIER ALARM" so an infra outage never
+    reads as a healthy run. The counter (ledger_unavailable_staged) was added
+    with the staged-fallback path; this pins the end-of-run alarm.
+    """
+
+    def test_alarm_fires_when_ledger_unavailable_staged(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        from unittest.mock import patch as _patch
+
+        import workflows.weekly_prospect as wp
+        from workflows.llm_dispatch import LLMBudgetLedgerUnavailable
+
+        monkeypatch.setenv("OUTBOUND_USE_LLM_DISPATCH", "1")
+        monkeypatch.setenv("ATTIO_LIST_ID", "list-123")
+        monkeypatch.setattr(wp, "EXPORTS_DIR", tmp_path)
+
+        personas = {
+            "operations_leaders": {
+                "enterprise_mode": True,
+                "search_size_credit": 15,
+                "search_queries": {"sn_search_urls": {"mx": "https://sn/s"}},
+            }
+        }
+        csv_text = (
+            "fullName,title,companyName,location,defaultProfileUrl\n"
+            "Test User,Plant Manager,Subsidiary,\"Mexico City, Mexico\","
+            "https://www.linkedin.com/in/test-user\n"
+        )
+        crm = MagicMock()
+        crm.query_list_entries.return_value = []
+        crm.search_person_by_linkedin.return_value = None
+        pb = MagicMock()
+
+        with _patch.object(wp, "build_anthropic_client", return_value=None), \
+             _patch.object(wp, "load_personas", return_value=personas), \
+             _patch.object(wp, "_check_all_persona_target_lists_fresh"), \
+             _patch.object(wp, "_load_in_list_canonical_urls", return_value=set()), \
+             _patch.object(wp, "_launch_and_download", return_value=csv_text), \
+             _patch(
+                 "workflows.llm_dispatch.request_llm_dispatch",
+                 side_effect=LLMBudgetLedgerUnavailable(
+                     "quality_gate_haiku", RuntimeError("attio 500")
+                 ),
+             ):
+            summary = wp.run_weekly_prospecting(
+                crm, pb, search_export_id="agent-1", dry_run=False,
+            )
+
+        assert summary["ledger_unavailable_staged"] == 1
+        err = capsys.readouterr().err
+        assert "LLM QUALIFIER ALARM" in err
+        assert "budget ledger was unavailable" in err
+
+
 class TestSupplyStarvationAlarm:
     """The keystone silent-failure fix: a run that qualifies people but sources
     zero net-new prospects must be detectable (it fires a loud operator alarm).

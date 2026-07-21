@@ -29,3 +29,9 @@ schedule:
 
 throttle:
   company_window_days: 14      # DEFAULT_THROTTLE_WINDOW_DAYS (2026-06-01: lowered 30 → 14 for throughput)
+
+scrape:
+  weekly_batch_size: 300       # deep weekly scrape window (PR-252): default --batch-size for
+                               # `weekly`. The Search Export phantom re-exports the same
+                               # top-of-search window each run, so a deeper batch is the lever
+                               # that reaches past the recycled results.

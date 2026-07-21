@@ -18,7 +18,12 @@ import click
 import httpx
 
 from clients.attio import AttioClient, _canonical_linkedin_url, first_option_title
-from clients.pb_config import li_session_cookie, li_user_agent_raw
+from clients.pb_config import (
+    li_session_cookie,
+    li_user_agent_raw,
+    scrape_max_wait,
+    scrape_profile_cap,
+)
 from models.business_calendar import add_business_days
 from models.campaign import load_personas
 from models.experiment import get_current_experiment_id
@@ -456,7 +461,9 @@ def _launch_and_download(
         "numberOfResultsPerSearch": batch_size,
         "numberOfLinesPerLaunch": batch_size,
         "removeDuplicateProfiles": True,
-        "numberOfProfiles": 200,
+        # PR-252: must track batch_size — a fixed cap below it silently clips
+        # deep scrapes back to the recycled top-of-search window.
+        "numberOfProfiles": scrape_profile_cap(batch_size),
         "csvName": csv_name,
         "identities": [{
             "sessionCookie": li_cookie,
@@ -466,7 +473,11 @@ def _launch_and_download(
     launch = pb.launch_agent(search_export_id, launch_args)
 
     click.echo("  Waiting for export to complete...")
-    pb.wait_for_completion(launch, poll_interval=15, max_wait=600)
+    # PR-252: scale so deeper scrapes don't hit a timeout sized for the old
+    # 100-row default.
+    pb.wait_for_completion(
+        launch, poll_interval=15, max_wait=scrape_max_wait(batch_size)
+    )
 
     # F-PR-5: CSV keyed to launch.container_id, not "latest". The per-launch
     # csvName MUST be passed here too, or the agent-scoped fallback fetches a
@@ -2439,6 +2450,72 @@ def _dead_signals(summary: dict, dry_run: bool) -> list[str]:
     return dead
 
 
+def _write_borderline_artifacts(
+    borderline_stage: list[dict],
+    today: str,
+    code_provenance: dict | None,
+) -> dict[str, str]:
+    """Write the staged-borderline artifacts; returns the per-lane prompts (PR-257).
+
+    The qualifier system prompt is identical for every entry in a scoring lane
+    (``render_qualification_prompt`` derives it from the lane's mode), so
+    duplicating it per row bloated the staged file — and the qualification
+    fan-out agents paid for those bytes in context. Three files are written:
+
+    - ``weekly_borderline_<date>.jsonl`` — main/forensic record; keeps
+      ``prospect_data`` + ``raw_csv_row`` for weekly-finalize, DROPS the per-row
+      ``qualification_prompt`` (pops it from the staged entries).
+    - ``..._prompts.json`` — system prompts written once, keyed by
+      ``scoring_lane`` (first-wins + loud stderr warning on an intra-lane
+      conflict, which by construction indicates a scorer bug).
+    - ``..._compact.jsonl`` — agent-facing ~350B/entry lines for the borderline
+      qualification fan-out (url, persona, language, score, lane, user payload).
+    """
+    borderline_path = EXPORTS_DIR / f"weekly_borderline_{today}.jsonl"
+    compact_path = EXPORTS_DIR / f"weekly_borderline_{today}_compact.jsonl"
+    prompts_path = EXPORTS_DIR / f"weekly_borderline_{today}_prompts.json"
+    borderline_path.parent.mkdir(parents=True, exist_ok=True)
+    lane_prompts: dict[str, str] = {}
+    with borderline_path.open("w") as f, compact_path.open("w") as cf:
+        for entry in borderline_stage:
+            if code_provenance:
+                # PR-228: each staged row records the code that scored it — a
+                # stale-checkout run is otherwise only diagnosable by forensic
+                # fingerprinting of these files.
+                entry["code_version"] = code_provenance
+            prompt = entry.pop("qualification_prompt", None) or {}
+            lane = entry.get("scoring_lane") or "default"
+            system_prompt = prompt.get("system", "")
+            if system_prompt:
+                if lane_prompts.get(lane, system_prompt) != system_prompt:
+                    click.echo(
+                        f"⚠️  BORDERLINE STAGING: conflicting system "
+                        f"prompts within lane {lane!r} — keeping the "
+                        f"first; do NOT trust {prompts_path.name} until "
+                        f"this is diagnosed.",
+                        err=True,
+                    )
+                else:
+                    lane_prompts[lane] = system_prompt
+            f.write(json.dumps(entry) + "\n")
+            cf.write(json.dumps({
+                "linkedin_url": entry["linkedin_url"],
+                "persona": entry["persona"],
+                "language": entry["language"],
+                "score": entry["score"],
+                "scoring_lane": lane,
+                "user": prompt.get("user", ""),
+            }) + "\n")
+    with prompts_path.open("w") as pf:
+        json.dump(lane_prompts, pf, ensure_ascii=False, indent=1)
+    click.echo(f"  Staged {len(borderline_stage)} borderlines → {borderline_path}")
+    click.echo(
+        f"  Agent-facing artifacts: {compact_path.name} + {prompts_path.name}"
+        f" ({len(lane_prompts)} lane prompt{'s' if len(lane_prompts) != 1 else ''})"
+    )
+    return lane_prompts
+
+
 def run_weekly_prospecting(
     crm: CRMProvider,
     pb: PhantomBusterClient,
@@ -2661,19 +2738,11 @@ def run_weekly_prospecting(
             )
         click.echo()
 
-    # Write borderline JSONL (even for dry-run — the agent wants to see them)
+    # Write borderline artifacts (even for dry-run — the agent wants to see
+    # them): the forensic main JSONL, the per-lane prompts file, and the
+    # agent-facing compact JSONL. (PR-257)
     if borderline_stage:
-        borderline_path = EXPORTS_DIR / f"weekly_borderline_{today}.jsonl"
-        borderline_path.parent.mkdir(parents=True, exist_ok=True)
-        with borderline_path.open("w") as f:
-            for entry in borderline_stage:
-                if code_provenance:
-                    # PR-228: each staged row records the code that scored it —
-                    # a stale-checkout run is otherwise only diagnosable by
-                    # forensic fingerprinting of these files.
-                    entry["code_version"] = code_provenance
-                f.write(json.dumps(entry) + "\n")
-        click.echo(f"  Staged {len(borderline_stage)} borderlines → {borderline_path}")
+        _write_borderline_artifacts(borderline_stage, today, code_provenance)
 
     if reprospect_review:
         review_path = EXPORTS_DIR / f"weekly_reprospect_review_{today}.csv"
@@ -2817,16 +2886,57 @@ def run_weekly_prospecting(
             err=True,
         )
 
+    # Loud ledger alarm (PR-216): an LLM-budget-ledger infra failure must never
+    # read as a normal run. When the ledger is down mid-run the qualifier fails
+    # OPEN (borderlines land in the staged artifact instead of being rejected
+    # with no recoverable record); a summary that only shows a larger staged
+    # count would hide the outage. Two signals are aggregated: staged-on-infra-
+    # failure (fail-open path) and any borderline_llm_error rejects (callers
+    # without a staging path, or non-ledger LLM failures).
+    ledger_staged = summary.get("ledger_unavailable_staged", 0)
+    llm_error_rejects = summary["rejected_by_path"].get("borderline_llm_error", 0)
+    if ledger_staged or llm_error_rejects:
+        click.echo("", err=True)
+        click.echo(
+            "⚠️  LLM QUALIFIER ALARM: borderline prospects could not get an "
+            "LLM verdict this run.",
+            err=True,
+        )
+        if ledger_staged:
+            click.echo(
+                f"   {ledger_staged} staged for agent qualification because "
+                "the budget ledger was unavailable (fail-open) — finalize "
+                "them via the AGENT HANDOFF steps below.",
+                err=True,
+            )
+        if llm_error_rejects:
+            click.echo(
+                f"   {llm_error_rejects} rejected with "
+                "verdict_path=borderline_llm_error (retryable) — they are "
+                "NOT staged in any artifact; they re-enter scoring on the "
+                "next weekly run.",
+                err=True,
+            )
+        click.echo(
+            "   Check the budget-ledger object and the dispatch harness "
+            "before the next run.",
+            err=True,
+        )
+
     if summary["borderline_staged"] > 0:
         n = summary["borderline_staged"]
         click.echo(f"\n=== AGENT HANDOFF — {n} borderlines staged ===")
-        click.echo(f"File: exports/weekly_borderline_{today}.jsonl")
-        click.echo("\nNext steps:")
-        click.echo("1. For each JSONL entry, call Haiku 4.5 with system+user payload.")
-        click.echo("   Model: claude-haiku-4-5-20251001, max_tokens=300.")
-        click.echo("   Parse JSON response into {pass, icp_lane, rationale}.")
-        click.echo(f"2. Write verdicts to exports/weekly_verdicts_{today}.jsonl")
-        click.echo('   (one JSON per line: {"linkedin_url": "...", "pass": bool, "icp_lane": 1|2, "rationale": "..."})')
-        click.echo(f"3. Run: python3 cli.py weekly-finalize --batch {today}")
+        click.echo(f"Rubric:  exports/weekly_borderline_{today}_prompts.json (system prompts by lane)")
+        click.echo(f"Entries: exports/weekly_borderline_{today}_compact.jsonl (agent-facing, ~350B/entry)")
+        click.echo("\nNext steps (full procedure: skills/sales-weekly/SKILL.md → AGENT HANDOFF):")
+        click.echo("1. Fan out qualification over 100-entry line ranges of the compact")
+        click.echo("   file (system prompt from the per-lane rubric) — never over the")
+        click.echo("   raw staged JSONL.")
+        click.echo(f"2. Merge chunk outputs into exports/weekly_verdicts_{today}.jsonl")
+        click.echo('   (one JSON per line: {"linkedin_url": "...", "pass": bool, "icp_lane": 1|2, "rationale": "..."});')
+        click.echo("   assert line count and linkedin_url match the staged entries 1:1.")
+        click.echo("3. Present the verdict summary; finalize via the OPERATOR-GATED path")
+        click.echo("   (/sales-finalize-borderline, or on explicit confirmation:")
+        click.echo(f"   python3 cli.py weekly-finalize --batch {today}).")
 
     return summary

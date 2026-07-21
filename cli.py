@@ -1023,7 +1023,7 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
 
 @cli.command()
 @click.option("--dry-run", is_flag=True, help="Score prospects without writing to Attio")
-@click.option("--batch-size", default=100, help="Max prospects to export")
+@click.option("--batch-size", default=lambda: load_outreach_config().weekly_scrape_batch_size, help="Max prospects to export per search (default: config/outreach.yaml → scrape.weekly_batch_size). The Search Export phantom re-exports the same top-of-search window each run; a deeper batch reaches past the recycled results.")
 @click.option("--search-export-id", default=lambda: load_pb_config().search_export_id or None, help="PhantomBuster Search Export agent ID (default: config/phantombuster.yaml → PB_SEARCH_EXPORT_ID)")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts (for cron)")
 @click.option(
