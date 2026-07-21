@@ -129,9 +129,47 @@ def load_messages() -> dict:
 
 
 def load_personas() -> dict:
-    """Load persona definitions from personas.json."""
+    """Load persona definitions from personas.json.
+
+    Validates `search_size_credit` (the search-scoped size credit consumed by
+    quality_gate.score_prospect) at load time so a config typo fails at
+    startup for every consumer — daily, weekly, and rescore — instead of
+    aborting a wet run mid-batch at the first scored prospect. (PR-227)
+    """
     with open(CONTENT_DIR / "personas.json") as f:
-        return json.load(f)
+        personas = json.load(f)
+    _size_fields = {"search_size_credit", "search_headcount_filter"}
+    for key, cfg in personas.items():
+        if not isinstance(cfg, dict):
+            continue
+        # Near-miss key detection (adversarial-QA, operator lens): a typo'd
+        # key ("search_size_credits", "search_size_cedit") would be silently
+        # ignored and the persona would abstain on size — the config-level
+        # re-run of the exact silent-default bug the 2026-07-06 RCA fixed.
+        # Catch anything that looks like an attempt at the size fields.
+        for k in cfg:
+            if k in _size_fields:
+                continue
+            if k.startswith("search_size") or k.startswith("search_headcount"):
+                close = (
+                    "search_size_credit" if "size" in k
+                    else "search_headcount_filter"
+                )
+                raise ValueError(
+                    f"personas.json: {key} has unrecognized field {k!r} — "
+                    f"did you mean {close!r}? (a typo'd key is silently "
+                    "ignored and the persona would abstain on size)"
+                )
+        credit = cfg.get("search_size_credit")
+        if credit is None:
+            continue
+        if isinstance(credit, bool) or not isinstance(credit, int) or not 0 <= credit <= 30:
+            raise ValueError(
+                f"personas.json: {key}.search_size_credit={credit!r} must be "
+                "an integer 0-30 (the size component's range — see "
+                "workflows/quality_gate.py score_prospect)."
+            )
+    return personas
 
 
 def load_targets() -> list[dict]:

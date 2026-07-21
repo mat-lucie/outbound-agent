@@ -121,6 +121,31 @@ Rules:
 - Never invent a label outside the list above."""
 
 
+def build_classifier_payload(
+    label: str,
+    *,
+    source: str = "haiku_classifier",
+    status: str = "low_confidence",
+) -> dict:
+    """Canonical CRM company write payload for a classifier-assigned industry.
+
+    Single owner of the PR-25 provenance contract shared by every writer
+    (backfill, ingest-time write-back, company CREATE stamp, and the bulk
+    apply script): ``low_confidence`` carries ``confidence=0.0`` and abstains
+    from the industry score bonus until confirmed; ``confirmed`` omits the
+    confidence stamp (the confirmation itself is the signal). (PR-225)
+    """
+    payload: dict[str, object] = {
+        "industry_vertical": label,
+        "industry_source": source,
+        "industry_classified_at": date.today().isoformat(),
+        "industry_vertical_status": status,
+    }
+    if status == "low_confidence":
+        payload["industry_vertical_confidence"] = 0.0
+    return payload
+
+
 def build_anthropic_client():
     """DEPRECATED (F-PR-9). Returns None unconditionally.
 
@@ -666,10 +691,10 @@ def backfill_missing_industries(
         "skipped": 0,
     }
 
-    # NOTE: 2000 should cover any foreseeable sales database; bump if
-    # total_scanned ever equals 2000 (means the pagination cap was hit and some
-    # companies may have been missed).
-    BACKFILL_SCAN_LIMIT = 2000
+    # NOTE: bump if total_scanned ever equals the cap (means the pagination
+    # cap was hit and some companies may have been missed). Raised 2000→10000
+    # after the 2000 cap was hit in production. (PR-225)
+    BACKFILL_SCAN_LIMIT = 10000
     all_companies = attio.search_companies(filter_=None, limit=BACKFILL_SCAN_LIMIT)
 
     summary["total_scanned"] = len(all_companies)
@@ -773,18 +798,8 @@ def backfill_missing_industries(
                 # them past the PR-25 abstain gate in quality_gate._industry_score.
                 # "low_confidence" with confidence=0.0 surfaces these to operator
                 # review (industry_low_confidence queue) for confirmation.
-                # The plumbing of status into score_prospect is a separate
-                # follow-up (see TODO at quality_gate.py:850).
-                attio.update_company(
-                    record_id,
-                    {
-                        "industry_vertical": label,
-                        "industry_source": "haiku_classifier",
-                        "industry_classified_at": date.today().isoformat(),
-                        "industry_vertical_status": "low_confidence",
-                        "industry_vertical_confidence": 0.0,
-                    },
-                )
+                # The status now plumbs into score_prospect at ingest (PR-225).
+                attio.update_company(record_id, build_classifier_payload(label))
                 summary["written"] += 1
                 if mig_run:
                     mig_run.mark_modified(record_id=record_id, object="companies")

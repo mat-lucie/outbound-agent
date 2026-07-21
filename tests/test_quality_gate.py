@@ -7,12 +7,17 @@ from workflows.quality_gate import classify_response, render_qualification_promp
 
 class TestScoreProspect:
     def test_high_score_large_company_decision_maker(self):
+        # Size is a search-level credit now (2026-07-06 RCA) — a strong
+        # decision-maker qualifies through a size-scoped persona config.
         result = score_prospect({
             "name": "Carlos Mendoza",
             "title": "VP of Operations",
             "company": "Grupo Bimbo",
             "location": "Mexico City, Mexico",
-            "employee_count": 5000,
+        }, persona_config={
+            "key": "operations_leaders",
+            "enterprise_mode": True,
+            "search_size_credit": 15,
         })
         assert result["pass"] is True
         assert result["score"] >= 60
@@ -276,15 +281,20 @@ class TestScoreProspect:
         })
         assert result["language"] == "en"
 
-    def test_employee_count_string_parsing(self):
-        result = score_prospect({
+    def test_employee_count_input_ignored(self):
+        # 2026-07-06 RCA: SN exports never carried a headcount column, so
+        # per-row employee_count is gone from scoring entirely. A leftover
+        # legacy key must not change the result.
+        base = {
             "name": "Test",
             "title": "Director of Manufacturing",
             "company": "Big Corp",
             "location": "USA",
-            "employee_count": "5001-10000",
-        })
-        assert result["score"] >= 60
+        }
+        without_key = score_prospect(dict(base))
+        with_key = score_prospect({**base, "employee_count": "5001-10000"})
+        assert with_key["score"] == without_key["score"]
+        assert with_key["score_breakdown"] == without_key["score_breakdown"]
 
     def test_score_clamped_to_100(self):
         result = score_prospect({
@@ -303,71 +313,44 @@ class TestMidMarketPersonaScoring:
     MIDMARKET_PERSONA = {
         "key": "mx_midmarket_manufacturing",
         "target_company_mode": True,
+        "search_headcount_filter": "51-200 / 201-500",
+        "search_size_credit": 15,
     }
 
-    def test_sweet_spot_passes(self):
-        """200-2000 emp + decision-maker should comfortably pass."""
+    def test_decision_maker_passes_with_search_credit(self):
+        """Decision-maker + the search's structural size credit passes.
+
+        Per-row headcount bands are gone (2026-07-06 RCA): the SN saved
+        search's headcount facet guarantees the size band, so the credit is
+        lane-level, not per-prospect."""
         result = score_prospect({
             "name": "Carlos Madrazo",
             "title": "Director de Operaciones",
             "company": "Conservas San Miguel",
             "location": "Guanajuato, Mexico",
-            "employee_count": 350,
         }, persona_config=self.MIDMARKET_PERSONA)
         assert result["pass"] is True
-        assert result["score"] >= 70
-        assert "sweet spot" in " ".join(result["reasons"]).lower()
+        assert result["score"] >= 60
+        assert "size scoped by sn search" in " ".join(result["reasons"]).lower()
         # Persona should be the triggering persona, NOT title-routed
         assert result["persona"] == "mx_midmarket_manufacturing"
 
-    def test_too_large_rejected(self):
-        """Enterprise scale should be penalized in mid-market mode."""
-        result = score_prospect({
-            "name": "Test",
-            "title": "Director de Operaciones",
-            "company": "Grupo Lala",
-            "location": "Mexico",
-            "employee_count": 8000,
-        }, persona_config=self.MIDMARKET_PERSONA)
-        assert "too large" in " ".join(result["reasons"]).lower()
-        # Even with great title, should fail or barely pass
-        assert result["score"] < 60
-
-    def test_too_small_rejected(self):
-        """SMB-scale companies should be penalized in mid-market mode."""
-        result = score_prospect({
-            "name": "Test",
-            "title": "Director de Operaciones",
-            "company": "Tiny Shop",
-            "location": "Mexico",
-            "employee_count": 30,
-        }, persona_config=self.MIDMARKET_PERSONA)
-        assert "too small" in " ".join(result["reasons"]).lower()
-
-    def test_lower_edge_passes_with_decision_maker(self):
-        """50-199 employee + decision-maker should still pass (lower edge)."""
-        result = score_prospect({
-            "name": "Test",
-            "title": "Director General",
-            "company": "Family Shop",
-            "location": "Mexico",
-            "employee_count": 150,
-        }, persona_config=self.MIDMARKET_PERSONA)
-        assert result["pass"] is True
-        assert "lower edge" in " ".join(result["reasons"]).lower()
-
-    def test_legacy_personas_unaffected(self):
-        """Without persona_config, scoring uses legacy enterprise-biased logic."""
+    def test_no_persona_config_size_abstains(self):
+        """Without persona_config there is no declared search scoping, so the
+        size component abstains (0) instead of granting a fake default —
+        the 2026-07-06 RCA killed the +10/+20/+22 unknown-size offsets."""
         result = score_prospect({
             "name": "Test",
             "title": "VP of Operations",
             "company": "Big Corp",
             "location": "Mexico City, Mexico",
-            "employee_count": 5000,
         })
-        # Legacy: 5000 employees gets +28 "Large company"
-        assert "large company" in " ".join(result["reasons"]).lower()
-        assert result["pass"] is True
+        assert result["score_breakdown"]["size"] == 0
+        joined = " ".join(result["reasons"]).lower()
+        assert "company size unknown (search not size-scoped)" in joined
+        # 0 size + 28 decision-maker + 20 non-competitor = 48 → below the
+        # 60 pass line: an unscoped source cannot pass on title alone.
+        assert result["pass"] is False
 
     def test_mid_market_gm_passes(self):
         """Gerente General at a mid-market family manufacturer is a decision-maker."""
@@ -376,11 +359,10 @@ class TestMidMarketPersonaScoring:
             "title": "Gerente General",
             "company": "Envases del Bajío",
             "location": "León, Mexico",
-            "employee_count": 400,
         }, persona_config=self.MIDMARKET_PERSONA)
         assert result["pass"] is True
         assert "decision-maker" in " ".join(result["reasons"]).lower()
-        assert "sweet spot" in " ".join(result["reasons"]).lower()
+        assert "size scoped by sn search" in " ".join(result["reasons"]).lower()
 
     def test_mid_market_gerente_geral_pt_passes(self):
         """Portuguese 'Gerente Geral' at a Brazilian mid-market manufacturer."""
@@ -389,7 +371,6 @@ class TestMidMarketPersonaScoring:
             "title": "Gerente Geral",
             "company": "Embalagens Paulista",
             "location": "Campinas, Brazil",
-            "employee_count": 600,
         }, persona_config=self.MIDMARKET_PERSONA)
         assert result["pass"] is True
         assert result["language"] == "pt"
@@ -402,37 +383,37 @@ class TestEnterprisePersonaScoring:
     ENTERPRISE_PERSONA = {
         "key": "operations_leaders",
         "enterprise_mode": True,
+        "search_headcount_filter": "501-1,000 / 1,001-5,000 / 5,001-10,000 / 10,001+",
+        "search_size_credit": 15,
     }
 
     def test_enterprise_gm_unknown_size_passes(self):
-        """GM at a multinational with unknown headcount should qualify — the
-        most common shape of a PhantomBuster enterprise export."""
+        """GM at a multinational should qualify via the search-scoped size
+        credit — the most common shape of an enterprise export."""
         result = score_prospect({
             "name": "Jorge Vazquez",
             "title": "General Manager",
             "company": "L'Oréal Brasil",
             "location": "São Paulo, Brazil",
-            "employee_count": "",
         }, persona_config=self.ENTERPRISE_PERSONA)
         assert result["pass"] is True
         joined = " ".join(result["reasons"]).lower()
-        assert "unknown company size" in joined
+        assert "size scoped by sn search" in joined
         assert "decision-maker" in joined
         # Enterprise rows are classified by title: "General Manager" → operations_leaders
         assert result["persona"] == "operations_leaders"
 
     def test_enterprise_country_head_passes(self):
-        """Regional/LATAM head at a 50k-employee parent should comfortably pass."""
+        """Regional/LATAM head at an enterprise-scoped search should pass."""
         result = score_prospect({
             "name": "Ignacio Delgado",
             "title": "Head of Manufacturing LATAM",
             "company": "Honeywell",
             "location": "Mexico City, Mexico",
-            "employee_count": 50000,
         }, persona_config=self.ENTERPRISE_PERSONA)
         assert result["pass"] is True
-        assert result["score"] >= 70
-        assert "enterprise sweet spot" in " ".join(result["reasons"]).lower()
+        assert result["score"] >= 60
+        assert "size scoped by sn search" in " ".join(result["reasons"]).lower()
 
     def test_enterprise_auto_tier_1_passes(self):
         """Auto Tier 1 enterprise plant director is now in ICP (Lane 2 only)."""
@@ -508,27 +489,6 @@ class TestEnterprisePersonaScoring:
             "employee_count": "",
         }, persona_config=self.ENTERPRISE_PERSONA)
         assert result["pass"] is False
-
-    def test_enterprise_sub_500_penalized(self):
-        """A 200-employee company is mid-market territory, not enterprise.
-        Enterprise lane should score it low AND mid-market lane should pick it up."""
-        payload = {
-            "name": "Test",
-            "title": "Plant Manager",
-            "company": "Small Multinational Branch",
-            "location": "Mexico City, Mexico",
-            "employee_count": 200,
-        }
-        enterprise_result = score_prospect(payload, persona_config=self.ENTERPRISE_PERSONA)
-        assert "below enterprise scale" in " ".join(enterprise_result["reasons"]).lower()
-        assert enterprise_result["score"] < 60
-
-        # Same prospect scored by mid-market lane should actually qualify —
-        # 200 emp is the sweet spot, Plant Manager is a domain influencer.
-        midmarket_persona = {"key": "mx_midmarket_manufacturing", "target_company_mode": True}
-        midmarket_result = score_prospect(payload, persona_config=midmarket_persona)
-        assert midmarket_result["pass"] is True
-        assert "sweet spot" in " ".join(midmarket_result["reasons"]).lower()
 
     def test_mutually_exclusive_flags_raise(self):
         """A persona_config with both flags set is a configuration bug and must
@@ -649,6 +609,7 @@ class TestHybridHaikuGate:
     ENTERPRISE_PERSONA = {
         "key": "operations_leaders",
         "enterprise_mode": True,
+        "search_size_credit": 15,
     }
 
     # ── helpers ─────────────────────────────────────────────────────
@@ -685,7 +646,11 @@ class TestHybridHaikuGate:
         client.messages.create.assert_not_called()
 
     def test_high_score_never_calls_llm(self):
-        """score > 75 must short-circuit to pass=True without invoking the LLM."""
+        """score > 75 must short-circuit to pass=True without invoking the LLM.
+
+        Shipped configs sit at search_size_credit=15 (auto-pass deliberately
+        unreachable — 2026-07-06 calibration), so this contract test injects a
+        credit above the line: 30 + 28 (decision-maker) + 20 = 78 > 75."""
         client = MagicMock()
         result = score_prospect(
             {
@@ -693,9 +658,12 @@ class TestHybridHaikuGate:
                 "title": "Director de Operaciones",
                 "company": "BigCo",
                 "location": "Mexico City, Mexico",
-                "employee_count": 5000,
             },
-            persona_config=self.ENTERPRISE_PERSONA,
+            persona_config={
+                "key": "operations_leaders",
+                "enterprise_mode": True,
+                "search_size_credit": 30,
+            },
             anthropic_client=client,
         )
         assert result["score"] > 75
@@ -996,60 +964,16 @@ class TestLedgerUnavailableRouting:
 
 
 class TestEnterpriseBandsCorrection:
-    """Tests that lock in the new enterprise-mode scoring bands (ICP correction)."""
+    """Historical class: the per-row enterprise headcount bands (and the ERP
+    company_headline bonus) were removed 2026-07-06 — SN exports never carried
+    the columns they read (see TestSearchScopedSizeCredit). Only the LATAM-
+    override coverage remains."""
 
     ENTERPRISE_PERSONA = {
         "key": "operations_leaders",
         "enterprise_mode": True,
+        "search_size_credit": 15,
     }
-
-    def test_sub_200_small_subsidiary_band(self):
-        """A <200-emp subsidiary should get the new +5 small-subsidiary band."""
-        result = score_prospect(
-            {
-                "name": "x",
-                "title": "Plant Manager",
-                "company": "Small Branch",
-                "location": "Mexico City, Mexico",
-                "employee_count": 100,
-            },
-            persona_config=self.ENTERPRISE_PERSONA,
-        )
-        assert "small subsidiary" in " ".join(result["reasons"]).lower()
-
-    def test_500_to_2000_band_raised(self):
-        """500-1999 employees should now give +22 (was +18)."""
-        result = score_prospect(
-            {
-                "name": "x",
-                "title": "Plant Manager",  # domain influencer → +24 (no industry = individual path)
-                "company": "Mid Subsidiary",
-                "location": "Mexico City, Mexico",
-                "employee_count": 800,
-            },
-            persona_config=self.ENTERPRISE_PERSONA,
-        )
-        # Domain influencer (+24) + not competitor (+20) + size band (+22) = 66.
-        # No industry set → individual role path fires, NOT the PR-23 joint case.
-        # Joint case (ops_in_industrial +30) only fires when industry ∈ IN_ICP_INDUSTRIES.
-        assert result["score"] == 66
-
-    def test_erp_bonus_applied(self):
-        """ERP signal in company_headline should add +5."""
-        base_payload = {
-            "name": "x",
-            "title": "Plant Manager",
-            "company": "Generic Industries",
-            "location": "Mexico City, Mexico",
-            "employee_count": 3000,
-        }
-        without_erp = score_prospect(base_payload, persona_config=self.ENTERPRISE_PERSONA)
-        with_erp = score_prospect(
-            {**base_payload, "company_headline": "We run SAP S/4HANA across our plants"},
-            persona_config=self.ENTERPRISE_PERSONA,
-        )
-        assert with_erp["score"] == without_erp["score"] + 5
-        assert any("erp signal" in r.lower() for r in with_erp["reasons"])
 
     def test_latam_override_includes_chile_peru_colombia(self):
         """'Global Operations Chile' is a regional role, not out-of-scope."""
@@ -1060,7 +984,6 @@ class TestEnterpriseBandsCorrection:
                     "title": f"Global Operations {country}",
                     "company": "Multinational Corp",
                     "location": "Santiago, Chile",
-                    "employee_count": 50000,
                 },
                 persona_config=self.ENTERPRISE_PERSONA,
             )
@@ -1081,23 +1004,23 @@ class TestAgentGate:
     ENTERPRISE_PERSONA = {
         "key": "operations_leaders",
         "enterprise_mode": True,
+        "search_size_credit": 15,
     }
     MIDMARKET_PERSONA = {
         "key": "mx_midmarket_manufacturing",
         "target_company_mode": True,
+        "search_size_credit": 15,
     }
 
     # Borderline prospect (enterprise mode, no industry set):
-    # below-enterprise-scale +5, plant manager +24 (individual path, no industry), not competitor +20 = 49.
-    # Note: no industry → joint ops_in_industrial case does NOT fire; individual role +24 applies.
-    # With in-ICP industry this would be: below-enterprise +5 + ops_in_industrial +30 + competitor +20 = 55
-    # (still borderline).
+    # search size credit +15, plant manager +24 (individual path, no industry),
+    # not competitor +20 = 59 (borderline). No industry → the joint
+    # ops_in_industrial case does NOT fire; individual role +24 applies.
     BORDERLINE_PROSPECT = {
         "name": "Test User",
         "title": "Plant Manager",
         "company": "Subsidiary",
         "location": "Mexico City, Mexico",
-        "employee_count": 200,
     }
 
     def test_borderline_agent_gate_true_no_client_returns_sentinel(self):
@@ -1179,13 +1102,16 @@ class TestAgentGate:
         assert "Persona mode: legacy" in prompt["user"]
 
     def test_render_qualification_prompt_includes_all_fields(self):
-        """render_qualification_prompt user content includes all prospect fields."""
+        """render_qualification_prompt user content includes all prospect fields.
+
+        Employee count left the prompt 2026-07-06: the weekly path never sets
+        it (SN exports carry no headcount column), so the line rendered a
+        permanent 'unknown' — dead prompt weight."""
         prospect = {
             "name": "Carlos Mendez",
             "title": "VP Operations",
             "company": "Grupo Industrial",
             "location": "Monterrey, Mexico",
-            "employee_count": 2500,
         }
         prompt = render_qualification_prompt(prospect, None)
         user = prompt["user"]
@@ -1193,7 +1119,7 @@ class TestAgentGate:
         assert "VP Operations" in user
         assert "Grupo Industrial" in user
         assert "Monterrey, Mexico" in user
-        assert "2500" in user
+        assert "Employee count" not in user
 
 
 class TestIndustryAwareScoring:
@@ -1202,6 +1128,7 @@ class TestIndustryAwareScoring:
     MIDMARKET_PERSONA = {
         "key": "mx_midmarket_manufacturing",
         "target_company_mode": True,
+        "search_size_credit": 15,
     }
 
     def _base_prospect(self, **overrides) -> dict:
@@ -1210,25 +1137,28 @@ class TestIndustryAwareScoring:
             "title": "Director de Operaciones",
             "company": "Conservas San Miguel",
             "location": "Guanajuato, Mexico",
-            "employee_count": 350,
         }
         base.update(overrides)
         return base
 
     def test_in_icp_industry_boosts_score(self):
-        """In-ICP industry adds +12, lifting modal 70 → 82 (strong-pass band)."""
+        """In-ICP industry adds +12, lifting the DM baseline 63 → 75.
+
+        75 is deliberately NOT > 75: at the shipped search_size_credit=15 the
+        deterministic auto-pass stays off (2026-07-06 calibration), so the best
+        hand still routes to the LLM band."""
         baseline = score_prospect(self._base_prospect(), persona_config=self.MIDMARKET_PERSONA)
         boosted = score_prospect(
             self._base_prospect(industry="Food & Beverage"),
             persona_config=self.MIDMARKET_PERSONA,
         )
         assert boosted["score"] == baseline["score"] + 12
-        assert boosted["score"] >= 75
-        assert boosted["verdict_path"] == "target_pass"
+        assert boosted["score"] == 75
+        assert boosted["verdict_path"] == "borderline_pass"
         assert any("In-ICP" in r for r in boosted["reasons"])
 
     def test_off_icp_industry_drops_below_dm_threshold(self):
-        """Off-ICP ('Other') applies -25 penalty, dropping pass-eligible 70 below 60."""
+        """Off-ICP ('Other') applies -25 penalty, dropping pass-eligible below 60."""
         baseline = score_prospect(self._base_prospect(), persona_config=self.MIDMARKET_PERSONA)
         penalized = score_prospect(
             self._base_prospect(industry="Other"),
@@ -1236,7 +1166,10 @@ class TestIndustryAwareScoring:
         )
         assert penalized["score"] == baseline["score"] - 25
         assert penalized["score"] < 60
-        # 70 - 25 = 45 → borderline_reject (40-75 band, no anthropic_client)
+        # 63 - 25 = 38: under 40, but the prospect is a DECISION-MAKER whose
+        # drop below the line is entirely the industry penalty — the
+        # adversarial-QA rescue routes that cell to the LLM band instead of
+        # a silent deterministic reject (no client here → borderline_reject).
         assert penalized["verdict_path"] == "borderline_reject"
 
     def test_unknown_industry_is_neutral(self):
@@ -1262,7 +1195,6 @@ class TestIndustryAwareScoring:
         # the clamping behavior, not the path attribution.
         weak = self._base_prospect(
             title="Machine Operator",     # low role-fit, no IC keyword
-            employee_count=30,            # too small for mid-market
             industry="Other",             # -25
         )
         result = score_prospect(weak, persona_config=self.MIDMARKET_PERSONA)
@@ -1280,7 +1212,7 @@ class TestIndustryAwareScoring:
         )
         breakdown = result["score_breakdown"]
         assert breakdown["industry"] == 12
-        assert breakdown["size"] == 28      # 350 emp = sweet spot
+        assert breakdown["size"] == 15      # search_size_credit from persona config
         assert breakdown["role"] == 28      # Director = decision-maker
         assert breakdown["competitor"] == 20  # not a competitor
         assert breakdown["total"] == result["score"]
@@ -1311,10 +1243,12 @@ class TestRoleIndustryOrthogonality:
     ENTERPRISE_PERSONA = {
         "key": "operations_leaders",
         "enterprise_mode": True,
+        "search_size_credit": 15,
     }
     MIDMARKET_PERSONA = {
         "key": "mx_midmarket_manufacturing",
         "target_company_mode": True,
+        "search_size_credit": 15,
     }
 
     def _enterprise_prospect(self, **overrides) -> dict:
@@ -1323,7 +1257,6 @@ class TestRoleIndustryOrthogonality:
             "title": "Plant Manager",
             "company": "Alimentos Norte",
             "location": "Monterrey, Mexico",
-            "employee_count": 800,   # smaller than enterprise sweet spot → +22
         }
         base.update(overrides)
         return base
@@ -1335,16 +1268,17 @@ class TestRoleIndustryOrthogonality:
             persona_config=self.ENTERPRISE_PERSONA,
         )
         breakdown = result["score_breakdown"]
-        # size=22 + ops_in_industrial=30 + competitor=20 = 72
-        assert result["score"] == 72
+        # size=15 (search credit) + ops_in_industrial=30 + competitor=20 = 65
+        assert result["score"] == 65
         assert breakdown["ops_in_industrial"] == 30
         assert breakdown["role"] == 0
         assert breakdown["industry"] == 0
         assert breakdown["total"] == result["score"]
-        # Defense-in-depth: 72 must land in the 60-75 borderline-pass band,
+        # Defense-in-depth: 65 must land in the 60-75 borderline-pass band,
         # NOT the >75 deterministic-pass band.  A regression that restored the
-        # old +36 additive would push the score back to 78 and silently skip
-        # the LLM gate — this assertion would catch that.
+        # old +36 additive would push the score to 71 — still borderline, but
+        # the breakdown asserts above pin the joint shape; the verdict assert
+        # locks the band.
         assert result["verdict_path"] == "borderline_pass"
 
     def test_joint_case_reason_is_single_combined_string(self):
@@ -1390,8 +1324,8 @@ class TestRoleIndustryOrthogonality:
             persona_config=self.ENTERPRISE_PERSONA,
         )
         breakdown = result["score_breakdown"]
-        # size=22 + role=24 + competitor=20 = 66
-        assert result["score"] == 66
+        # size=15 (search credit) + role=24 + competitor=20 = 59
+        assert result["score"] == 59
         assert breakdown["role"] == 24
         assert breakdown["industry"] == 0
         # Joint key is always present (invariant shape); 0 means non-joint path fired.
@@ -1410,7 +1344,6 @@ class TestRoleIndustryOrthogonality:
                 "title": "Director de Manufactura",
                 "company": "Acme Foods",
                 "location": "Monterrey, Mexico",
-                "employee_count": 800,
                 "industry": "Food & Beverage",
             },
             persona_config=self.ENTERPRISE_PERSONA,
@@ -1419,8 +1352,8 @@ class TestRoleIndustryOrthogonality:
         assert breakdown["role"] == 28      # decision-maker
         assert breakdown["industry"] == 12  # individual industry bonus preserved
         assert breakdown["ops_in_industrial"] == 0  # invariant shape; 0 means non-joint
-        # size=22 + role=28 + competitor=20 + industry=12 = 82
-        assert result["score"] == 82
+        # size=15 (search credit) + role=28 + competitor=20 + industry=12 = 75
+        assert result["score"] == 75
 
     def test_generic_influencer_at_icp_industry_keeps_individual_paths(self):
         """Generic influencer (no ops/digi domain) + in-ICP industry → +18 + +12 = +30.
@@ -1434,7 +1367,6 @@ class TestRoleIndustryOrthogonality:
                 "title": "Team Lead",
                 "company": "Pharma Corp",
                 "location": "Mexico City, Mexico",
-                "employee_count": 800,
                 "industry": "Pharma",
             },
             persona_config=self.ENTERPRISE_PERSONA,
@@ -1443,8 +1375,8 @@ class TestRoleIndustryOrthogonality:
         assert breakdown["role"] == 18      # generic influencer, no domain
         assert breakdown["industry"] == 12  # individual industry bonus
         assert breakdown["ops_in_industrial"] == 0  # invariant shape; 0 means non-joint
-        # size=22 + role=18 + competitor=20 + industry=12 = 72
-        assert result["score"] == 72
+        # size=15 (search credit) + role=18 + competitor=20 + industry=12 = 65
+        assert result["score"] == 65
 
     def test_digi_influencer_at_icp_industry_keeps_individual_paths(self):
         """NARROW interp: digi-domain influencer + in-ICP industry → +24 + +12 = +36.
@@ -1460,7 +1392,6 @@ class TestRoleIndustryOrthogonality:
                 "title": "Digital Transformation Manager",
                 "company": "Alimentos Norte",
                 "location": "Monterrey, Mexico",
-                "employee_count": 800,
                 "industry": "Food & Beverage",
             },
             persona_config=self.ENTERPRISE_PERSONA,
@@ -1469,8 +1400,8 @@ class TestRoleIndustryOrthogonality:
         assert breakdown["role"] == 24      # digi-domain influencer (+24, unchanged)
         assert breakdown["industry"] == 12  # individual industry bonus (+12, unchanged)
         assert breakdown["ops_in_industrial"] == 0  # NARROW: digi never fires joint
-        # size=22 + role=24 + competitor=20 + industry=12 = 78 (NARROW: no joint)
-        assert result["score"] == 78
+        # size=15 (search credit) + role=24 + competitor=20 + industry=12 = 71 (NARROW: no joint)
+        assert result["score"] == 71
 
     def test_ops_influencer_at_off_icp_industry_uses_individual_penalty(self):
         """Ops influencer + off-ICP ('Other') → +24 (role) + -25 (industry) = -1 net.
@@ -1486,8 +1417,8 @@ class TestRoleIndustryOrthogonality:
         assert breakdown["role"] == 24       # individual role path
         assert breakdown["industry"] == -25  # individual off-ICP penalty
         assert breakdown["ops_in_industrial"] == 0  # off-ICP never fires joint
-        # size=22 + role=24 + competitor=20 + industry=-25 = 41
-        assert result["score"] == 41
+        # size=15 (search credit) + role=24 + competitor=20 + industry=-25 = 34
+        assert result["score"] == 34
 
     def test_ops_influencer_at_unknown_industry_uses_individual_role(self):
         """Ops influencer + unknown industry label → +24 (role) + 0 (industry).
@@ -1504,8 +1435,8 @@ class TestRoleIndustryOrthogonality:
         assert breakdown["role"] == 24
         assert breakdown["industry"] == 0
         assert breakdown["ops_in_industrial"] == 0  # unknown industry never fires joint
-        # size=22 + role=24 + competitor=20 + industry=0 = 66
-        assert result["score"] == 66
+        # size=15 (search credit) + role=24 + competitor=20 + industry=0 = 59
+        assert result["score"] == 59
 
     def test_joint_case_reduces_over_count_relative_to_additive(self):
         """Joint combined bonus (+30) is strictly less than old additive (+36)."""
@@ -1599,3 +1530,196 @@ class TestRoleIndustryOrthogonality:
         assert breakdown["ops_in_industrial"] == 0
         assert breakdown["role"] == 24
         assert breakdown["industry"] == 0
+
+
+class TestSearchScopedSizeCredit:
+    """2026-07-06 RCA fix: company size is a lane-level structural credit
+    declared in the persona config (the SN saved search's headcount facet is
+    the size signal), never a per-row lookup. No config → abstain. (PR-227)"""
+
+    def _dm_prospect(self, **overrides) -> dict:
+        base = {
+            "name": "Test",
+            "title": "Director de Operaciones",
+            "company": "Acme Foods",
+            "location": "Monterrey, Mexico",
+        }
+        base.update(overrides)
+        return base
+
+    def test_credit_applied_with_reason_and_component(self):
+        result = score_prospect(self._dm_prospect(), persona_config={
+            "key": "operations_leaders",
+            "enterprise_mode": True,
+            "search_size_credit": 15,
+            "search_headcount_filter": "501-1,000 / 1,001+",
+        })
+        assert result["score_breakdown"]["size"] == 15
+        joined = " ".join(result["reasons"])
+        assert "Size scoped by SN search (+15)" in joined
+        assert "501-1,000 / 1,001+" in joined
+
+    def test_no_credit_key_abstains(self):
+        result = score_prospect(self._dm_prospect(), persona_config={
+            "key": "operations_leaders",
+            "enterprise_mode": True,
+        })
+        assert result["score_breakdown"]["size"] == 0
+        assert any("abstained" in r for r in result["reasons"])
+
+    def test_no_persona_config_abstains(self):
+        result = score_prospect(self._dm_prospect())
+        assert result["score_breakdown"]["size"] == 0
+        assert any("abstained" in r for r in result["reasons"])
+
+    def test_credit_out_of_range_raises(self):
+        import pytest
+        for bad in (31, -1):
+            with pytest.raises(ValueError, match="search_size_credit"):
+                score_prospect(self._dm_prospect(), persona_config={
+                    "key": "operations_leaders",
+                    "enterprise_mode": True,
+                    "search_size_credit": bad,
+                })
+
+    def test_shipped_credit_15_keeps_autopass_off(self):
+        """Calibration gate (2026-07-06): the DM + confirmed in-ICP industry
+        cell measured below the 80% enable bar — so the shipped credit of 15
+        lands the best possible hand on exactly 75, which is NOT > 75:
+        everything still routes through the LLM band."""
+        result = score_prospect(
+            self._dm_prospect(industry="Food & Beverage",
+                              industry_vertical_status="confirmed"),
+            persona_config={
+                "key": "operations_leaders",
+                "enterprise_mode": True,
+                "search_size_credit": 15,
+            })
+        assert result["score"] == 75          # 15 + 28 + 20 + 12
+        assert result["verdict_path"] == "borderline_pass"
+
+    def test_credit_above_reachability_line_enables_autopass(self):
+        """The enable lever: any credit >= 16 makes DM + confirmed in-ICP
+        industry cross 75. Raise personas.json only with fresh calibration
+        evidence (>= 80% precision in the auto-pass cell)."""
+        result = score_prospect(
+            self._dm_prospect(industry="Food & Beverage",
+                              industry_vertical_status="confirmed"),
+            persona_config={
+                "key": "operations_leaders",
+                "enterprise_mode": True,
+                "search_size_credit": 22,
+            })
+        assert result["score"] == 82          # 22 + 28 + 20 + 12
+        assert result["verdict_path"] == "enterprise_pass"
+
+    def test_low_confidence_industry_still_abstains_from_autopass(self):
+        """PR-25 abstain composes with the credit: an ingest-classified
+        (low_confidence) label contributes 0, so even a high credit cannot
+        auto-pass on an unverified industry signal."""
+        result = score_prospect(
+            self._dm_prospect(industry="Food & Beverage",
+                              industry_vertical_status="low_confidence"),
+            persona_config={
+                "key": "operations_leaders",
+                "enterprise_mode": True,
+                "search_size_credit": 22,
+            })
+        assert result["score"] == 70          # 22 + 28 + 20 + 0
+        assert result["verdict_path"] in ("borderline_pass", "borderline_reject")
+
+
+class TestDeterministicGeometryConstants:
+    """The reachability line and pass-path registry are derived/shared, not
+    re-encoded literals (2026-07-06 code-review findings). (PR-227)"""
+
+    def test_pass_paths_subset_of_registry(self):
+        from workflows.quality_gate import DETERMINISTIC_PASS_PATHS, VERDICT_PATHS
+        assert DETERMINISTIC_PASS_PATHS <= VERDICT_PATHS
+
+    def test_reachability_boundary_behavior(self):
+        """Behavior-derived boundary tie: at MIN-1 the best hand lands exactly
+        on the threshold (borderline); at MIN it crosses (deterministic pass).
+        If any geometry constant changes without the derivation following,
+        this breaks loudly."""
+        from workflows.weekly_prospect import DETERMINISTIC_REACHABLE_MIN_CREDIT
+        best_hand = {
+            "name": "Test",
+            "title": "Director de Operaciones",   # decision-maker
+            "company": "Acme Foods",               # non-competitor
+            "location": "Monterrey, Mexico",
+            "industry": "Food & Beverage",         # confirmed in-ICP
+            "industry_vertical_status": "confirmed",
+        }
+        def cfg(credit):
+            return {"key": "operations_leaders", "enterprise_mode": True,
+                    "search_size_credit": credit}
+        at_line = score_prospect(best_hand, persona_config=cfg(DETERMINISTIC_REACHABLE_MIN_CREDIT))
+        below_line = score_prospect(best_hand, persona_config=cfg(DETERMINISTIC_REACHABLE_MIN_CREDIT - 1))
+        assert at_line["verdict_path"] == "enterprise_pass"
+        assert below_line["verdict_path"] == "borderline_pass"
+
+    def test_non_numeric_credit_raises_actionable_error(self):
+        import pytest
+        with pytest.raises(ValueError, match="search_size_credit"):
+            score_prospect({
+                "name": "Test", "title": "Director", "company": "Acme",
+                "location": "Mexico",
+            }, persona_config={
+                "key": "operations_leaders", "enterprise_mode": True,
+                # the plausible typo: headcount facet string pasted into credit
+                "search_size_credit": "501-1,000",
+            })
+
+
+class TestDmOffIcpRescue:
+    """Adversarial-QA (pipeline-leakage lens): a decision-maker pushed under
+    the 40 reject line SOLELY by the off-ICP industry penalty routes to the
+    LLM band instead of a silent deterministic reject. (PR-227)"""
+
+    CFG = {"key": "operations_leaders", "enterprise_mode": True,
+           "search_size_credit": 15}
+
+    def test_dm_at_confirmed_other_stages_for_llm(self):
+        result = score_prospect({
+            "name": "Test", "title": "Director de Operaciones",
+            "company": "Grupo Conglomerado",
+            "location": "Monterrey, Mexico",
+            "industry": "Other", "industry_vertical_status": "confirmed",
+        }, persona_config=self.CFG, agent_gate=True)
+        # 15 + 28 + 20 - 25 = 38 — under 40, but the penalty was decisive.
+        assert result["score"] == 38
+        assert result["verdict_path"] != "deterministic_reject"
+        assert result.get("needs_agent_qualification") is True
+
+    def test_non_dm_at_confirmed_other_still_rejects(self):
+        result = score_prospect({
+            "name": "Test", "title": "Production Supervisor",
+            "company": "Servicios Generales",
+            "location": "Monterrey, Mexico",
+            "industry": "Other", "industry_vertical_status": "confirmed",
+        }, persona_config=self.CFG, agent_gate=True)
+        assert result["score"] < 40
+        assert result["verdict_path"] == "deterministic_reject"
+
+    def test_dm_below_40_with_decisive_penalty_reaches_llm(self):
+        # A decision-maker whose drop below 40 is entirely the industry
+        # penalty reaches the LLM whenever the penalty is decisive, regardless
+        # of size credit (no persona config → size 0).
+        result = score_prospect({
+            "name": "Test", "title": "Director de Operaciones",
+            "company": "Acme",
+            "location": "Monterrey, Mexico",
+            "industry": "Other", "industry_vertical_status": "confirmed",
+        }, agent_gate=True)
+        # 0 + 28 + 20 - 25 = 23; without the penalty it would be 48 >= 40,
+        # so the rescue applies.
+        assert result.get("needs_agent_qualification") is True
+
+    def test_scale_version_stamped_in_breakdown(self):
+        from workflows.quality_gate import SCORING_SCALE_VERSION
+        result = score_prospect({
+            "name": "Test", "title": "Director de Operaciones",
+            "company": "Acme Foods", "location": "Monterrey, Mexico",
+        }, persona_config=self.CFG)
+        assert result["score_breakdown"]["scale_version"] == SCORING_SCALE_VERSION

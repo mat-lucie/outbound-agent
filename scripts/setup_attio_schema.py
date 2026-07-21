@@ -23,6 +23,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from clients.attio import AttioClient  # noqa: E402
+from workflows.quality_gate import VERDICT_PATHS  # noqa: E402
 
 
 # Spec: each entry is (parent_kind, parent_id_or_slug, attribute body).
@@ -122,6 +123,36 @@ def _build_specs(list_id: str) -> list[tuple[str, str, dict]]:
             },
         ),
         (
+            "object",
+            "companies",
+            {
+                "title": "Industry Vertical Status",
+                "api_slug": "industry_vertical_status",
+                "type": "select",
+                "is_required": False,
+                "is_unique": False,
+                "is_multiselect": False,
+                "default_value": None,
+                "config": {},
+                "description": "PR-25 confidence status of industry_vertical: confirmed / unknown / low_confidence. Only 'confirmed' unlocks the ops_industrial_joint bonus in the scorer.",
+            },
+        ),
+        (
+            "object",
+            "companies",
+            {
+                "title": "Industry Vertical Confidence",
+                "api_slug": "industry_vertical_confidence",
+                "type": "number",
+                "is_required": False,
+                "is_unique": False,
+                "is_multiselect": False,
+                "default_value": None,
+                "config": {},
+                "description": "Classifier confidence (0.0-1.0) for industry_vertical. Backfilled classifier labels write 0.0 until operator-confirmed.",
+            },
+        ),
+        (
             # PR-240 language guard: the HQ country code is the canonical source
             # the fail-closed language guard (workflows.daily_check.
             # expected_language_for_entry) re-derives the expected DM language
@@ -145,17 +176,14 @@ def _build_specs(list_id: str) -> list[tuple[str, str, dict]]:
 
 
 # Select options to seed after attribute creation.
+# verdict_path options come from the canonical VERDICT_PATHS registry in
+# quality_gate so newly added scorer branches (e.g. the disqualifier_* slugs)
+# are seeded automatically on the next run instead of drifting. (PR-225)
 SELECT_OPTIONS: dict[tuple[str, str], list[str]] = {
     ("list", "scoring_lane"): ["target_company_mode", "enterprise_mode", "legacy"],
-    ("list", "verdict_path"): [
-        "target_pass",
-        "enterprise_pass",
-        "borderline_pass",
-        "borderline_reject",
-        "borderline_llm_error",
-        "deterministic_reject",
-    ],
+    ("list", "verdict_path"): sorted(VERDICT_PATHS),
     ("object", "industry_source"): ["haiku_classifier", "claude_session", "pb_scrape", "manual"],
+    ("object", "industry_vertical_status"): ["confirmed", "unknown", "low_confidence"],
 }
 
 

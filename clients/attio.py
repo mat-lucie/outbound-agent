@@ -300,6 +300,21 @@ def _linkedin_url_variants(url: str) -> list[str]:
     return out
 
 
+def first_option_title(raw) -> str:
+    """Extract the first option title from a CRM select-attribute value list.
+
+    Canonical parser for record select attrs shaped
+    ``[{"option": {"title": "Food & Beverage"}}]`` (e.g. ``industry_vertical``,
+    ``industry_vertical_status``). Returns ``""`` for None/empty/malformed
+    values. (PR-225)
+    """
+    if raw and isinstance(raw, list) and isinstance(raw[0], dict):
+        opt = raw[0].get("option") or {}
+        if isinstance(opt, dict):
+            return str(opt.get("title", "") or "")
+    return ""
+
+
 class AttioClient:
     """Client for the Attio REST API v2."""
 
