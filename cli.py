@@ -789,7 +789,8 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
     help="Proceed with a wet run even when the checkout is behind origin/main "
          "(the staleness is still stamped into the run's provenance).",
 )
-def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, force_weekend, allow_stale):
+@click.option("--exclude", "exclude_ids", multiple=True, help="entry_id or record_id to skip this run (repeatable)")
+def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, force_weekend, allow_stale, exclude_ids):
     """Send-DMs phase: reattach to today's daily_run row and send Part B only.
 
     Runs ONLY after `daily --yes --skip-dms` opened the day. `--dry-run`
@@ -992,6 +993,7 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
                         dry_run=dry_run, auto_confirm=yes, cache=cache,
                         audit_logger=audit_logger,
                         daily_run=daily_run,
+                        exclude_ids=set(exclude_ids),
                     )
                     click.echo(f"\nCode: {format_provenance(code_provenance)}")
             except NoDailyRunRow as exc:

@@ -431,4 +431,133 @@ def test_cancel_at_confirm_gate_does_not_send(
     )
     pb.launch_agent.assert_not_called()
     attio.update_list_entry.assert_not_called()
-    attio.update_company.assert_not_called()
+
+
+# ── PR-237: per-run operator exclusions (--exclude) ─────────────────────────
+
+
+@patch.dict(os.environ, {"ATTIO_LIST_ID": "list-001", "ATTIO_API_KEY": "fake", "PHANTOMBUSTER_API_KEY": "fake",
+                          "PB_LI_SESSION_COOKIE": "fake-cookie", "PB_LI_USER_AGENT": "TestAgent/1.0",
+                          "GSHEET_AUTOCONNECT_ID": "fake-sheet-id"})
+@patch("workflows.daily_check._get_all_entries_with_raw")
+@patch("workflows.daily_check.write_prospects_to_sheet", return_value="https://sheet/x")
+@patch("workflows.daily_check._pb_session_args", return_value={})
+class TestSendDmsExcludeFilter:
+    """PR-237: `exclude_ids` drops matching entry_id/record_id rows from the
+    DM-due selection for this run only, in BOTH the wet queue and the dry-run
+    preview. This fork is machine-keyed (no ownership claim layer), so the
+    filter simply prunes the parsed pool before selection."""
+
+    def _setup_cache(self):
+        cache = MagicMock()
+        cache.get.side_effect = lambda rid: (
+            f"Name-{rid}", f"Company-{rid}",
+            f"https://www.linkedin.com/in/{rid}", "manufacturing",
+            "Plant Director",
+        )
+        return cache
+
+    def test_exclude_drops_matching_entry_and_record_id(
+        self, _pb_args, _sheet, _get_entries, capsys,
+    ):
+        """exclude_ids matching an entry_id AND a record_id both drop from the
+        queue; unmatched-but-present rows stay."""
+        from workflows.daily_check import run_dm_sequencing
+
+        today = date(2026, 5, 20)
+        # 3 fresh-accept DM1-due rows: a0 (entry_id ent-a0), a1, a2.
+        entries = [
+            _entry("a0", "Accepted", "2026-05-18", dm_step=0),
+            _entry("a1", "Accepted", "2026-05-18", dm_step=0),
+            _entry("a2", "Accepted", "2026-05-18", dm_step=0),
+        ]
+        _get_entries.return_value = ([], entries)
+
+        attio = _attio_with_full_schema()
+        pb = MagicMock()
+        cache = self._setup_cache()
+
+        with patch("workflows.daily_check.date") as mock_date:
+            mock_date.today.return_value = today
+            mock_date.fromisoformat = date.fromisoformat
+            result = run_dm_sequencing(
+                attio, pb, "sender-id",
+                daily_run=_fake_daily_run(remaining=30),
+                dry_run=True, auto_confirm=True, cache=cache,
+                # Exclude a0 by entry_id and a1 by record_id.
+                exclude_ids={"ent-a0", "a1"},
+            )
+
+        # Only a2 survives to the DM1 queue.
+        assert result["dry_run"]["dm1"] == 1, (
+            f"only a2 should remain DM1-due, got {result['dry_run']}"
+        )
+        captured = capsys.readouterr().out
+        assert "[excluded by operator]" in captured
+        # The excluded rows must not be previewed.
+        assert "https://www.linkedin.com/in/a0" not in captured
+        assert "https://www.linkedin.com/in/a1" not in captured
+        assert "https://www.linkedin.com/in/a2" in captured
+
+    def test_exclude_dry_run_issues_zero_writes(
+        self, _pb_args, _sheet, _get_entries,
+    ):
+        """The exclude filter is pure in-memory pruning: a dry run with an
+        exclusion writes nothing to Attio and launches no PB agent."""
+        from workflows.daily_check import run_dm_sequencing
+
+        today = date(2026, 5, 20)
+        entries = [
+            _entry("a0", "Accepted", "2026-05-18", dm_step=0),
+            _entry("a1", "Accepted", "2026-05-18", dm_step=0),
+        ]
+        _get_entries.return_value = ([], entries)
+
+        attio = _attio_with_full_schema()
+        pb = MagicMock()
+        cache = self._setup_cache()
+
+        with patch("workflows.daily_check.date") as mock_date:
+            mock_date.today.return_value = today
+            mock_date.fromisoformat = date.fromisoformat
+            run_dm_sequencing(
+                attio, pb, "sender-id",
+                daily_run=_fake_daily_run(remaining=30),
+                dry_run=True, auto_confirm=True, cache=cache,
+                exclude_ids={"ent-a0"},
+            )
+
+        pb.launch_agent.assert_not_called()
+        attio.update_list_entry.assert_not_called()
+        attio.update_company.assert_not_called()
+
+    def test_exclude_unmatched_id_warns(
+        self, _pb_args, _sheet, _get_entries, capsys,
+    ):
+        """A supplied id matching nothing prints a loud warning (typo /
+        already-sent / not-due) and leaves the queue untouched."""
+        from workflows.daily_check import run_dm_sequencing
+
+        today = date(2026, 5, 20)
+        entries = [_entry("a0", "Accepted", "2026-05-18", dm_step=0)]
+        _get_entries.return_value = ([], entries)
+
+        attio = _attio_with_full_schema()
+        pb = MagicMock()
+        cache = self._setup_cache()
+
+        with patch("workflows.daily_check.date") as mock_date:
+            mock_date.today.return_value = today
+            mock_date.fromisoformat = date.fromisoformat
+            result = run_dm_sequencing(
+                attio, pb, "sender-id",
+                daily_run=_fake_daily_run(remaining=30),
+                dry_run=True, auto_confirm=True, cache=cache,
+                exclude_ids={"does-not-exist"},
+            )
+
+        # Queue is unaffected — a0 still DM1-due.
+        assert result["dry_run"]["dm1"] == 1
+        captured = capsys.readouterr().out
+        assert "does-not-exist" in captured
+        assert "not in today's DM queue" in captured

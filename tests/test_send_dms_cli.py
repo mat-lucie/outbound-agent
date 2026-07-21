@@ -436,3 +436,57 @@ def test_send_dms_reattach_refusals_fail_closed(monkeypatch, make_exc):
     )
     assert result.exit_code != 0
     seq.assert_not_called()
+
+
+# ── PR-237: --exclude passthrough (send-dms → run_dm_sequencing) ─────────────
+
+
+def _invoke_send_dms_dry(monkeypatch, seq, extra_args):
+    """Drive `send-dms --dry-run` past the preflights with run_dm_sequencing
+    stubbed, returning the CliRunner result. Shared by the --exclude passthrough
+    tests below."""
+    _patch_clients_and_lock(monkeypatch)
+    _install_attach(monkeypatch, _FakeRun(run_date="2026-06-09", reply_status="ok"))
+    monkeypatch.setattr(
+        "models.business_calendar.operator_today", lambda: date(2026, 6, 9)
+    )
+    monkeypatch.setattr("workflows.daily_check.run_dm_sequencing", seq)
+    return CliRunner().invoke(
+        cli, ["send-dms", "--dry-run", *extra_args],
+        env={**os.environ, "PB_MESSAGE_SENDER_ID": "ms", "ATTIO_LIST_ID": "lst"},
+    )
+
+
+def test_send_dms_exclude_entry_id_threaded_as_set(monkeypatch):
+    """A single --exclude reaches run_dm_sequencing as exclude_ids={"e1"}."""
+    seq = MagicMock(return_value={"dm1": 0, "dm2": 0, "dm3": 0})
+    result = _invoke_send_dms_dry(monkeypatch, seq, ["--exclude", "e1"])
+    assert result.exit_code == 0, result.output
+    seq.assert_called_once()
+    assert seq.call_args.kwargs["exclude_ids"] == {"e1"}
+
+
+def test_send_dms_exclude_record_id_threaded_as_set(monkeypatch):
+    """--exclude also accepts a record_id (opaque to the CLI — same passthrough)."""
+    seq = MagicMock(return_value={"dm1": 0, "dm2": 0, "dm3": 0})
+    result = _invoke_send_dms_dry(monkeypatch, seq, ["--exclude", "rec_123"])
+    assert result.exit_code == 0, result.output
+    assert seq.call_args.kwargs["exclude_ids"] == {"rec_123"}
+
+
+def test_send_dms_multiple_exclude_flags_collected(monkeypatch):
+    """Repeated --exclude flags collect into one set."""
+    seq = MagicMock(return_value={"dm1": 0, "dm2": 0, "dm3": 0})
+    result = _invoke_send_dms_dry(
+        monkeypatch, seq, ["--exclude", "e1", "--exclude", "rec_2"]
+    )
+    assert result.exit_code == 0, result.output
+    assert seq.call_args.kwargs["exclude_ids"] == {"e1", "rec_2"}
+
+
+def test_send_dms_no_exclude_passes_empty_set(monkeypatch):
+    """Absent --exclude → empty set (never None), so the filter is a no-op."""
+    seq = MagicMock(return_value={"dm1": 0, "dm2": 0, "dm3": 0})
+    result = _invoke_send_dms_dry(monkeypatch, seq, [])
+    assert result.exit_code == 0, result.output
+    assert seq.call_args.kwargs["exclude_ids"] == set()

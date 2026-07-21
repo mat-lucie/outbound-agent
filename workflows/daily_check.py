@@ -2992,8 +2992,18 @@ def run_dm_sequencing(
     auto_confirm: bool = False,
     cache: RecordCache | None = None,
     audit_logger: AuditLogger | None = None,
+    exclude_ids: set[str] | None = None,
 ) -> dict:
     """Part B: Send DMs to accepted connections based on timing.
+
+    ``exclude_ids`` (PR-237) is a per-run operator exclusion set — entry_id
+    or record_id strings dropped from BOTH the wet queue and the dry-run
+    preview for this run only, with a per-match skip line and a loud warning
+    for any supplied id that matched nothing (typo / already sent / not due).
+    This fork is machine-keyed (no multi-operator ownership claim layer), so
+    the exclusion simply prunes ``all_parsed`` before the DM-due selection
+    loop; upstream additionally had to place it ahead of its ownership claim
+    filter, which does not exist here.
 
     `cache` may be supplied by the caller to reuse person records pre-fetched
     by earlier phases; if None, a fresh cache is built. Standalone debug runs
@@ -3223,6 +3233,37 @@ def run_dm_sequencing(
             click.echo(f"     {url}: {stage_summary}")
         if len(divergent) > 20:
             click.echo(f"     ... and {len(divergent) - 20} more")
+
+    if exclude_ids:
+        # PR-237 per-run operator exclusions (--exclude): drop matching
+        # entry_id/record_id rows from the DM-due selection below, for THIS
+        # run only. Applied here (before the queue-building loop) so excluded
+        # rows never enter selection in either the wet or dry-run path — the
+        # dry-run preview reflects exactly the wet queue. This fork is
+        # machine-keyed, so there is no ownership claim filter to sequence
+        # ahead of (upstream #237's "apply --exclude before the claim filter"
+        # concern is N/A here); no Attio traffic fires either way.
+        _excluded_matched: set[str] = set()
+        _kept_parsed = []
+        for attrs in all_parsed:
+            _eid = attrs.get("entry_id")
+            _rid = str(attrs.get("record_id"))
+            _ids = {i for i in (_eid, _rid) if i is not None}
+            _matched = _ids & exclude_ids
+            if _matched:
+                click.echo(
+                    f"  [excluded by operator] {_rid} (entry {_eid}) "
+                    f"skipped via --exclude"
+                )
+                _excluded_matched |= _matched
+                continue
+            _kept_parsed.append(attrs)
+        all_parsed = _kept_parsed
+        for _unmatched in exclude_ids - _excluded_matched:
+            click.echo(
+                f"⚠ --exclude id not in today's DM queue (typo, already "
+                f"sent, or not due): {_unmatched}"
+            )
 
     # The attrs-only eligibility gates live in `dm_due_step` — shared with
     # compute_due_dm_counts (and any DM claim filter), so a gate added there
