@@ -79,6 +79,34 @@ Fill these **required** values in `.env`:
 Optional values (`RESEND_API_KEY`, `RESEND_FROM_ADDRESS`, `REPORT_EMAIL`, Sales
 Navigator vars) can stay blank for a first run.
 
+### (Optional) Gmail email-response detection
+
+**Off by default.** When enabled, the engine reads your Gmail inbox (read-only)
+to detect prospect *email* replies — powering follow-up-radar reply detection
+and Phase 0.6 stage flips — so an email "No thanks" or "let's talk" stops or
+advances the sequence just like a LinkedIn reply. Skip this for a first run;
+the engine degrades gracefully without it (email detection simply doesn't run).
+
+To turn it on:
+
+1. Install the optional extra: `pip install -e '.[gmail]'` (pulls
+   `google-api-python-client`; the core install stays lean without it).
+2. Reuse the same Google OAuth client secret as Sheets
+   (`credentials/google-oauth.json`), then mint a **separate**, read-only
+   Gmail token once — an interactive browser consent:
+
+   ```bash
+   python -m clients.gmail
+   ```
+
+   This writes `credentials/gmail-authorized-user.json` (git-ignored, scope
+   `gmail.readonly`). It stays independent of the Sheets token on purpose, so
+   enabling Gmail never forces re-consent on the DM-send path.
+
+If the token is absent or unreadable, the client raises
+`GmailCredentialsMissing` and the email-detection path skips cleanly — never a
+crash. Re-run `python -m clients.gmail` to re-enable.
+
 ---
 
 ## 3. Create the PhantomBuster phantoms
