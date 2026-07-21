@@ -12,6 +12,8 @@ concurrency:
 jobs:
   quality-gates:
     runs-on: ubuntu-latest
+    # Cap a hung run so a stuck test can't burn CI hours (adapted from upstream PR-235).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
