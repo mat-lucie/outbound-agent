@@ -153,7 +153,12 @@ def cli():
 @click.option("--inbox-scraper-id", default=lambda: load_pb_config().inbox_scraper_id or None, help="PhantomBuster Inbox Scraper agent ID (default: config/phantombuster.yaml → PB_INBOX_SCRAPER_ID)")
 @click.option("--skip-dms", is_flag=True, help="Skip Part B DM sequencing (connections only)")
 @click.option("--force-weekend", is_flag=True, help="Override the Mon-Fri-only outreach rule")
-def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profile_scraper_id, sales_nav_profile_scraper_id, inbox_scraper_id, skip_dms, force_weekend):
+@click.option(
+    "--allow-stale", is_flag=True,
+    help="Proceed with a wet run even when the checkout is behind origin/main "
+         "(the staleness is still stamped into the run's provenance).",
+)
+def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profile_scraper_id, sales_nav_profile_scraper_id, inbox_scraper_id, skip_dms, force_weekend, allow_stale):
     """Daily check: send connections, queue DMs, detect responses."""
     from clients.phantombuster import PhantomBusterClient
     from models.business_calendar import is_send_day, operator_today
@@ -184,6 +189,10 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
         acquire_run_lock,
         log_lock_refused,
     )
+    from workflows.run_provenance import (
+        assert_checkout_current,
+        format_provenance,
+    )
     from workflows.safety_limits import get_status
     from workflows.starvation import evaluate_pipeline_starvation
     from workflows.weekly_prospect import _attio_inner_client
@@ -194,6 +203,13 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
     click.echo("=== Outbound Agent -- Daily Check ===\n")
     click.echo(f"Mode: {mode.value}\n")
     click.echo(f"Safety limits:\n{get_status()}\n")
+
+    # PR-228 preflight: refuse a wet run from a checkout that is missing
+    # merged work — BEFORE the run lock, any PB launch, or any CRM write.
+    # Dry runs and --allow-stale warn instead. Mirrors weekly.
+    code_provenance = assert_checkout_current(
+        dry_run=dry_run, allow_stale=allow_stale
+    )
 
     # PR-11 pre-flight (§0 invariant #9): if two or more experiments are
     # `running`, `get_current_experiment_id` raises
@@ -702,6 +718,7 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                     click.echo(f"Connections sent: {conn_result.get('sent', 0)}")
                     total_dms = dm_result.get("dm1", 0) + dm_result.get("dm2", 0) + dm_result.get("dm3", 0)
                     click.echo(f"DMs sent: {total_dms}")
+                    click.echo(f"Code: {format_provenance(code_provenance)}")
             except MalformedDailyRunRow as exc:
                 # The pre-open same-day scan (multi-row incident guard)
                 # fails closed on a prior row with a corrupt counter.
@@ -767,7 +784,12 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
 @click.option("--message-sender-id", envvar="PB_MESSAGE_SENDER_ID", help="PhantomBuster Message Sender agent ID")
 @click.option("--inbox-scraper-id", envvar="PB_INBOX_SCRAPER_ID", help="PhantomBuster Inbox Scraper agent ID (response re-detect)")
 @click.option("--force-weekend", is_flag=True, help="Override the Mon-Fri-only DM rule")
-def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, force_weekend):
+@click.option(
+    "--allow-stale", is_flag=True,
+    help="Proceed with a wet run even when the checkout is behind origin/main "
+         "(the staleness is still stamped into the run's provenance).",
+)
+def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, force_weekend, allow_stale):
     """Send-DMs phase: reattach to today's daily_run row and send Part B only.
 
     Runs ONLY after `daily --yes --skip-dms` opened the day. `--dry-run`
@@ -797,6 +819,10 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
         acquire_run_lock,
         log_lock_refused,
     )
+    from workflows.run_provenance import (
+        assert_checkout_current,
+        format_provenance,
+    )
     from workflows.weekly_prospect import _attio_inner_client
 
     mode = RunMode.from_dry_run_flag(dry_run)
@@ -804,6 +830,13 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
 
     click.echo("=== Outbound Agent -- Send DMs ===\n")
     click.echo(f"Mode: {mode.value}\n")
+
+    # PR-228 preflight: refuse a wet run from a checkout that is missing
+    # merged work — BEFORE the run lock, any PB launch, or any CRM write.
+    # Dry runs and --allow-stale warn instead. Mirrors weekly.
+    code_provenance = assert_checkout_current(
+        dry_run=dry_run, allow_stale=allow_stale
+    )
 
     # Experiment pre-flight (parity with daily): a >1 running-experiment
     # ambiguity is a hard abort BEFORE any send. Other failures defer.
@@ -960,6 +993,7 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
                         audit_logger=audit_logger,
                         daily_run=daily_run,
                     )
+                    click.echo(f"\nCode: {format_provenance(code_provenance)}")
             except NoDailyRunRow as exc:
                 click.echo(f"  ⚠ {exc} Exiting EX_TEMPFAIL.", err=True)
                 raise SystemExit(EXIT_TEMPFAIL) from exc
@@ -990,7 +1024,12 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
 @click.option("--batch-size", default=100, help="Max prospects to export")
 @click.option("--search-export-id", default=lambda: load_pb_config().search_export_id or None, help="PhantomBuster Search Export agent ID (default: config/phantombuster.yaml → PB_SEARCH_EXPORT_ID)")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts (for cron)")
-def weekly(dry_run, batch_size, search_export_id, yes):
+@click.option(
+    "--allow-stale", is_flag=True,
+    help="Proceed with a wet run even when the checkout is behind origin/main "
+         "(the staleness is still stamped into the run's provenance).",
+)
+def weekly(dry_run, batch_size, search_export_id, yes, allow_stale):
     """Weekly prospecting: export, qualify, and load new prospects."""
     from clients.phantombuster import PhantomBusterClient
     from workflows.run_lock import (
@@ -999,9 +1038,18 @@ def weekly(dry_run, batch_size, search_export_id, yes):
         acquire_run_lock,
         log_lock_refused,
     )
+    from workflows.run_provenance import assert_checkout_current
     from workflows.weekly_prospect import run_weekly_prospecting
 
     click.echo("=== Outbound Agent -- Weekly Prospecting ===\n")
+
+    # PR-228 preflight: refuse a wet run from a checkout that is missing
+    # merged work — BEFORE the run lock, any PB launch, or any CRM write.
+    # Dry runs and --allow-stale warn instead. The collected provenance is
+    # stamped into the summary + staged JSONL either way.
+    code_provenance = assert_checkout_current(
+        dry_run=dry_run, allow_stale=allow_stale
+    )
 
     # PR-21 pre-flight (mirrors daily's §0 invariant #9 guard): if two or more
     # experiments are `running`, abort BEFORE any prospects commit so we never
@@ -1041,6 +1089,7 @@ def weekly(dry_run, batch_size, search_export_id, yes):
             run_weekly_prospecting(
                 crm, pb, search_export_id,
                 batch_size=batch_size, dry_run=dry_run,
+                code_provenance=code_provenance,
             )
     except RunLockHeld as exc:
         log_lock_refused(lock_name, exc)
