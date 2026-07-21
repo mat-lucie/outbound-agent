@@ -650,6 +650,40 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
         "scripts.data_quality_report.write_report",
     ("data_quality_report", "report_text"):
         "scripts.data_quality_report.write_report",
+
+    # ---- Follow-up Radar state (PR-211/214/247) ----
+    # Sole writer for every radar-state attribute is workflows.followup_state
+    # (the stamp/snooze/mute/callback/touch/await CLI paths route through it via
+    # AttioWriter). The five followup_* attrs land on BOTH warm object types
+    # (the linkedin_outreach list + the deals object); deals also carries the
+    # partner-attribution + verified-touch extras; the WAITING lane adds
+    # awaiting_reply_* on both.
+    ("linkedin_outreach", "followup_draft_at"): "workflows.followup_state",
+    ("linkedin_outreach", "followup_draft_id"): "workflows.followup_state",
+    ("linkedin_outreach", "followup_snooze_until"): "workflows.followup_state",
+    ("linkedin_outreach", "followup_muted"): "workflows.followup_state",
+    ("linkedin_outreach", "followup_callback_date"): "workflows.followup_state",
+    ("deals", "followup_draft_at"): "workflows.followup_state",
+    ("deals", "followup_draft_id"): "workflows.followup_state",
+    ("deals", "followup_snooze_until"): "workflows.followup_state",
+    ("deals", "followup_muted"): "workflows.followup_state",
+    ("deals", "followup_callback_date"): "workflows.followup_state",
+    # referred_by (PR-214): the referring partner's canonical lowercase email,
+    # stamped by the skill layer (via the `followup-refer` CLI) onto the deal
+    # through workflows.followup_state.stamp_referred_by.
+    ("deals", "referred_by"): "workflows.followup_state",
+    # last_verified_touch (PR-214): the skill-verified true last-touch date,
+    # stamped via `followup-touch` after each Phase C verification.
+    ("deals", "last_verified_touch"): "workflows.followup_state",
+    # ---- WAITING lane: awaiting_reply_* state (PR-247) ----
+    ("linkedin_outreach", "awaiting_reply_since"): "workflows.followup_state",
+    ("linkedin_outreach", "awaiting_reply_thread_id"): "workflows.followup_state",
+    ("linkedin_outreach", "awaiting_reply_note_id"): "workflows.followup_state",
+    ("linkedin_outreach", "awaiting_reply_nudge_count"): "workflows.followup_state",
+    ("deals", "awaiting_reply_since"): "workflows.followup_state",
+    ("deals", "awaiting_reply_thread_id"): "workflows.followup_state",
+    ("deals", "awaiting_reply_note_id"): "workflows.followup_state",
+    ("deals", "awaiting_reply_nudge_count"): "workflows.followup_state",
 }
 
 

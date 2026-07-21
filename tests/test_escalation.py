@@ -92,8 +92,12 @@ class TestSlugInventory:
         #     disagrees with its HQ/lane-derived expected language at DM /
         #     connection render time; skip + queue row instead of a
         #     wrong-language send).
-        # New count: 89 + 1 + 2 + 1 + 2 + 1 = 96.
-        assert len(ESCALATION_TYPES) == 96
+        # feat/port-followup-radar (PR-247 WAITING lane) added 1 more:
+        #   - awaiting_reply_resolved (a WAITING-lane cycle ended: the prospect
+        #     replied to a tracked send; emitted by followup-await
+        #     --clear --resolved, carrying the reply-latency learning signal).
+        # New count: 89 + 1 + 2 + 1 + 2 + 1 + 1 = 97.
+        assert len(ESCALATION_TYPES) == 97
 
     def test_no_duplicate_slugs(self):
         assert len(ESCALATION_TYPES) == len(ESCALATION_TYPES_SET)

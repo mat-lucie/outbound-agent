@@ -152,13 +152,14 @@ def cli():
 @click.option("--sales-nav-profile-scraper-id", default=lambda: load_pb_config().sales_nav_profile_scraper_id or None, help="PhantomBuster Sales Navigator Profile Scraper agent ID, sales_nav backend (the default) (default: config/phantombuster.yaml → PB_SALES_NAV_PROFILE_SCRAPER_ID)")
 @click.option("--inbox-scraper-id", default=lambda: load_pb_config().inbox_scraper_id or None, help="PhantomBuster Inbox Scraper agent ID (default: config/phantombuster.yaml → PB_INBOX_SCRAPER_ID)")
 @click.option("--skip-dms", is_flag=True, help="Skip Part B DM sequencing (connections only)")
+@click.option("--skip-followups", is_flag=True, help="Skip Phase C (warm follow-up radar). Phase C is read-only detection; it never sends. Fails-closed-clean when the radar schema is absent, so a schemaless install runs it as a no-op regardless.")
 @click.option("--force-weekend", is_flag=True, help="Override the Mon-Fri-only outreach rule")
 @click.option(
     "--allow-stale", is_flag=True,
     help="Proceed with a wet run even when the checkout is behind origin/main "
          "(the staleness is still stamped into the run's provenance).",
 )
-def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profile_scraper_id, sales_nav_profile_scraper_id, inbox_scraper_id, skip_dms, force_weekend, allow_stale):
+def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profile_scraper_id, sales_nav_profile_scraper_id, inbox_scraper_id, skip_dms, skip_followups, force_weekend, allow_stale):
     """Daily check: send connections, queue DMs, detect responses."""
     from clients.phantombuster import PhantomBusterClient
     from models.business_calendar import is_send_day, operator_today
@@ -719,6 +720,37 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                     total_dms = dm_result.get("dm1", 0) + dm_result.get("dm2", 0) + dm_result.get("dm3", 0)
                     click.echo(f"DMs sent: {total_dms}")
                     click.echo(f"Code: {format_provenance(code_provenance)}")
+
+                    # Phase C: warm follow-up radar (read-only detection, PR-211).
+                    # STRICTLY downstream of Phase A/B and fully isolated: any
+                    # failure here degrades to a WARN and never fails invites/DMs
+                    # or the daily run's exit code. Fails-closed-clean on a
+                    # schemaless install (the engine's schema probes degrade to a
+                    # digest, never crash), so the radar is inert until the
+                    # operator provisions its attributes (--feature radar). The
+                    # skill layer turns this digest into drafts — the CLI only
+                    # surfaces it.
+                    if not skip_followups:
+                        click.echo("\n--- Phase C: Follow-up Radar ---")
+                        try:
+                            from workflows.followup_radar import run_followup_radar
+                            fu = run_followup_radar(crm, today=today)
+                            click.echo(fu["digest"])
+                            click.echo(
+                                f"  ({fu['surfaced']} surfaced"
+                                f"{_followup_lane_counts(fu)})"
+                            )
+                        except Exception as exc:  # noqa: BLE001 — never break the daily run
+                            import traceback
+                            # Swallow the control flow (Phase C must not fail
+                            # A/B) but NOT the diagnostics — a bare type+message
+                            # is undebuggable when the failure is 3 calls deep.
+                            click.echo(
+                                f"  ⚠ Phase C (follow-up radar) errored and was "
+                                f"skipped: {type(exc).__name__}: {exc}\n"
+                                f"{traceback.format_exc()}",
+                                err=True,
+                            )
             except MalformedDailyRunRow as exc:
                 # The pre-open same-day scan (multi-row incident guard)
                 # fails closed on a prior row with a corrupt counter.
@@ -2577,6 +2609,441 @@ def sales_finalize_borderline_cmd(ctx, batch: str, dry_run: bool) -> None:
     )
     if out["finalize_result"] is not None:
         click.echo(f"finalize_result: {out['finalize_result']}")
+
+
+# ── Follow-up Radar (Phase C) ──────────────────────────────────────────────
+def _followup_lane_counts(summary: dict) -> str:
+    """Lane-count suffix for the radar footer, mirroring render_digest's
+    split-count convention: partner → owed → waiting → LinkedIn-warm → nudge,
+    with zero-count lanes omitted so an empty lane doesn't add noise."""
+    parts = []
+    if summary["partner"]:
+        parts.append(f"{summary['partner']} partner intro")
+    if summary["owed"]:
+        parts.append(f"{summary['owed']} owed")
+    if summary.get("waiting"):
+        parts.append(f"{summary['waiting']} waiting")
+    if summary["linkedin_warm"]:
+        parts.append(f"{summary['linkedin_warm']} LinkedIn-warm")
+    if summary["nudge"]:
+        parts.append(f"{summary['nudge']} nudge")
+    return "".join(f" · {p}" for p in parts)
+
+
+@cli.command("followup")
+@click.option("--dry-run", is_flag=True, help="No effect on this command — detection is read-only; kept for interface parity with the daily run.")
+@click.option("--limit", type=int, default=0, help="Cap the number of surfaced candidates (0 = all). The skill layer drafts for the top-N; keep this small when drafting.")
+@click.option("--json", "json_out", is_flag=True, help="Emit the candidate list as JSON for the skill layer to consume (in addition to the human digest).")
+@click.option("--full", is_flag=True, help="Show the entire Nudge lane instead of a top-3 preview.")
+def followup_cmd(dry_run, limit, json_out, full):
+    """Follow-up Radar: detect warm-but-stale accounts and render a ranked digest.
+
+    Read-only. Detects accounts that engaged (replied, call booked, demo'd,
+    open deal) then went quiet, ranks them Owed-first, and prints a digest.
+    The skill layer (Phase C) consumes ``--json`` to verify last-touch and
+    draft follow-ups; this command never sends or writes. Fails-closed-clean
+    when the radar schema is absent (the engine degrades to an inert digest),
+    so a schemaless install runs it as a no-op.
+    """
+    import json as _json
+
+    from workflows.followup_radar import run_followup_radar
+
+    click.echo("=== Follow-up Radar ===\n")
+    # Standalone diagnostic command: unlike Phase C (firewalled inside the
+    # daily run), a bad ATTIO_LIST_ID or a CRM outage here should print a
+    # clean error and exit 1 rather than dump a raw traceback at the operator.
+    try:
+        with _crm_provider() as crm:
+            summary = run_followup_radar(crm, limit=(limit or None), full=full)
+    except Exception as exc:  # noqa: BLE001 — operator-facing diagnostic
+        import traceback
+        click.echo(
+            f"ERROR: follow-up radar failed: {type(exc).__name__}: {exc}\n"
+            f"{traceback.format_exc()}",
+            err=True,
+        )
+        raise SystemExit(1) from exc
+
+    click.echo(summary["digest"])
+    click.echo(
+        f"\n({summary['surfaced']} of {summary['total']} surfaced"
+        f"{_followup_lane_counts(summary)})"
+    )
+    if json_out:
+        click.echo("\n--- candidates (json) ---")
+        click.echo(_json.dumps(summary["candidates"], indent=2))
+
+
+_FOLLOWUP_OBJECTS = ("linkedin_outreach", "deals")
+# A snooze/callback more than this far out is almost certainly a typo (a year
+# instead of a date, a fat-fingered 2099). Parking an account that far silently
+# removes it from the radar with no signal — reject it loudly instead.
+_FOLLOWUP_MAX_HORIZON_DAYS = 400
+
+
+def _reject_absurd_followup_date(d, label):
+    """Exit 1 if a snooze/callback date is absurdly far in the future."""
+    from datetime import timedelta
+
+    from models.business_calendar import operator_today
+
+    horizon = operator_today() + timedelta(days=_FOLLOWUP_MAX_HORIZON_DAYS)
+    if d > horizon:
+        click.echo(
+            f"ERROR: {label}={d.isoformat()} is more than "
+            f"{_FOLLOWUP_MAX_HORIZON_DAYS} days out — likely a typo. Parking an "
+            f"account that far silently hides it. Refusing.",
+            err=True,
+        )
+        raise SystemExit(1)
+
+
+def _followup_state_call(fn_name: str, object_: str, target_id: str, **kwargs):
+    """Shared plumbing for the followup state-write commands.
+
+    ``target_id`` is the list ENTRY id for linkedin_outreach, or the deal
+    record_id for deals. Resolves the list_id from env for the list case,
+    builds an AttioWriter, and dispatches to workflows.followup_state.<fn_name>.
+    Prints a clean error + exits 1 on failure (operator-facing).
+    """
+    from clients.attio_writer import AttioWriter
+    from workflows import followup_state
+
+    list_id = os.environ.get("ATTIO_LIST_ID", "").strip() if object_ == "linkedin_outreach" else None
+    if object_ == "linkedin_outreach" and not list_id:
+        click.echo("ERROR: ATTIO_LIST_ID not set (needed for linkedin_outreach writes)", err=True)
+        raise SystemExit(1)
+    try:
+        fn = getattr(followup_state, fn_name)
+        fn(AttioWriter(), object=object_, record_id=target_id, list_id=list_id, **kwargs)
+    except Exception as exc:  # noqa: BLE001 — operator-facing
+        click.echo(f"ERROR: {fn_name} failed: {type(exc).__name__}: {exc}", err=True)
+        raise SystemExit(1) from exc
+    click.echo(f"ok: {fn_name} {object_}:{target_id}")
+
+
+@cli.command("followup-stamp")
+@click.option("--object", "object_", type=click.Choice(_FOLLOWUP_OBJECTS), required=True)
+@click.option("--id", "target_id", required=True, help="Entry id (linkedin_outreach) or deal record_id.")
+@click.option("--draft-id", required=True, help="Gmail draft id just created.")
+def followup_stamp_cmd(object_, target_id, draft_id):
+    """Record that a follow-up draft was created (followup_draft_at + _draft_id).
+
+    Called by the skill layer (Phase C) right after it creates a Gmail draft, so
+    the radar won't re-draft this account until it's acted on or the draft goes
+    stale."""
+    _followup_state_call("stamp_draft", object_, target_id, draft_id=draft_id)
+
+
+@cli.command("followup-snooze")
+@click.option("--object", "object_", type=click.Choice(_FOLLOWUP_OBJECTS), required=True)
+@click.option("--id", "target_id", required=True)
+@click.option("--until", required=True, help="YYYY-MM-DD — radar skips this account until then.")
+def followup_snooze_cmd(object_, target_id, until):
+    """Park an account until a date (one-click operator snooze)."""
+    until_d = date.fromisoformat(until)
+    _reject_absurd_followup_date(until_d, "snooze --until")
+    _followup_state_call("set_snooze", object_, target_id, until=until_d)
+
+
+@cli.command("followup-mute")
+@click.option("--object", "object_", type=click.Choice(_FOLLOWUP_OBJECTS), required=True)
+@click.option("--id", "target_id", required=True)
+@click.option("--unmute", is_flag=True, help="Re-include a previously-muted account.")
+def followup_mute_cmd(object_, target_id, unmute):
+    """Permanently exclude (or with --unmute, re-include) an account. Used to
+    park the stale Partner-Intro backlog so it stops re-surfacing."""
+    _followup_state_call("set_muted", object_, target_id, muted=not unmute)
+
+
+@cli.command("followup-mute-batch")
+@click.option("--object", "object_", type=click.Choice(_FOLLOWUP_OBJECTS), default="linkedin_outreach", show_default=True)
+@click.option("--file", "id_file", required=True, type=click.Path(exists=True, dir_okay=False), help="Path to a file of ids, one per line (blank lines and #-comments skipped).")
+def followup_mute_batch_cmd(object_, id_file):
+    """Mute many accounts from a file — the first-run backlog flush.
+
+    One id per line (entry_id for linkedin_outreach, deal record_id for deals);
+    blank lines and lines starting with '#' are skipped, duplicates are
+    collapsed. Writes are sequential and idempotent, so re-running the same file
+    is safe.
+
+    Output contract (pipe-clean): stdout carries ONLY the failed ids, one per
+    line, nothing else — so `... > retry.txt` yields a directly re-runnable
+    retry file. Everything human-facing (the per-failure 'FAILED <id>: <err>'
+    lines and the final 'Muted N of M' summary) goes to stderr. Exit 0 iff
+    every id succeeded."""
+    from clients.attio_writer import AttioWriter
+    from workflows import followup_state
+
+    # Parse: strip whitespace, drop blanks + #-comments, dedupe preserving order.
+    seen: set[str] = set()
+    record_ids: list[str] = []
+    with open(id_file, encoding="utf-8") as fh:
+        for raw in fh:
+            rid = raw.strip()
+            if not rid or rid.startswith("#") or rid in seen:
+                continue
+            seen.add(rid)
+            record_ids.append(rid)
+
+    if not record_ids:
+        click.echo(f"ERROR: no ids in {id_file} (after skipping blanks and #-comments)", err=True)
+        raise SystemExit(1)
+
+    list_id = os.environ.get("ATTIO_LIST_ID", "").strip() if object_ == "linkedin_outreach" else None
+    if object_ == "linkedin_outreach" and not list_id:
+        click.echo("ERROR: ATTIO_LIST_ID not set (needed for linkedin_outreach writes)", err=True)
+        raise SystemExit(1)
+
+    total = len(record_ids)
+    succeeded, failed = followup_state.mute_batch(
+        AttioWriter(), object=object_, record_ids=record_ids, list_id=list_id
+    )
+    # Stream contract: stdout = failed ids ONLY (pipe-clean for a retry file);
+    # all human-facing lines go to stderr so `> retry.txt` can't capture the
+    # summary as a phantom record id.
+    for rid, err in failed:
+        click.echo(f"FAILED {rid}: {err}", err=True)
+    click.echo(f"Muted {len(succeeded)} of {total}", err=True)
+    if failed:
+        click.echo("Failed ids:", err=True)
+        for rid, _ in failed:
+            click.echo(rid)
+        raise SystemExit(1)
+
+
+@cli.command("followup-callback")
+@click.option("--object", "object_", type=click.Choice(_FOLLOWUP_OBJECTS), required=True)
+@click.option("--id", "target_id", required=True)
+@click.option("--date", "cb_date", required=True, help="YYYY-MM-DD — reconnect date; radar hard-surfaces it then.")
+def followup_callback_cmd(object_, target_id, cb_date):
+    """Set a deferral tickler ('contáctame en agosto') — suppress until the date,
+    then hard-surface as Owed."""
+    cb = date.fromisoformat(cb_date)
+    _reject_absurd_followup_date(cb, "callback --date")
+    _followup_state_call("set_callback", object_, target_id, callback=cb)
+
+
+@cli.command("followup-refer")
+@click.option("--id", "deal_id", required=True, help="Deal record_id to attribute.")
+@click.option("--partner-email", required=True, help="Referring partner's email (normalized to lowercase).")
+def followup_refer_cmd(deal_id, partner_email):
+    """Stamp the referring partner's email on a deal (deals-only attribution).
+
+    Called by the Phase C skill layer when it finds a known partner
+    among a deal candidate's Gmail thread participants. Invalid email → clear
+    stderr message, exit 1 (never stamps a bad value onto a deal)."""
+    from clients.attio_writer import AttioWriter
+    from workflows import followup_state
+
+    try:
+        followup_state.stamp_referred_by(
+            AttioWriter(), deal_id=deal_id, partner_email=partner_email
+        )
+    except Exception as exc:  # noqa: BLE001 — operator-facing
+        click.echo(f"ERROR: stamp_referred_by failed: {type(exc).__name__}: {exc}", err=True)
+        raise SystemExit(1) from exc
+    click.echo(f"ok: stamp_referred_by deals:{deal_id}")
+
+
+@cli.command("followup-touch")
+@click.option("--id", "deal_id", required=True, help="Deal record_id to stamp.")
+@click.option("--date", "touch_date", default=None, help="YYYY-MM-DD — the C.2-verified true last-touch date (from the email thread / call transcript).")
+@click.option("--clear", is_flag=True, help="Null the verified touch instead (correction path for a bad stamp) — deal recency falls back to the interaction join / creation date.")
+def followup_touch_cmd(deal_id, touch_date, clear):
+    """Stamp (or with --clear, null) the verified true last-touch on a deal.
+
+    Deals-only. Called by the Phase C skill layer after each
+    successful C.2 email/call verification, so engine ranking (recency
+    tier 1) gets truer every run. Dates are guarded in both directions
+    (future beyond 1 day of UTC skew, or >400 days past = likely year typo)
+    — rejected loudly, never a silent bad stamp."""
+    from clients.attio_writer import AttioWriter
+    from workflows import followup_state
+
+    if clear == bool(touch_date):
+        click.echo("ERROR: pass exactly one of --date or --clear", err=True)
+        raise SystemExit(1)
+    try:
+        if clear:
+            followup_state.clear_verified_touch(AttioWriter(), deal_id=deal_id)
+        else:
+            touch = date.fromisoformat(touch_date)
+            followup_state.stamp_verified_touch(AttioWriter(), deal_id=deal_id, touch=touch)
+    except Exception as exc:  # noqa: BLE001 — operator-facing (incl. a malformed --date)
+        click.echo(f"ERROR: followup-touch failed: {type(exc).__name__}: {exc}", err=True)
+        raise SystemExit(1) from exc
+    verb = "clear_verified_touch" if clear else "stamp_verified_touch"
+    click.echo(f"ok: {verb} deals:{deal_id}")
+
+
+def _read_awaiting_state(object_: str, target_id: str) -> dict | None:
+    """Read the awaiting_reply_* attrs for one deal/entry (parsed dict or None).
+
+    Used by the ``followup-await`` clear/nudge paths, which need the CURRENT
+    since-date and nudge count (the resolved event's latency data, the nudge
+    ceiling). Returns None when the record can't be read — callers decide how
+    loudly to fail.
+    """
+    from clients.attio import AttioClient
+
+    try:
+        with AttioClient() as attio:
+            if object_ == "deals":
+                rec = attio.get_deal(target_id)
+                return AttioClient.parse_deal(rec) if rec else None
+            entry = attio.get_list_entry(target_id)
+            return AttioClient.parse_entry(entry) if entry else None
+    except Exception as exc:  # noqa: BLE001 — callers refuse/fail per-path
+        click.echo(
+            f"WARNING: could not read awaiting state for {object_}:{target_id}: "
+            f"{type(exc).__name__}: {exc}",
+            err=True,
+        )
+        return None
+
+
+@cli.command("followup-await")
+@click.option("--object", "object_", type=click.Choice(_FOLLOWUP_OBJECTS), required=True)
+@click.option("--id", "target_id", required=True, help="Entry id (linkedin_outreach) or deal record_id.")
+@click.option("--since", "since_date", default=None, help="YYYY-MM-DD — your most recent unanswered send (C.2-verified). Overwrites any prior stamp; deals also co-stamp last_verified_touch.")
+@click.option("--thread", "thread_id", default=None, help="Gmail thread id of the unanswered send (required with --since; advisory — drafts re-resolve the live thread).")
+@click.option("--clear", is_flag=True, help="End the waiting cycle (nulls since/thread/nudge count; the canonical note id is kept).")
+@click.option("--resolved", "resolved_date", default=None, help="YYYY-MM-DD the reply arrived (only with --clear) — emits the awaiting_reply_resolved learning event BEFORE clearing.")
+@click.option("--nudged", is_flag=True, help="Count a nudge draft against the 2-nudge ceiling (exit 1 at the ceiling — no more auto-nudges).")
+@click.option("--note-id", "note_id", default=None, help="Canonical waiting-note id to persist (standalone, or alongside --nudged).")
+def followup_await_cmd(object_, target_id, since_date, thread_id, clear, resolved_date, nudged, note_id):
+    """Manage WAITING-lane state: you sent an email, no reply yet.
+
+    Modes (exactly one): --since (stamp/re-stamp after a C.2-verified Gmail
+    check — never from the raw sweep), --clear [--resolved] (reply arrived or
+    operator reset; --resolved emits the reply-latency learning event first),
+    --nudged (count a nudge draft; hard max 2 per cycle), or --note-id alone
+    (persist the canonical note id after creating the note via MCP).
+    Dates are guarded like followup-touch (future >1d skew / >400d past =
+    exit 1)."""
+    modes = [bool(since_date), clear, nudged, bool(note_id) and not nudged and not since_date]
+    if sum(modes) != 1:
+        click.echo(
+            "ERROR: pass exactly one mode: --since (+--thread), --clear "
+            "[--resolved], --nudged [--note-id], or --note-id alone",
+            err=True,
+        )
+        raise SystemExit(1)
+    if resolved_date and not clear:
+        click.echo("ERROR: --resolved only makes sense with --clear", err=True)
+        raise SystemExit(1)
+
+    if since_date:
+        if not thread_id:
+            click.echo("ERROR: --since requires --thread (the Gmail thread id)", err=True)
+            raise SystemExit(1)
+        since = date.fromisoformat(since_date)
+        _followup_state_call(
+            "set_awaiting_reply", object_, target_id,
+            since=since, thread_id=thread_id,
+        )
+        if note_id:
+            _followup_state_call("set_awaiting_note_id", object_, target_id, note_id=note_id)
+        return
+
+    if nudged:
+        state = _read_awaiting_state(object_, target_id)
+        if state is None:
+            click.echo(
+                "ERROR: could not read the current nudge count — refusing to "
+                "increment blind (the 2-nudge ceiling would be unenforceable).",
+                err=True,
+            )
+            raise SystemExit(1)
+        try:
+            current = int(state.get("awaiting_reply_nudge_count") or 0)
+        except (TypeError, ValueError):
+            # A malformed count must NOT read as 0 — that would silently
+            # reset the ceiling and re-nudge an account that had its 2.
+            click.echo(
+                f"ERROR: awaiting_reply_nudge_count is malformed "
+                f"({state.get('awaiting_reply_nudge_count')!r}) — refusing to "
+                "increment; repair the value (or followup-await --clear) first.",
+                err=True,
+            )
+            raise SystemExit(1) from None
+        _followup_state_call(
+            "increment_awaiting_nudge", object_, target_id,
+            current_count=current, note_id=note_id,
+        )
+        return
+
+    if clear:
+        if resolved_date:
+            # Emit the learning event BEFORE clearing — the clear destroys the
+            # latency data the event carries. Idempotent on (type, key), so a
+            # re-run after a failed clear refreshes the row, never duplicates.
+            resolved = date.fromisoformat(resolved_date)
+            _reject_absurd_followup_date(resolved, "await --resolved")
+            state = _read_awaiting_state(object_, target_id)
+            if state is None:
+                # A failed READ is not "no stamp" — clearing here would
+                # silently destroy the real awaiting_reply_since and the
+                # latency data point with it. Refuse; plain --clear (no
+                # --resolved) remains the explicit no-event escape hatch.
+                click.echo(
+                    "ERROR: could not read the record — refusing to clear "
+                    "blind with --resolved (the latency event would be lost "
+                    "with no trace). Retry, or use plain --clear to skip the "
+                    "event deliberately.",
+                    err=True,
+                )
+                raise SystemExit(1)
+            since_raw = state.get("awaiting_reply_since")
+            since_d = date.fromisoformat(str(since_raw)[:10]) if since_raw else None
+            if since_d is None:
+                click.echo(
+                    "WARNING: no awaiting_reply_since on the record — clearing "
+                    "anyway, but no resolved event (latency unknowable).",
+                    err=True,
+                )
+            elif resolved < since_d:
+                click.echo(
+                    f"ERROR: --resolved {resolved.isoformat()} predates the "
+                    f"stamped send {since_d.isoformat()} — a reply can't "
+                    "arrive before the send; check the date. Nothing written.",
+                    err=True,
+                )
+                raise SystemExit(1)
+            else:
+                try:
+                    nudges = int((state or {}).get("awaiting_reply_nudge_count") or 0)
+                except (TypeError, ValueError):
+                    nudges = 0
+                try:
+                    from workflows.escalation import escalate
+
+                    escalate(
+                        type="awaiting_reply_resolved",
+                        idempotency_key=f"awaiting-resolved|{target_id}|{resolved.isoformat()}",
+                        payload={
+                            "record_id": target_id,
+                            "object": object_,
+                            "awaiting_reply_since": since_d.isoformat(),
+                            "resolved": resolved.isoformat(),
+                            "latency_days": (resolved - since_d).days,
+                            "nudge_count": nudges,
+                        },
+                    )
+                except Exception as esc_exc:  # noqa: BLE001 — best-effort: a queue hiccup must not strand the clear
+                    click.echo(
+                        f"WARNING: awaiting_reply_resolved event failed "
+                        f"({type(esc_exc).__name__}: {esc_exc}) — clearing anyway; "
+                        "the latency data point is lost.",
+                        err=True,
+                    )
+        _followup_state_call("clear_awaiting_reply", object_, target_id)
+        return
+
+    # --note-id alone: persist the canonical note id post-creation.
+    _followup_state_call("set_awaiting_note_id", object_, target_id, note_id=note_id)
 
 
 if __name__ == "__main__":

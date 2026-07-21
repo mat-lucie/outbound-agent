@@ -23,6 +23,13 @@ logger = logging.getLogger(__name__)
 _RETRY_BASE_WAIT = 1.0
 _RETRY_MAX_WAIT = 30.0
 
+# Full deal-sweep ceiling (PR-220). The 500 default on ``search_deals``
+# silently drops the tail once the deal count passes it; the Follow-up Radar
+# and weekly-report deal-recency join sweep the WHOLE deals object, so they
+# pass ``limit=DEAL_FULL_SCAN_LIMIT, fail_if_truncated=True`` — hitting this
+# ceiling raises ``AttioResultTruncated`` instead of returning a short set.
+DEAL_FULL_SCAN_LIMIT = 10_000
+
 
 def request_with_retry(
     attio: "AttioClient",
@@ -649,24 +656,23 @@ class AttioClient:
 
     # ── Company records ──────────────────────────────────────
 
-    def search_companies(self, filter_: dict | None = None, limit: int = 50) -> list[dict]:
-        """Search company records with optional filter. Auto-paginates."""
-        all_records: list[dict] = []
-        page_size = min(limit, 100)
-        offset: int = 0
+    def search_companies(
+        self,
+        filter_: dict | None = None,
+        limit: int = 50,
+        *,
+        fail_if_truncated: bool = False,
+    ) -> list[dict]:
+        """Search company records with optional filter. Auto-paginates.
 
-        while len(all_records) < limit:
-            body: dict = {"limit": page_size, "offset": offset}
-            if filter_:
-                body["filter"] = filter_
-            data = self._request("POST", "/objects/companies/records/query", json=body)
-            records = data.get("data", [])
-            all_records.extend(records)
-            if len(records) < page_size:
-                break
-            offset += len(records)
-
-        return all_records[:limit]
+        Routes through the shared truncation-guarded paginator so a full sweep
+        can opt into ``fail_if_truncated=True`` (PR-220 — a silently truncated
+        company sweep drops the tail past the limit).
+        """
+        return self._query_paginated(
+            "/objects/companies/records/query", filter_, limit,
+            fail_if_truncated=fail_if_truncated,
+        )
 
     def create_company(self, attributes: dict) -> dict:
         """Create a new company record."""
@@ -784,6 +790,22 @@ class AttioClient:
                 return None
             raise
 
+    def get_list_entry(self, entry_id: str, list_id: str | None = None) -> dict | None:
+        """Get a single list entry by its entry ID. Returns None if not found.
+
+        Used by the Follow-up Radar WAITING-lane CLI (``followup-await``) to
+        read the current awaiting_reply_* state off one entry before a
+        clear/nudge write (PR-247).
+        """
+        lid = list_id or os.environ.get("ATTIO_LIST_ID", "")
+        try:
+            data = self._request("GET", f"/lists/{lid}/entries/{entry_id}")
+            return data.get("data", data)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+
     def create_deal(self, attributes: dict) -> dict:
         """Create a new deal record. Mirrors ``create_company``.
 
@@ -820,24 +842,25 @@ class AttioClient:
                 return False
             raise
 
-    def search_deals(self, filter_: dict | None = None, limit: int = 500) -> list[dict]:
-        """Search deal records with optional filter. Auto-paginates."""
-        all_records: list[dict] = []
-        page_size = min(limit, 100)
-        offset: int = 0
+    def search_deals(
+        self,
+        filter_: dict | None = None,
+        limit: int = 500,
+        *,
+        fail_if_truncated: bool = False,
+    ) -> list[dict]:
+        """Search deal records with optional filter. Auto-paginates.
 
-        while len(all_records) < limit:
-            body: dict = {"limit": page_size, "offset": offset}
-            if filter_:
-                body["filter"] = filter_
-            data = self._request("POST", "/objects/deals/records/query", json=body)
-            records = data.get("data", [])
-            all_records.extend(records)
-            if len(records) < page_size:
-                break
-            offset += len(records)
-
-        return all_records[:limit]
+        Full-sweep callers (the Follow-up Radar deal cohort, the weekly-report
+        deal-recency join) pass ``limit=DEAL_FULL_SCAN_LIMIT,
+        fail_if_truncated=True`` — the 500 default silently drops the tail once
+        the deal count passes it, so a whole-object sweep routes through the
+        shared truncation-guarded paginator instead (PR-220).
+        """
+        return self._query_paginated(
+            "/objects/deals/records/query", filter_, limit,
+            fail_if_truncated=fail_if_truncated,
+        )
 
     # ── List entries (pipeline) ───────────────────────────────
 
@@ -1213,6 +1236,42 @@ class AttioClient:
             "company_id": company_obj.get("target_record_id") if isinstance(company_obj, dict) else None,
             "country": country_obj.get("country_code") if isinstance(country_obj, dict) else None,
             "owner_id": owner_obj.get("referenced_actor_id") if isinstance(owner_obj, dict) else None,
+            # ---- Follow-up Radar state (PR-211) — deal-side twins ----
+            "followup_draft_at": AttioClient._extract_value(values, "followup_draft_at"),
+            "followup_draft_id": AttioClient._extract_value(values, "followup_draft_id"),
+            "followup_snooze_until": AttioClient._extract_value(values, "followup_snooze_until"),
+            "followup_muted": AttioClient._extract_value(values, "followup_muted"),
+            "followup_callback_date": AttioClient._extract_value(values, "followup_callback_date"),
+            # ---- WAITING lane: awaiting-reply state (PR-247) — deal-side twins ----
+            "awaiting_reply_since": AttioClient._extract_value(values, "awaiting_reply_since"),
+            "awaiting_reply_thread_id": AttioClient._extract_value(values, "awaiting_reply_thread_id"),
+            "awaiting_reply_note_id": AttioClient._extract_value(values, "awaiting_reply_note_id"),
+            "awaiting_reply_nudge_count": AttioClient._extract_value(values, "awaiting_reply_nudge_count"),
+            # Partner attribution: the canonical lowercase email of the partner
+            # who introduced this deal (deal-side twin of the Partner Intro
+            # entry stage). Non-empty → the radar routes the deal to the PARTNER
+            # lane and treats the intro as email evidence for channel_hint.
+            "referred_by": AttioClient._extract_value(values, "referred_by"),
+            # ---- Follow-up Radar v2: real deal recency (PR-214) ----
+            # Person record_ids the radar joins against for native interaction
+            # timestamps (people.last_interaction). Empty list when the deal has
+            # no associated people — recency then falls back per _deal_recency.
+            "associated_people": [
+                p.get("target_record_id")
+                for p in (values.get("associated_people") or [])
+                if isinstance(p, dict) and p.get("target_record_id")
+            ],
+            # Skill-layer-verified true last-touch (date), stamped via the
+            # `followup-touch` CLI after a successful verification. Highest-
+            # precedence recency source; None until first verified (or until the
+            # schema is provisioned — both read the same).
+            "last_verified_touch": AttioClient._extract_value(values, "last_verified_touch"),
+            # Deal creation timestamp — the tier-3 recency fallback. Attio's
+            # system field lives at the record top level; the `values` read
+            # tolerates the timestamp moving under values (same shape-drift
+            # guard as followup_radar._deal_last_touch).
+            "created_at": record.get("created_at")
+            or AttioClient._extract_value(values, "created_at"),
         }
 
     @staticmethod

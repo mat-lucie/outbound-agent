@@ -14,6 +14,12 @@ class EmailStage(Enum):
     EMAIL3_SENT = "email3_sent"
     COMPLETED = "completed"
     UNSUBSCRIBED = "unsubscribed"
+    # Terminal email-reply stages (Follow-up Radar WAITING lane, PR-247).
+    # Deliberately absent from ACTIVE_STAGES so a replying/declining prospect
+    # drops out of the drip — and out of the WAITING lane (the account is now
+    # in a human's hands, or said no).
+    RESPONDED = "email_responded"
+    NOT_INTERESTED = "email_not_interested"
 
 
 class EmailStep(Enum):

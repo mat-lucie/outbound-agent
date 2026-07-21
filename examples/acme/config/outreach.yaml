@@ -35,3 +35,9 @@ scrape:
                                # `weekly`. The Search Export phantom re-exports the same
                                # top-of-search window each run, so a deeper batch is the lever
                                # that reaches past the recycled results.
+
+radar:                         # Follow-up Radar Gmail conversation-ledger sweep (PR-214).
+  gmail_sweep_enabled: false   # OFF by default — the radar runs on CRM signals alone. Enable
+                               # only after minting the optional read-only Gmail token; it
+                               # degrades to a clean skip when the token is absent.
+  gmail_lookback_days: 90      # inbound-reply lookback window per candidate.

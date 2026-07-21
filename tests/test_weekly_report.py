@@ -147,6 +147,22 @@ class TestParseDeal:
         assert out["name"] is None
         assert out["stage"] == ""
         assert out["value"] is None
+        assert out["created_at"] is None
+
+    def test_parses_top_level_created_at(self):
+        rec = _deal_record("Acme", "In Progress")
+        rec["created_at"] = "2026-01-15T09:00:00Z"
+        out = AttioClient.parse_deal(rec)
+        assert out["created_at"] == "2026-01-15T09:00:00Z"
+
+    def test_created_at_falls_back_to_values(self):
+        # Shape-drift tolerance: if Attio ever moves the system timestamp
+        # under `values`, parse_deal still reads it (mirrors
+        # followup_radar._deal_last_touch). (PR-218)
+        rec = _deal_record("Acme", "In Progress")
+        rec["values"]["created_at"] = [{"value": "2026-02-01"}]
+        out = AttioClient.parse_deal(rec)
+        assert out["created_at"] == "2026-02-01"
 
 
 class TestComputeActiveDeals:

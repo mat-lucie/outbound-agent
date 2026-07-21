@@ -71,6 +71,9 @@ def test_load_outreach_config_returns_example_defaults():
     assert cfg.send_days == frozenset({0, 1, 2, 3, 4})
     assert cfg.company_throttle_window_days == 14
     assert cfg.weekly_scrape_batch_size == 300
+    # Follow-up Radar Gmail sweep is OFF by default (PR-214).
+    assert cfg.radar_gmail_sweep_enabled is False
+    assert cfg.radar_gmail_lookback_days == 90
 
 
 def test_consumers_sourced_from_loaded_config():
@@ -213,6 +216,34 @@ def test_batch_size_exceeding_cap_raises(tmp_path, monkeypatch):
     body = _VALID_YAML.replace("invite_batch_size: 20", "invite_batch_size: 99")
     _write_config(tmp_path, monkeypatch, body)
     with pytest.raises(ConfigError, match="invite_batch_size"):
+        load_outreach_config()
+
+
+def test_radar_section_absent_defaults_to_off(tmp_path, monkeypatch):
+    """The radar section is optional-with-default: a config predating it loads
+    with the Gmail sweep OFF and a 90-day lookback."""
+    body = "\n".join(
+        line for line in _VALID_YAML.splitlines()
+        if not line.startswith("radar:") and "gmail_" not in line
+    )
+    _write_config(tmp_path, monkeypatch, body)
+    cfg = load_outreach_config()
+    assert cfg.radar_gmail_sweep_enabled is False
+    assert cfg.radar_gmail_lookback_days == 90
+
+
+def test_radar_gmail_sweep_enabled_parses_bool(tmp_path, monkeypatch):
+    body = _VALID_YAML + "\nradar:\n  gmail_sweep_enabled: true\n  gmail_lookback_days: 30\n"
+    _write_config(tmp_path, monkeypatch, body)
+    cfg = load_outreach_config()
+    assert cfg.radar_gmail_sweep_enabled is True
+    assert cfg.radar_gmail_lookback_days == 30
+
+
+def test_radar_gmail_sweep_enabled_rejects_non_bool(tmp_path, monkeypatch):
+    body = _VALID_YAML + '\nradar:\n  gmail_sweep_enabled: "yes"\n'
+    _write_config(tmp_path, monkeypatch, body)
+    with pytest.raises(ConfigError, match="gmail_sweep_enabled"):
         load_outreach_config()
 
 

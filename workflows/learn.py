@@ -488,7 +488,9 @@ def measure_cohorts(attio) -> list[dict]:
     - dm{N}_response_rate: posterior mean per step (PR-10, backward-compat scalar)
     - dm{N}_received / dm{N}_replies: eligible n_observed / n_successes (PR-10)
     """
-    raw_entries = attio.query_list_entries(limit=5000)
+    # fail_if_truncated (PR-220): a silently truncated sweep corrupts every
+    # cohort denominator below; a loud failure forces raising the limit instead.
+    raw_entries = attio.query_list_entries(limit=5000, fail_if_truncated=True)
     parsed = [attio.parse_entry(e) for e in raw_entries]
     # §3.11 soft-delete filter: drop loser entries whose union-merge
     # winner already carries the cohort identity + cadence math. Including
