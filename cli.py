@@ -136,6 +136,50 @@ class _DryRunDailyRun:
         pass
 
 
+def _experiment_registry_preflight(command: str) -> None:
+    """Experiment-registry pre-flight shared by daily / send-dms / weekly.
+
+    §0 invariant #9 + the 2026-08-23 silent-failure review: the registry is
+    re-read per prospect commit (workflows.weekly_prospect.
+    _build_prospect_entry_attrs → get_current_experiment_id), so a persistent
+    registry failure (unreadable/malformed experiments.tsv, dead registry
+    store) would otherwise recur MID-BATCH — after PhantomBuster spend and
+    partial CRM commits. Three arms:
+
+    - MultipleRunningExperimentsError → abort: ambiguous cohort; the
+      operator must close one experiment before any send.
+    - Any other exception → abort: the registry exists but cannot be read,
+      so cohort stamping would fail at every commit anyway. Failing here —
+      before the run lock, PB launch, or any CRM write — beats a mid-batch
+      traceback with partial state.
+    - Clean return (an experiment_id or None) → proceed. A genuinely
+      absent registry (missing TSV) reads as no running experiment.
+    """
+    from models.experiment import (
+        MultipleRunningExperimentsError,
+        get_current_experiment_id,
+    )
+    try:
+        _ = get_current_experiment_id()
+    except MultipleRunningExperimentsError as exc:
+        click.echo(
+            f"ABORT: cannot run {command} — {exc} "
+            "Close one experiment in experiments.tsv and re-run.",
+            err=True,
+        )
+        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001 — any registry failure is terminal here
+        click.echo(
+            f"ABORT: cannot run {command} — experiment registry is "
+            f"unreadable ({type(exc).__name__}: {exc}). The registry is "
+            "re-read on every prospect commit, so this failure would recur "
+            "mid-batch after PhantomBuster spend. Fix experiments.tsv and "
+            "re-run.",
+            err=True,
+        )
+        sys.exit(1)
+
+
 @click.group()
 def cli():
     """Outbound Agent -- LinkedIn outreach automation."""
@@ -218,40 +262,9 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
         dry_run=dry_run, allow_stale=allow_stale
     )
 
-    # PR-11 pre-flight (§0 invariant #9): if two or more experiments are
-    # `running`, `get_current_experiment_id` raises
-    # MultipleRunningExperimentsError. Surface that early — before the run
-    # lock + Attio client open — so the operator gets a clean stderr abort
-    # instead of a mid-flight traceback from one of three call sites in
-    # workflows.daily_check (run_connection_requests, run_dm_sequencing).
-    #
-    # Only the multi-running ambiguity is a hard abort. Any other failure
-    # (transient Attio error, malformed TSV cache, missing credentials in a
-    # test harness) is left for the in-flight call sites to handle — they
-    # already do, and silently swallowing here would mask real bugs the test
-    # suite asserts against.
-    from models.experiment import (
-        MultipleRunningExperimentsError,
-        get_current_experiment_id,
-    )
-    try:
-        _ = get_current_experiment_id()
-    except MultipleRunningExperimentsError as exc:
-        click.echo(
-            f"ABORT: cannot run daily — {exc} "
-            "Close one experiment in Attio (or in experiments.tsv) and re-run.",
-            err=True,
-        )
-        sys.exit(1)
-    except Exception as exc:  # noqa: BLE001 — see comment above
-        # Defer to in-flight error handling, but emit a one-line debug log so
-        # the operator can distinguish pre-flight failures (e.g., Attio down,
-        # missing creds) from in-flight failures further down the run.
-        click.echo(
-            f"[daily pre-flight] experiment check skipped: "
-            f"{type(exc).__name__}: {exc}",
-            err=True,
-        )
+    # PR-11 pre-flight (§0 invariant #9): abort on multi-running ambiguity
+    # or an unreadable registry BEFORE the run lock + CRM client open.
+    _experiment_registry_preflight("daily")
 
     # operator_today() reads OUTBOUND_TZ (default America/Lima)
     # so a UTC cron clock doesn't shift the quarantine + send-day calendar.
@@ -931,26 +944,9 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
         dry_run=dry_run, allow_stale=allow_stale
     )
 
-    # Experiment pre-flight (parity with daily): a >1 running-experiment
-    # ambiguity is a hard abort BEFORE any send. Other failures defer.
-    from models.experiment import (
-        MultipleRunningExperimentsError,
-        get_current_experiment_id,
-    )
-    try:
-        _ = get_current_experiment_id()
-    except MultipleRunningExperimentsError as exc:
-        click.echo(
-            f"ABORT: cannot send DMs — {exc} Close one experiment and re-run.",
-            err=True,
-        )
-        sys.exit(1)
-    except Exception as exc:  # noqa: BLE001 — defer to in-flight handling
-        click.echo(
-            f"[send-dms pre-flight] experiment check skipped: "
-            f"{type(exc).__name__}: {exc}",
-            err=True,
-        )
+    # Experiment pre-flight (parity with daily): ambiguity or an unreadable
+    # registry is a hard abort BEFORE any send.
+    _experiment_registry_preflight("send-dms")
 
     today = operator_today()
     lock_name = "sales-daily"  # SAME lock as daily — serializes step 1 / step 2
@@ -1148,31 +1144,10 @@ def weekly(dry_run, batch_size, search_export_id, yes, allow_stale):
         dry_run=dry_run, allow_stale=allow_stale
     )
 
-    # PR-21 pre-flight (mirrors daily's §0 invariant #9 guard): if two or more
-    # experiments are `running`, abort BEFORE any prospects commit so we never
-    # get partial-batch state with mixed cohort tags. Any other exception
-    # (transient Attio, missing credentials) is left for in-flight handling.
-    from models.experiment import (
-        MultipleRunningExperimentsError,
-        get_current_experiment_id,
-    )
-    try:
-        _ = get_current_experiment_id()
-    except MultipleRunningExperimentsError as exc:
-        click.echo(
-            f"ABORT: cannot run weekly — {exc}. Close one experiment in Attio first.",
-            err=True,
-        )
-        sys.exit(1)
-    except Exception as exc:  # noqa: BLE001 — defer to in-flight error handling
-        # One-line debug log so a pre-flight failure (Attio down, missing
-        # creds) is distinguishable from in-flight failures further down
-        # the run. Mirrors daily pre-flight.
-        click.echo(
-            f"[weekly pre-flight] experiment check skipped: "
-            f"{type(exc).__name__}: {exc}",
-            err=True,
-        )
+    # PR-21 pre-flight (mirrors daily's §0 invariant #9 guard): abort on
+    # multi-running ambiguity or an unreadable registry BEFORE any prospects
+    # commit, so we never get partial-batch state with mixed cohort tags.
+    _experiment_registry_preflight("weekly")
 
     if not search_export_id:
         click.echo("Error: PB_SEARCH_EXPORT_ID not set. Set it in .env or pass --search-export-id.")
