@@ -1699,3 +1699,52 @@ class TestResolveCompanySignals:
         )
         with pytest.raises(httpx.HTTPStatusError):
             _resolve_company_signals(attio, "Acme", "acme.com", {}, dry_run=False)
+
+
+class TestDenylistTokenMemoization:
+    """`is_denylisted_candidate` runs per candidate ROW; the Botdog YAML must
+    be parsed once per process, not once per row."""
+
+    def test_tokens_parsed_once_across_many_candidates(self, monkeypatch):
+        import scripts.seed_botdog_blacklist as seeder
+        from workflows import weekly_prospect as wp
+
+        calls: list[int] = []
+
+        def counting_denylist_tokens():
+            calls.append(1)
+            return ("contoso",)
+
+        monkeypatch.setattr(seeder, "denylist_tokens", counting_denylist_tokens)
+        wp._denylist_tokens_cached.cache_clear()
+        try:
+            for _ in range(50):
+                assert wp.is_denylisted_candidate("Contoso Holdings", None) is True
+            assert not wp.is_denylisted_candidate("Acme Foods", "Jane Doe")
+            assert len(calls) == 1
+        finally:
+            wp._denylist_tokens_cached.cache_clear()
+
+    def test_a_different_config_dir_reparses(self, monkeypatch, tmp_path):
+        """Cache is keyed on OUTBOUND_CONFIG_DIR so repointing the engine at
+        another operator's config never serves the previous one's denylist."""
+        import scripts.seed_botdog_blacklist as seeder
+        from workflows import weekly_prospect as wp
+
+        seen: list[str] = []
+
+        def per_dir_tokens():
+            import os as _os
+            seen.append(_os.environ.get("OUTBOUND_CONFIG_DIR", ""))
+            return ("contoso",) if seen[-1].endswith("a") else ()
+
+        monkeypatch.setattr(seeder, "denylist_tokens", per_dir_tokens)
+        wp._denylist_tokens_cached.cache_clear()
+        try:
+            monkeypatch.setenv("OUTBOUND_CONFIG_DIR", str(tmp_path / "a"))
+            assert wp.is_denylisted_candidate("Contoso Holdings", None) is True
+            monkeypatch.setenv("OUTBOUND_CONFIG_DIR", str(tmp_path / "b"))
+            assert wp.is_denylisted_candidate("Contoso Holdings", None) is False
+            assert len(seen) == 2
+        finally:
+            wp._denylist_tokens_cached.cache_clear()

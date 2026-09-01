@@ -789,7 +789,9 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
     # company-HQ inference in models.resolution. A NARROW human-curated
     # exception list — empty for almost everyone — so the script is the
     # only code writer; operators may also set it by hand in the CRM UI,
-    # which the resolver reads the same way.
+    # which the resolver reads the same way. Written via direct
+    # attio.update_person, NOT AttioWriter.apply, so this registry never gates
+    # it; the entry exists for manifest parity.
     ("people", "language"): "scripts.set_person_language",
 
     # ---- People: email response detection (Phase 0.6, PR-243) ----

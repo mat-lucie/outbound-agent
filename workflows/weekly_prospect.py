@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict
 
@@ -2362,6 +2363,25 @@ def new_process_summary() -> dict[str, Any]:
     }
 
 
+@lru_cache(maxsize=4)
+def _denylist_tokens_cached(_config_dir: str) -> tuple[str, ...]:
+    """The operator's never-contact tokens, parsed once per process.
+
+    ``denylist_tokens()`` re-reads and re-parses the Botdog YAML on every call
+    and :func:`is_denylisted_candidate` runs per candidate ROW, so a weekly or
+    pain-signal ingest would otherwise parse the same small file thousands of
+    times. Keyed on ``OUTBOUND_CONFIG_DIR`` so repointing the engine at another
+    config dir (as the test suite does) still re-parses — the same
+    cache-on-the-raw-env-value shape ``gmail_sweep._automated_domain_re`` uses.
+
+    An in-place EDIT of the YAML needs a new process to be picked up, which is
+    how the rest of the engine reads config.
+    """
+    from scripts.seed_botdog_blacklist import denylist_tokens
+
+    return denylist_tokens()
+
+
 def is_denylisted_candidate(
     company: str | None, name: str | None, title: str | None = None
 ) -> bool:
@@ -2379,9 +2399,9 @@ def is_denylisted_candidate(
     An operator with no denylist configured has zero tokens, so this is a
     no-op on a default install.
     """
-    from scripts.seed_botdog_blacklist import denylist_tokens, matches_denylist
+    from scripts.seed_botdog_blacklist import matches_denylist
 
-    tokens = denylist_tokens()
+    tokens = _denylist_tokens_cached(os.environ.get("OUTBOUND_CONFIG_DIR", ""))
     if not tokens:
         return False
     return matches_denylist(company, name, tokens) or (

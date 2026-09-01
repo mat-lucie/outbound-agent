@@ -13,8 +13,10 @@ from workflows.cross_channel_suppression import (
     LINKEDIN_OUTREACH_LIST_ID_ENV,
     NEGATIVE_RESPONSE_CLASSIFICATIONS,
     SUPPRESSED_STAGES,
+    EmailLaneNotProvisioned,
     apply_suppression,
     build_suppression_set,
+    email_campaign_stage_provisioned,
     email_hard_decline_ids,
     email_person_ids_in_stages,
     is_suppressed,
@@ -204,18 +206,37 @@ class TestImportSurface:
         # Importing the module must not require ATTIO_LIST_ID — only
         # build_suppression_set does. Critical because tests/test_*.py
         # may import workflows.cross_channel_suppression for any reason.
-        with patch.dict("os.environ", {}, clear=True):
-            import importlib
+        #
+        # Executed as a PRIVATE copy, NOT importlib.reload: reload rebinds the
+        # live module's objects in place, so every module that already did
+        # `from ... import EmailLaneNotProvisioned` keeps the pre-reload class
+        # and its `except` clause silently stops matching — a landmine for
+        # whichever test happens to run next.
+        import importlib.util
 
-            import workflows.cross_channel_suppression as mod
-            importlib.reload(mod)
+        import workflows.cross_channel_suppression as mod
+
+        spec = importlib.util.spec_from_file_location(
+            "cross_channel_suppression_import_probe", mod.__file__,
+        )
+        probe = importlib.util.module_from_spec(spec)
+        with patch.dict("os.environ", {}, clear=True):
+            spec.loader.exec_module(probe)
+        assert probe.WRITER_MODULE == "workflows.cross_channel_suppression"
 
 
 class TestEmailHardDeclineIds:
     """§3.1 email-channel hard declines — fail CLOSED-HARD like
     build_suppression_set (a holed set could re-contact a hard no)."""
 
-    def _attio_with_stages(self, by_stage: dict, broken: set | None = None):
+    def _attio_with_stages(
+        self,
+        by_stage: dict,
+        broken: set | None = None,
+        *,
+        people_slugs: list[str] | None = None,
+        schema_exc: Exception | None = None,
+    ):
         attio = MagicMock()
 
         def search_people(filter_=None, limit=0, *, fail_if_truncated=False):
@@ -224,7 +245,16 @@ class TestEmailHardDeclineIds:
                 raise RuntimeError("attio 503")
             return [{"id": {"record_id": rid}} for rid in by_stage.get(stage, ())]
 
+        def get_object_attributes(slug):
+            # The schema probe that discriminates "attribute absent" from
+            # "read failed". Default: attribute present (a fault is a fault).
+            if schema_exc is not None:
+                raise schema_exc
+            slugs = ["email_campaign_stage"] if people_slugs is None else people_slugs
+            return [{"api_slug": s} for s in slugs]
+
         attio.search_people.side_effect = search_people
+        attio.get_object_attributes.side_effect = get_object_attributes
         return attio
 
     def test_collects_both_decline_stages(self):
@@ -244,11 +274,75 @@ class TestEmailHardDeclineIds:
         )
 
     def test_partial_fetch_raises(self):
+        # The attribute IS provisioned, so a query failure is a real fault.
         attio = self._attio_with_stages(
             {"email_not_interested": ["rec-A"]}, broken={"unsubscribed"},
         )
         with pytest.raises(RuntimeError, match="hard-decline"):
             email_hard_decline_ids(attio)
+
+    def test_partial_fetch_is_not_a_provisioning_error(self):
+        # A transient fault must NOT masquerade as "no email lane" — that
+        # would turn an Attio outage into a silently skipped §3.1 set.
+        attio = self._attio_with_stages(
+            {"email_not_interested": ["rec-A"]}, broken={"unsubscribed"},
+        )
+        with pytest.raises(RuntimeError) as exc_info:
+            email_hard_decline_ids(attio)
+        assert not isinstance(exc_info.value, EmailLaneNotProvisioned)
+
+    def test_absent_attribute_raises_email_lane_not_provisioned(self):
+        # The optional email lane was never installed (this engine never
+        # provisions people.email_campaign_stage), so every filter 400s.
+        # Nothing is holed — the caller degrades instead of aborting.
+        attio = self._attio_with_stages(
+            {}, broken={"email_not_interested", "unsubscribed"},
+            people_slugs=["name", "email_addresses"],
+        )
+        with pytest.raises(EmailLaneNotProvisioned, match="email_campaign_stage"):
+            email_hard_decline_ids(attio)
+
+    def test_unreadable_schema_keeps_failing_closed(self):
+        # Probe failed → "unknown", which must never read as "absent".
+        attio = self._attio_with_stages(
+            {}, broken={"email_not_interested", "unsubscribed"},
+            schema_exc=RuntimeError("attio 503"),
+        )
+        with pytest.raises(RuntimeError, match="hard-decline") as exc_info:
+            email_hard_decline_ids(attio)
+        assert not isinstance(exc_info.value, EmailLaneNotProvisioned)
+
+    def test_schema_is_not_probed_on_the_happy_path(self):
+        # The discriminator costs one GET and must only be paid on failure.
+        attio = self._attio_with_stages({"email_not_interested": ["rec-A"]})
+        assert email_hard_decline_ids(attio) == {"rec-A"}
+        attio.get_object_attributes.assert_not_called()
+
+
+class TestEmailCampaignStageProvisioned:
+    def _attio(self, slugs=None, exc=None):
+        attio = MagicMock()
+        if exc is not None:
+            attio.get_object_attributes.side_effect = exc
+        else:
+            attio.get_object_attributes.return_value = [
+                {"api_slug": s} for s in (slugs or [])
+            ]
+        return attio
+
+    def test_present(self):
+        assert email_campaign_stage_provisioned(
+            self._attio(["name", "email_campaign_stage"])
+        ) is True
+
+    def test_absent(self):
+        assert email_campaign_stage_provisioned(self._attio(["name"])) is False
+
+    def test_unreadable_is_none_not_false(self):
+        # None ≠ False: callers must not read an outage as "no email lane".
+        assert email_campaign_stage_provisioned(
+            self._attio(exc=RuntimeError("attio 503"))
+        ) is None
 
 
 class TestEmailPersonIdsInStages:

@@ -218,6 +218,12 @@ class FakeAttio:
     ]
 
     def get_object_attributes(self, slug):
+        # people also carries email_campaign_stage: the default fake models a
+        # workspace where the OPTIONAL email lane IS installed, so an
+        # email-stage query failure reads as a transient fault (fail closed-
+        # hard). The not-provisioned case has its own fake below.
+        if slug == "people":
+            return [*self._FULL_SLUGS, {"api_slug": "email_campaign_stage"}]
         return self._FULL_SLUGS
 
     def get_list_attributes(self, list_id):
@@ -1688,12 +1694,63 @@ def test_hard_decline_suppresses_deal_via_any_associated_person(identity_parsers
 def test_hard_decline_fetch_failure_aborts_detection(identity_parsers):
     # Fail CLOSED-HARD, like build_suppression_set: a holed decline set could
     # re-contact a prospect who said no, so the whole run refuses to proceed.
+    # The attribute IS provisioned here (FakeAttio.get_object_attributes), so
+    # the failure is a genuine transient fault — the degrade path below must
+    # never swallow it.
     attio = FakeAttio(
         entries=[_entry("r1", "Responded", last_contact="2026-05-01")],
         decline_fetch_exc=RuntimeError("attio down"),
     )
     with pytest.raises(RuntimeError, match="hard-decline"):
         detect_candidates(attio, today=TODAY)
+
+
+class _NoEmailLaneAttio(FakeAttio):
+    """A workspace where the OPTIONAL email lane was never installed.
+
+    ``people.email_campaign_stage`` does not exist, so Attio 400s every
+    email-stage filter. This engine never provisions the attribute, so this
+    is the DEFAULT state of a fresh install that only runs LinkedIn.
+    """
+
+    def get_object_attributes(self, slug):
+        return self._FULL_SLUGS  # no email_campaign_stage on people
+
+    def search_people(self, filter_=None, limit=0, *, fail_if_truncated=False):
+        raise RuntimeError("400 unknown attribute slug 'email_campaign_stage'")
+
+
+def test_missing_email_lane_degrades_instead_of_aborting(identity_parsers):
+    # Regression: the hard-decline fetch used to raise unconditionally on a
+    # 400, so a fresh install WITHOUT the email lane got no digest at all.
+    # There is nothing to suppress on — produce the digest, say so loudly.
+    attio = _NoEmailLaneAttio(
+        entries=[_entry("r1", "Responded", last_contact="2026-05-01")],
+    )
+    res = detect_candidates(attio, today=TODAY)
+    assert {c.record_id for c in res.candidates} == {"r1"}
+    assert any("email lane not provisioned" in d for d in res.degraded)
+
+
+def test_missing_email_lane_degrade_line_reaches_the_digest(identity_parsers):
+    # The degrade must be visible to the operator, not just on the result
+    # object — a silently-skipped §3.1 input is the whole failure mode.
+    attio = _NoEmailLaneAttio(
+        entries=[_entry("r1", "Responded", last_contact="2026-05-01")],
+    )
+    res = detect_candidates(attio, today=TODAY)
+    md = render_digest(res.candidates, degraded=res.degraded)
+    assert "Detection degraded" in md
+    assert "email lane not provisioned" in md
+
+
+def test_missing_email_lane_still_allows_waiting_nudges(identity_parsers):
+    # The responded set fails CLOSED for the WAITING lane. "Absent attribute"
+    # is not a holed set — with no email lane there are no replies to collide
+    # with, so WAITING must keep emitting rather than silently going quiet.
+    attio = _NoEmailLaneAttio(entries=[_waiting_entry("w1", since="2026-06-20")])
+    res = detect_candidates(attio, today=TODAY)
+    assert {c.record_id for c in res.candidates} == {"w1"}
 
 
 def test_waiting_excluded_for_responded_email_person(identity_parsers):

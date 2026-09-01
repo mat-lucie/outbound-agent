@@ -62,6 +62,13 @@ EMAIL_HARD_DECLINE_STAGES: tuple[EmailStage, ...] = (
     EmailStage.UNSUBSCRIBED,
 )
 
+# The Person attribute every email-stage query filters on. Created by the
+# OPTIONAL email lane — this engine never provisions it (setup_attio_schema
+# only reconciles OPTIONS on an attribute that already exists), so a fresh
+# install that never installed the email lane has no such attribute and every
+# email-stage filter 400s. See EmailLaneNotProvisioned below.
+EMAIL_CAMPAIGN_STAGE_SLUG = "email_campaign_stage"
+
 LINKEDIN_OUTREACH_LIST_ID_ENV = "ATTIO_LIST_ID"
 WRITER_MODULE = "workflows.cross_channel_suppression"
 
@@ -168,6 +175,33 @@ def email_person_ids_in_stages(
     return ids, ok
 
 
+class EmailLaneNotProvisioned(RuntimeError):
+    """``people.email_campaign_stage`` does not exist in this workspace.
+
+    Deliberately NOT the same failure as a transient read error. The attribute
+    belongs to the optional email lane, which this engine never provisions, so
+    on an install without that lane there is no email stage state to read — the
+    hard-decline set is genuinely empty, not holed. Callers degrade loudly (one
+    banner line) instead of aborting the whole run, which is why this is a
+    distinct type: ``except RuntimeError`` on the fail-closed path would
+    otherwise swallow the distinction.
+    """
+
+
+def email_campaign_stage_provisioned(attio: AttioClient) -> bool | None:
+    """Whether ``people.email_campaign_stage`` exists in the live schema.
+
+    Returns True/False, or ``None`` when the probe ITSELF failed — "unknown"
+    must never read as "absent", or an Attio outage would silently disable a
+    §3.1 suppression set. One cheap GET, taken only on the failure path.
+    """
+    try:
+        slugs = {a.get("api_slug") for a in attio.get_object_attributes("people")}
+    except Exception:  # noqa: BLE001 — unknown ≠ absent; caller keeps failing closed
+        return None
+    return EMAIL_CAMPAIGN_STAGE_SLUG in slugs
+
+
 def email_hard_decline_ids(attio: AttioClient) -> set[str]:
     """Person record_ids in an email HARD-DECLINE stage (§3.1 suppression).
 
@@ -175,11 +209,28 @@ def email_hard_decline_ids(attio: AttioClient) -> set[str]:
     could re-contact a prospect who explicitly said no or unsubscribed, so a
     partial fetch raises instead of returning what it found.
 
+    The ONE exception is "the email lane was never installed" — see
+    :class:`EmailLaneNotProvisioned`. Nothing is holed there, so raising the
+    fail-closed error would kill a run that has nothing to fail closed about.
+
     Raises:
-        RuntimeError: if any of the hard-decline stage queries failed.
+        EmailLaneNotProvisioned: ``people.email_campaign_stage`` is absent from
+            the live schema (no email lane) — the caller degrades.
+        RuntimeError: any other hard-decline stage query failure.
     """
     ids, ok = email_person_ids_in_stages(attio, EMAIL_HARD_DECLINE_STAGES, "hard-decline")
     if not ok:
+        # Discriminate "the attribute isn't there" from "the read failed".
+        # AttioClient surfaces both as a bare httpx.HTTPStatusError and the
+        # shape of Attio's 400 body is not a contract we can pin, so the live
+        # schema is the only precise discriminator available. Probed here (the
+        # failure path) so the happy path pays nothing.
+        if email_campaign_stage_provisioned(attio) is False:
+            raise EmailLaneNotProvisioned(
+                f"people.{EMAIL_CAMPAIGN_STAGE_SLUG} is not provisioned in this "
+                "workspace — the optional email lane was never installed, so "
+                "there is no email hard-decline state to read."
+            )
         raise RuntimeError(
             "email hard-decline suppression set unreadable (Attio people "
             "search failed) — refusing to proceed on a partial set: a holed "

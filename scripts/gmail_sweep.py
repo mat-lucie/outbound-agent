@@ -171,6 +171,26 @@ def _automated_domain_re(extra: str) -> re.Pattern[str]:
 _ADDRESS_DOMAIN = re.compile(r"[\w.+-]+@([\w-]+\.[\w.-]+)")
 
 
+def _under(domain: str, parent: str) -> bool:
+    """True when domain IS parent or a subdomain of it."""
+    return domain == parent or domain.endswith("." + parent)
+
+
+# IANA-reserved documentation domains (RFC 2606). Nobody owns them, so they can
+# never be an operator identity — and `.env.example` ships EMAIL_FROM /
+# EMAIL_REPLY_TO as `outbound@example.com`, uncommented. Without this filter an
+# operator who copied the example without editing it would "configure"
+# example.com as their own domain, the fail-loud UNCONFIGURED guard in main()
+# would pass, and EVERY thread would misclassify silently — the exact failure
+# the guard exists to prevent.
+_RESERVED_EXAMPLE_PARENTS = ("example.com", "example.org", "example.net", "example")
+
+
+def _is_reserved_example_domain(domain: str) -> bool:
+    """True for example.com/.org/.net, the `.example` TLD, and subdomains."""
+    return any(_under(domain, parent) for parent in _RESERVED_EXAMPLE_PARENTS)
+
+
 def internal_domains() -> frozenset[str]:
     """The operator's OWN mail domains — addresses there are never a
     counterparty, and a message from one of them means "we replied last".
@@ -180,21 +200,23 @@ def internal_domains() -> frozenset[str]:
     domain of ``EMAIL_FROM`` / ``EMAIL_REPLY_TO`` (the campaign identity the
     email lane already requires). Empty means UNCONFIGURED — :func:`main`
     refuses to run rather than report every thread as owed.
+
+    Reserved example domains are dropped from BOTH paths (see
+    ``_is_reserved_example_domain``): a shipped placeholder is not
+    configuration, and letting one through defeats the UNCONFIGURED guard.
     """
-    declared = _split_domains(os.environ.get("OUTBOUND_INTERNAL_DOMAINS", ""))
+    declared = {
+        d for d in _split_domains(os.environ.get("OUTBOUND_INTERNAL_DOMAINS", ""))
+        if not _is_reserved_example_domain(d)
+    }
     if declared:
-        return declared
+        return frozenset(declared)
     derived = set()
     for var in ("EMAIL_FROM", "EMAIL_REPLY_TO"):
         match = _ADDRESS_DOMAIN.search(os.environ.get(var, "") or "")
-        if match:
+        if match and not _is_reserved_example_domain(match.group(1).lower()):
             derived.add(match.group(1).lower())
     return frozenset(derived)
-
-
-def _under(domain: str, parent: str) -> bool:
-    """True when domain IS parent or a subdomain of it."""
-    return domain == parent or domain.endswith("." + parent)
 
 
 def is_internal(address: str) -> bool:

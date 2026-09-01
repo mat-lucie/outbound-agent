@@ -24,9 +24,11 @@ The optional Botdog transport feature (``--feature botdog``) provisions the
 single ``send_channel`` list-entry attribute the delivery-transport routing
 reads. PhantomBuster owns sending, so a normal install never needs it: the
 resolver treats an absent/unset value as ``pb``. Provision it only if you
-wire the optional Botdog transport and need to mark rows it owns. Nothing in
-this engine WRITES the attribute — it is read-only routing state whose sole
-writer is an operator's own migration.
+wire the optional Botdog transport and need to mark rows it owns. No SEND path
+writes it — routing only reads it. Its sole code writer (per the §3.15 registry)
+is ``scripts.attio_dedup``, whose union merge carries a ``botdog`` stamp from any
+merged member onto the surviving entry; operators otherwise stamp rows by hand or
+from their own migration.
 
 The optional pain-signal discovery lane (``--feature pain_signal``) provisions
 the five list-entry attrs that lane stamps at commit (prospect_source,
@@ -319,8 +321,9 @@ _BOTDOG_SEND_CHANNEL_DESCRIPTION = (
     "Missing/unset resolves to 'pb' (PhantomBuster) — the default and only "
     "wired send transport. A row stamped 'botdog' is HELD OUT of PB invites "
     "and DMs and out of the Phase 0 / 0.5 scrape detectors, so it receives "
-    "no outreach from any transport until it is re-stamped 'pb'. Read-only "
-    "routing state: no code in this engine writes it."
+    "no outreach from any transport until it is re-stamped 'pb'. No send path "
+    "writes it; its sole code writer is scripts/attio_dedup.py, which carries "
+    "a 'botdog' stamp onto the survivor of a merge."
 )
 
 
