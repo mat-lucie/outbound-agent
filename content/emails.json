@@ -1,58 +1,58 @@
 {
   "email1": {
     "en": {
-      "subject": "Email 1 for {{company}} — REPLACE_THIS_TEMPLATE",
-      "body_html": "<p>Hi {{first_name}},</p><p>REPLACE_THIS_TEMPLATE — your email body for {{company}} goes here. Replace this text with your own message. Keep the {{first_name}} and {{company}} tokens.</p>"
+      "subject": "Email 1 for {{company}}: REPLACE_THIS_TEMPLATE",
+      "body_html": "<p>Hi {{first_name}},</p><p>REPLACE_THIS_TEMPLATE: your email body for {{company}} goes here. Replace this text with your own message. Keep the {{first_name}} and {{company}} tokens.</p>"
     },
     "es": {
-      "subject": "Email 1 para {{company}} — REPLACE_THIS_TEMPLATE",
-      "body_html": "<p>Hola {{first_name}},</p><p>REPLACE_THIS_TEMPLATE — aquí va tu correo para {{company}}. Reemplaza este texto con tu propio mensaje. Mantén los tokens {{first_name}} y {{company}}.</p>"
+      "subject": "Email 1 para {{company}}: REPLACE_THIS_TEMPLATE",
+      "body_html": "<p>Hola {{first_name}},</p><p>REPLACE_THIS_TEMPLATE: aquí va tu correo para {{company}}. Reemplaza este texto con tu propio mensaje. Mantén los tokens {{first_name}} y {{company}}.</p>"
     },
     "pt": {
-      "subject": "Email 1 para {{company}} — REPLACE_THIS_TEMPLATE",
-      "body_html": "<p>Olá {{first_name}},</p><p>REPLACE_THIS_TEMPLATE — seu e-mail para {{company}} vai aqui. Substitua este texto pela sua própria mensagem. Mantenha os tokens {{first_name}} e {{company}}.</p>"
+      "subject": "Email 1 para {{company}}: REPLACE_THIS_TEMPLATE",
+      "body_html": "<p>Olá {{first_name}},</p><p>REPLACE_THIS_TEMPLATE: seu e-mail para {{company}} vai aqui. Substitua este texto pela sua própria mensagem. Mantenha os tokens {{first_name}} e {{company}}.</p>"
     }
   },
   "email2": {
     "en": {
-      "subject": "Email 2 for {{company}} — REPLACE_THIS_TEMPLATE",
-      "body_html": "<p>Hi {{first_name}},</p><p>REPLACE_THIS_TEMPLATE — your email body for {{company}} goes here. Replace this text with your own message. Keep the {{first_name}} and {{company}} tokens.</p>"
+      "subject": "Email 2 for {{company}}: REPLACE_THIS_TEMPLATE",
+      "body_html": "<p>Hi {{first_name}},</p><p>REPLACE_THIS_TEMPLATE: your email body for {{company}} goes here. Replace this text with your own message. Keep the {{first_name}} and {{company}} tokens.</p>"
     },
     "es": {
-      "subject": "Email 2 para {{company}} — REPLACE_THIS_TEMPLATE",
-      "body_html": "<p>Hola {{first_name}},</p><p>REPLACE_THIS_TEMPLATE — aquí va tu correo para {{company}}. Reemplaza este texto con tu propio mensaje. Mantén los tokens {{first_name}} y {{company}}.</p>"
+      "subject": "Email 2 para {{company}}: REPLACE_THIS_TEMPLATE",
+      "body_html": "<p>Hola {{first_name}},</p><p>REPLACE_THIS_TEMPLATE: aquí va tu correo para {{company}}. Reemplaza este texto con tu propio mensaje. Mantén los tokens {{first_name}} y {{company}}.</p>"
     },
     "pt": {
-      "subject": "Email 2 para {{company}} — REPLACE_THIS_TEMPLATE",
-      "body_html": "<p>Olá {{first_name}},</p><p>REPLACE_THIS_TEMPLATE — seu e-mail para {{company}} vai aqui. Substitua este texto pela sua própria mensagem. Mantenha os tokens {{first_name}} e {{company}}.</p>"
+      "subject": "Email 2 para {{company}}: REPLACE_THIS_TEMPLATE",
+      "body_html": "<p>Olá {{first_name}},</p><p>REPLACE_THIS_TEMPLATE: seu e-mail para {{company}} vai aqui. Substitua este texto pela sua própria mensagem. Mantenha os tokens {{first_name}} e {{company}}.</p>"
     }
   },
   "email3": {
     "en": {
-      "subject": "Email 3 for {{company}} — REPLACE_THIS_TEMPLATE",
-      "body_html": "<p>Hi {{first_name}},</p><p>REPLACE_THIS_TEMPLATE — your email body for {{company}} goes here. Replace this text with your own message. Keep the {{first_name}} and {{company}} tokens.</p>"
+      "subject": "Email 3 for {{company}}: REPLACE_THIS_TEMPLATE",
+      "body_html": "<p>Hi {{first_name}},</p><p>REPLACE_THIS_TEMPLATE: your email body for {{company}} goes here. Replace this text with your own message. Keep the {{first_name}} and {{company}} tokens.</p>"
     },
     "es": {
-      "subject": "Email 3 para {{company}} — REPLACE_THIS_TEMPLATE",
-      "body_html": "<p>Hola {{first_name}},</p><p>REPLACE_THIS_TEMPLATE — aquí va tu correo para {{company}}. Reemplaza este texto con tu propio mensaje. Mantén los tokens {{first_name}} y {{company}}.</p>"
+      "subject": "Email 3 para {{company}}: REPLACE_THIS_TEMPLATE",
+      "body_html": "<p>Hola {{first_name}},</p><p>REPLACE_THIS_TEMPLATE: aquí va tu correo para {{company}}. Reemplaza este texto con tu propio mensaje. Mantén los tokens {{first_name}} y {{company}}.</p>"
     },
     "pt": {
-      "subject": "Email 3 para {{company}} — REPLACE_THIS_TEMPLATE",
-      "body_html": "<p>Olá {{first_name}},</p><p>REPLACE_THIS_TEMPLATE — seu e-mail para {{company}} vai aqui. Substitua este texto pela sua própria mensagem. Mantenha os tokens {{first_name}} e {{company}}.</p>"
+      "subject": "Email 3 para {{company}}: REPLACE_THIS_TEMPLATE",
+      "body_html": "<p>Olá {{first_name}},</p><p>REPLACE_THIS_TEMPLATE: seu e-mail para {{company}} vai aqui. Substitua este texto pela sua própria mensagem. Mantenha os tokens {{first_name}} e {{company}}.</p>"
     }
   },
   "wave2": {
     "en": {
-      "subject": "Wave 2 for {{company}} — REPLACE_THIS_TEMPLATE",
-      "body_html": "<p>Hi {{first_name}},</p><p>REPLACE_THIS_TEMPLATE — your email body for {{company}} goes here. Replace this text with your own message. Keep the {{first_name}} and {{company}} tokens.</p>"
+      "subject": "Wave 2 for {{company}}: REPLACE_THIS_TEMPLATE",
+      "body_html": "<p>Hi {{first_name}},</p><p>REPLACE_THIS_TEMPLATE: your email body for {{company}} goes here. Replace this text with your own message. Keep the {{first_name}} and {{company}} tokens.</p>"
     },
     "es": {
-      "subject": "Wave 2 para {{company}} — REPLACE_THIS_TEMPLATE",
-      "body_html": "<p>Hola {{first_name}},</p><p>REPLACE_THIS_TEMPLATE — aquí va tu correo para {{company}}. Reemplaza este texto con tu propio mensaje. Mantén los tokens {{first_name}} y {{company}}.</p>"
+      "subject": "Wave 2 para {{company}}: REPLACE_THIS_TEMPLATE",
+      "body_html": "<p>Hola {{first_name}},</p><p>REPLACE_THIS_TEMPLATE: aquí va tu correo para {{company}}. Reemplaza este texto con tu propio mensaje. Mantén los tokens {{first_name}} y {{company}}.</p>"
     },
     "pt": {
-      "subject": "Wave 2 para {{company}} — REPLACE_THIS_TEMPLATE",
-      "body_html": "<p>Olá {{first_name}},</p><p>REPLACE_THIS_TEMPLATE — seu e-mail para {{company}} vai aqui. Substitua este texto pela sua própria mensagem. Mantenha os tokens {{first_name}} e {{company}}.</p>"
+      "subject": "Wave 2 para {{company}}: REPLACE_THIS_TEMPLATE",
+      "body_html": "<p>Olá {{first_name}},</p><p>REPLACE_THIS_TEMPLATE: seu e-mail para {{company}} vai aqui. Substitua este texto pela sua própria mensagem. Mantenha os tokens {{first_name}} e {{company}}.</p>"
     }
   }
 }
