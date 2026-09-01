@@ -3,7 +3,7 @@
 import os
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import click
 import httpx
@@ -45,9 +45,14 @@ from models.pipeline import (
     is_send_eligible,
 )
 from models.resolution import (
+    BROKEN_OVERRIDE_SOURCES,
+    LanguageSource,
     MissingLanguageError,
+    classify_language_source,
     compute_next_eligible_send_date,
+    has_person_override,
     resolve_language,
+    should_report_language_source,
 )
 from workflows import recheck_cache
 from workflows.daily_check_helpers import (
@@ -74,6 +79,7 @@ from workflows.content_guard import assert_content_replaced
 from workflows.daily_run import DailyRun
 from workflows.dm_sequencer import NEXT_STAGE, STAGE_FOR_DM, get_pending_dms
 from workflows.escalation import escalate
+from workflows.metrics import phase_timer, record_phase_or_skip
 from workflows.pb_advance_gate import emit_pb_inmail_dead_end, emit_pb_silent_no_op
 from workflows.pre_invite_check import (
     _IMMUTABLE_FROZEN_AT_VALUES,
@@ -340,6 +346,40 @@ def _company_id_for_prospect(
     return attio._person_to_company.get(record_id)
 
 
+# Operator-facing explanation per reportable language source. MUST cover
+# every member of UNVERIFIED_LANGUAGE_SOURCES: a missing entry raises
+# KeyError inside the per-prospect loop, which has no try/except around it
+# — that aborts the remaining queue rather than degrading one row. The
+# invariant is pinned by test_every_unverified_source_has_an_operator_hint.
+# `{company}` is substituted with the prospect's company name where the
+# hint refers to it; hints about a broken override do not.
+_LANGUAGE_SOURCE_HINTS: dict[LanguageSource, str] = {
+    LanguageSource.LANE_DEFAULT: (
+        "{company} has no HQ country in the CRM, so nothing corroborates "
+        "this — it is the qualifier's guess from profile location."
+    ),
+    LanguageSource.COMPANY_HQ_CATCHALL: (
+        "{company}'s HQ country is non-LATAM, which tells us nothing about "
+        "this person — LATAM-based staff of multinationals are the case this "
+        "misses."
+    ),
+    LanguageSource.COMPANY_HQ_DISAGREES: (
+        "{company}'s HQ country implies the OTHER LATAM language. Not a "
+        "blocker — person-level truth outranks company HQ — but unrecorded."
+    ),
+    LanguageSource.OVERRIDE_UNUSABLE: (
+        "this person carries a `people.language` value the copy library "
+        "cannot render (only es/en/pt exist) — it was IGNORED, and the "
+        "language above is the un-overridden inference."
+    ),
+    LanguageSource.OVERRIDE_READ_FAILED: (
+        "the `people.language` read FAILED — this person may carry an "
+        "override that was lost. The language above is the un-overridden "
+        "inference and may be wrong."
+    ),
+}
+
+
 def expected_language_for_entry(
     attio: AttioClient,
     attrs: dict,
@@ -403,6 +443,8 @@ def language_mismatch_verdict(
     stored: Language,
     expected: Language | None,
     scoring_lane: str | None,
+    *,
+    person_override: bool = False,
 ) -> bool:
     """Decide whether a stored-vs-HQ language disagreement is a GENUINE
     wrong-language incident (skip the send + open a `language_mismatch` row) —
@@ -431,11 +473,21 @@ def language_mismatch_verdict(
 
     `expected is None` (undeterminable source) is subsumed by "fails open": with
     no concrete expectation we never flag, on EITHER branch.
+
+    `person_override` makes the docstring's own "person-level language truth
+    outranks company HQ" rule explicit: when a human recorded
+    `people.language` for this prospect, an HQ-derived disagreement is the HQ
+    being wrong, not the row. It suppresses the HQ branch ONLY. The us_mode
+    branch still flags, because that lane's copy is English by construction —
+    a non-EN override there is a lane violation that would ship untranslated
+    copy, not a person-level truth the guard should defer to.
     """
+    if (scoring_lane or "") == "us_mode":
+        return expected is not None and stored != Language.EN
+    if person_override:
+        return False
     if expected is None:
         return False
-    if (scoring_lane or "") == "us_mode":
-        return stored != Language.EN
     return expected in (Language.ES, Language.PT) and stored == Language.EN
 
 
@@ -2155,13 +2207,18 @@ def _build_invite_send_data(
             counts["same_company_run"] += 1
             continue
         persona = Persona.from_attio(attrs.get("persona", "operations_leaders"))
+        # Person-level override outranks company-derived guesses; mirrors
+        # the DM path so an invite and its follow-up DMs can never render
+        # in different languages for the same prospect.
+        person_lang = attio.person_language_override(str(attrs.get("record_id") or ""))
         # B-PD-001: language MUST be explicitly set on the Attio row. The
         # pre-PR-12 default-to-English silently shipped English DMs to
         # prospects whose `language` field was unset; missing language now
         # opens `missing_language` and skips the prospect.
         try:
             language = resolve_language(
-                attrs, persona=persona.value, dm_step="connection_note"
+                attrs, person_override=person_lang,
+                persona=persona.value, dm_step="connection_note"
             )
         except MissingLanguageError as exc:
             escalate(
@@ -2190,7 +2247,8 @@ def _build_invite_send_data(
         # invite. expected is None (never flag) when ambiguous.
         expected_lang = expected_language_for_entry(attio, attrs, cache)
         if language_mismatch_verdict(
-            language, expected_lang, attrs.get("scoring_lane")
+            language, expected_lang, attrs.get("scoring_lane"),
+            person_override=has_person_override(person_lang),
         ):
             # verdict True ⇒ expected_lang is a concrete Language (the helper
             # fails open to False on None) — assert for the type-checker.
@@ -3139,6 +3197,7 @@ def run_dm_sequencing(
     cache: RecordCache | None = None,
     audit_logger: AuditLogger | None = None,
     exclude_ids: set[str] | None = None,
+    metrics: Any = None,
 ) -> dict:
     """Part B: Send DMs to accepted connections based on timing.
 
@@ -3150,6 +3209,11 @@ def run_dm_sequencing(
     the exclusion simply prunes ``all_parsed`` before the DM-due selection
     loop; upstream additionally had to place it ahead of its ownership claim
     filter, which does not exist here.
+
+    ``metrics``: optional DailyRunMetrics. When provided, Part B records
+    coarse phase timings (dm_list_scan / dedup_index_build / queue_build /
+    pb_send_loop) via record_phase — latency evidence for the send-dms
+    latency work. Timing only; no behavior depends on it.
 
     `cache` may be supplied by the caller to reuse person records pre-fetched
     by earlier phases; if None, a fresh cache is built. Standalone debug runs
@@ -3233,7 +3297,9 @@ def run_dm_sequencing(
     # consistency sweep can reuse the snapshot on write-free exits instead of
     # re-fetching the same ~50k-entry list (up to ~500 paged round-trips).
     _raw_entries_snapshot: list[dict] | None
+    _t_phase = phase_timer()
     _raw_entries_snapshot, all_parsed = _get_all_entries_with_raw(attio)
+    record_phase_or_skip(metrics, "dm_list_scan", _t_phase)
     today = date.today()
     if cache is None:
         cache = RecordCache(attio)
@@ -3348,6 +3414,7 @@ def run_dm_sequencing(
         f"  Building duplicate-URL stage-rank index "
         f"({len(all_parsed)} entries, {len(unique_record_ids)} unique records)..."
     )
+    _t_phase = phase_timer()
     url_to_max_rank: dict[str, int] = {}
     url_to_stages: dict[str, list[tuple[str, str]]] = {}  # url -> [(stage, entry_id), ...]
     for attrs in all_parsed:
@@ -3363,6 +3430,10 @@ def run_dm_sequencing(
         if rank > url_to_max_rank.get(key, -1):
             url_to_max_rank[key] = rank
         url_to_stages.setdefault(key, []).append((s.value, attrs["entry_id"]))
+    # NB: with a cold cache this loop lazy-fetches person records one by
+    # one (cache.get → get_person) — the timer exists to expose exactly
+    # that.
+    record_phase_or_skip(metrics, "dedup_index_build", _t_phase)
 
     # Surface URLs with duplicate Attio entries at divergent stages — the most
     # common source of repeat-DM bugs. Print before queueing so dry-run reveals
@@ -3417,6 +3488,7 @@ def run_dm_sequencing(
     # Part-B analogue of the 2026-07-02 invite starvation bug). This loop
     # maps exclusion reasons to escalations, then applies the gates that
     # need record-cache lookups (sibling guard, company throttle).
+    _t_phase = phase_timer()
     for attrs in all_parsed:
         verdict = dm_due_step(attrs, today, audit_logger=audit_logger)
         if verdict.step is None:
@@ -3473,6 +3545,7 @@ def run_dm_sequencing(
             continue
 
         dm_queues[pending_dm].append(attrs)
+    record_phase_or_skip(metrics, "queue_build", _t_phase)
 
     total_messages = sum(len(q) for q in dm_queues.values())
     if total_messages == 0:
@@ -3580,6 +3653,13 @@ def run_dm_sequencing(
         "skipped_language_mismatch": 0,
         "skipped_company_throttled": queue_throttled_count,
         "skipped_missing_copy": 0,
+        # Advisory count (mostly dry-run): rows whose language no signal
+        # corroborates — see UNVERIFIED_LANGUAGE_SOURCES.
+        "language_unverified": 0,
+        # Subset of the above that counts BROKEN overrides (unreadable or
+        # unrenderable `people.language`). Counted on wet runs too — it is
+        # a data-integrity signal, not review noise.
+        "language_override_broken": 0,
         "dry_run": {"dm1": 0, "dm2": 0, "dm3": 0},
     }
     if queue_throttled_count:
@@ -3593,6 +3673,7 @@ def run_dm_sequencing(
             f"throttle (§3.8 {DEFAULT_THROTTLE_WINDOW_DAYS}-day window) — {throttle_row_note}."
         )
 
+    _t_phase = phase_timer()
     for step, queue in dm_queues.items():
         if not queue:
             continue
@@ -3618,9 +3699,17 @@ def run_dm_sequencing(
                 results["skipped_corrupted_company"] += 1
                 continue
             persona = Persona.from_attio(attrs.get("persona", "operations_leaders"))
+            # Person-level override outranks every company-derived guess
+            # (company HQ is the wrong key for LATAM-based staff of
+            # non-LATAM multinationals). Free for every prospect the run
+            # already preloaded; see AttioClient.person_language_override.
+            person_lang = attio.person_language_override(str(attrs["record_id"]))
             try:
                 language = resolve_language(
-                    attrs, persona=persona.value, dm_step=step.value
+                    attrs,
+                    person_override=person_lang,
+                    persona=persona.value,
+                    dm_step=step.value,
                 )
             except MissingLanguageError as exc:
                 escalate(
@@ -3650,8 +3739,15 @@ def run_dm_sequencing(
             # (language_mismatch_verdict) flags ONLY en-to-LATAM + us_mode lane
             # violations; es↔pt and HQ-derived "en" never flag (see helper).
             expected_lang = expected_language_for_entry(attio, attrs, cache)
+            lang_source = classify_language_source(
+                language,
+                person_override=person_lang,
+                hq_expected=expected_lang,
+                scoring_lane=attrs.get("scoring_lane"),
+            )
             if language_mismatch_verdict(
-                language, expected_lang, attrs.get("scoring_lane")
+                language, expected_lang, attrs.get("scoring_lane"),
+                person_override=has_person_override(person_lang),
             ):
                 # verdict True ⇒ expected_lang is a concrete Language (the
                 # helper fails open to False on None) — assert for the checker.
@@ -3678,6 +3774,43 @@ def run_dm_sequencing(
                 )
                 results["skipped_language_mismatch"] += 1
                 continue
+            # Tell the operator WHY this language was chosen, not just
+            # that it was unverified. Advisory only — the send is NOT gated
+            # (the narrowed mismatch guard above stays the only skip
+            # authority).
+            #
+            # Warns only for sources in UNVERIFIED_LANGUAGE_SOURCES, so:
+            #   * a person override is reported silently — a human already
+            #     checked it, and re-warning every run trains the operator
+            #     to skim past the line;
+            #   * an HQ country that maps to EN still warns. That bucket is
+            #     a catch-all for EVERY non-LATAM code, so backfilling
+            #     company HQ country can never silence the warning on a
+            #     LATAM-staff-of-a-multinational row the way it would have
+            #     if this branch had kept keying on `expected_lang is None`.
+            #
+            # BROKEN_OVERRIDE_SOURCES additionally warn on the WET path.
+            # Dry-run and wet are separate processes with separate caches
+            # (cli.py gates on mode.is_dry_run()), so the wet run re-reads
+            # every override: an override present at preview can be LOST at
+            # send time by one transient error. A dry-run-only warning
+            # cannot catch that, and it is the exact wrong-language
+            # incident this whole change exists to prevent.
+            if should_report_language_source(lang_source, dry_run=dry_run):
+                results["language_unverified"] += 1
+                if lang_source in BROKEN_OVERRIDE_SOURCES:
+                    results["language_override_broken"] += 1
+                # getattr shape-tolerance: resolve_language returns a
+                # Language enum in production, but advisory text must not
+                # crash on a plain code string (test fakes patch it so).
+                _lang_code = getattr(language, "value", language)
+                click.echo(
+                    f"  ⚠ {name or attrs['record_id']} ({step.value}): "
+                    f"language {_lang_code!r} — source: {lang_source.value}; "
+                    f"{_LANGUAGE_SOURCE_HINTS[lang_source].format(company=company or 'company')} "
+                    f"Verify before approving.",
+                    err=True,
+                )
             # PR-16 (B-PD-005): MissingMessageError → missing_copy queue
             # row + skip. Pre-PR-16 silent Spanish fallback would have
             # shipped wrong-language DMs.
@@ -4057,11 +4190,36 @@ def run_dm_sequencing(
             f"PB-unreported: {len(pb_unreported)}."
         )
 
+    record_phase_or_skip(metrics, "pb_send_loop", _t_phase)
+
     if results["skipped_missing_language"]:
         click.echo(
             f"  Skipped {results['skipped_missing_language']} prospect(s) with "
             f"missing/invalid language — see `missing_language` Operator "
             f"Review Queue rows."
+        )
+    if results["language_unverified"]:
+        # Advisory rollup: per-row warnings scroll away in a long run, so
+        # this puts the total where the operator reads the summary. Mostly
+        # a dry-run concern, but NOT dry-run-only — broken overrides
+        # increment this counter on wet runs too (see
+        # should_report_language_source).
+        click.echo(
+            f"  ⚠ {results['language_unverified']} queued DM(s) carry a "
+            f"language nothing corroborates — verify before approving. "
+            f"Record the checked value on the person with "
+            f"scripts/set_person_language.py; "
+            f"scripts/backfill_company_hq_country.py fixes company HQ data."
+        )
+    if results["language_override_broken"]:
+        # Deliberately separate from the line above: an override that could
+        # not be read or rendered is a BROKEN signal, not a missing one, and
+        # it fires on wet runs where the rollup above stays silent.
+        click.echo(
+            f"  ⚠ {results['language_override_broken']} of those had a BROKEN "
+            f"`people.language` override (unreadable, or set to a language "
+            f"with no copy) — those prospects may have been sent the "
+            f"un-overridden language. Re-check them before the next step."
         )
     if results["skipped_language_mismatch"]:
         click.echo(

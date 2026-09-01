@@ -48,7 +48,7 @@ dedicated parsers, never a generic flat map.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -56,6 +56,9 @@ from clients.attio import AttioClient, AttioResultTruncated
 from clients.crm.base import CRMProvider, Entry, Record, RecordInfo, Stage
 from clients.crm.exceptions import ResultTruncatedError, UniquenessConflictError
 from clients.crm.mapping import CRMMapping, default_attio_mapping
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 # Attio-internal concurrency tuning for bulk person fetch. The contract drops
 # this knob from the signature (see module docstring); we keep the inner
@@ -244,6 +247,31 @@ class AttioProvider(CRMProvider):
             metrics=metrics,
         )
         return {rid: self._to_record(raw, "people") for rid, raw in raw_map.items()}
+
+    def prefetch_companies_for_persons(
+        self, records: Iterable[Record], *, metrics: Any = None
+    ) -> int:
+        """Warm the inner client's company caches for these persons' employers.
+
+        Attio's ``extract_record_info`` follows the person's ``company``
+        record reference with one blocking GET per first-seen company,
+        serially — the dominant cost of a large pipeline preload. Harvest the
+        distinct linked company ids off the untouched payloads
+        (``Record.raw``) and fan them out through the client's bounded pool so
+        the per-person resolves that follow are cache hits.
+
+        Fail-open per the contract: ``bulk_prime_company_caches`` isolates
+        per-company failures internally, and an unwarmed company still
+        resolves lazily in ``extract_person_info``.
+        """
+        company_ids = {
+            cid
+            for record in records
+            if (cid := AttioClient.person_company_ref_id(record.raw)) is not None
+        }
+        if not company_ids:
+            return 0
+        return self._attio.bulk_prime_company_caches(company_ids, metrics=metrics)
 
     def search_person_by_linkedin(self, linkedin_url: str) -> Record | None:
         raw = self._attio.search_person_by_linkedin(linkedin_url)

@@ -24,6 +24,7 @@ import click
 
 from clients.crm.attio_provider import AttioProvider
 from clients.crm.base import CRMProvider
+from workflows.metrics import phase_timer, record_phase_or_skip
 
 if TYPE_CHECKING:
     from clients.attio import AttioClient
@@ -114,13 +115,43 @@ def preload_pipeline_persons(
     if not record_ids:
         return 0
     crm: CRMProvider = attio if isinstance(attio, CRMProvider) else AttioProvider(attio)
+    _t = phase_timer()
     try:
         records = crm.bulk_fetch_persons(record_ids, metrics=metrics)
     except Exception as e:
         click.echo(f"  Warning: bulk preload failed ({e}); falling back to per-record fetches.")
         return 0
+    finally:
+        record_phase_or_skip(metrics, "preload_person_fetch_parallel", _t)
+    # Pre-warm the linked companies through the provider's bounded pool, so
+    # the per-person resolve loop below reads them from cache instead of one
+    # blocking company GET per first-seen company (the dominant cost of a
+    # large preload). Optional optimization: providers without a company
+    # lookup no-op, and any company left unwarmed resolves lazily as before.
+    _t = phase_timer()
+    try:
+        crm.prefetch_companies_for_persons(records.values(), metrics=metrics)
+    except Exception as e:
+        # Fail-open (the prefetch is an optimization; the resolve loop
+        # still resolves every company) — but LOUD in metrics: a total
+        # prefetch collapse means the run silently regresses to the slow
+        # serial path, so it must reach the end-of-run summary, not just
+        # scrollback.
+        msg = (
+            f"bulk company prefetch failed "
+            f"({type(e).__name__}: {e}); "
+            f"falling back to serial company fetches"
+        )
+        if metrics is not None:
+            metrics.warn(msg)
+        click.echo(f"  Warning: {msg}.")
+    finally:
+        record_phase_or_skip(metrics, "preload_company_fetch_parallel", _t)
     primed = 0
     failures = 0
+    # Residual serial bucket: cache hits after the prefetch above, plus a
+    # lazy blocking GET for any company the prefetch failed to warm.
+    _t = phase_timer()
     for rid, record in records.items():
         try:
             info = crm.extract_person_info(record)
@@ -131,6 +162,7 @@ def preload_pipeline_persons(
             primed += 1
         except Exception:
             failures += 1
+    record_phase_or_skip(metrics, "preload_company_resolve_serial", _t)
     if failures:
         click.echo(
             f"  Warning: {failures} record(s) failed to prime "

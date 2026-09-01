@@ -230,6 +230,19 @@ def _claim_gate_rule(
 # misspellings of their own product name (see examples/acme/content/claims.json).
 _DEFAULT_BANNED_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("muchas ganas", re.compile(r"muchas\s+ganas", re.IGNORECASE)),
+    # Slop punctuation: dash-style asides read as AI-generated. Restructure
+    # into plain sentences instead.
+    ("em dash", re.compile(r"—")),
+    ("en dash", re.compile(r"–")),
+    ("double hyphen", re.compile(r"--")),
+    # A hyphen with spaces around it is a pseudo-dash; hyphenated compounds
+    # ("last-minute") and numeric ranges ("3-4 horas") don't match.
+    ("spaced hyphen used as dash", re.compile(r"\s-\s")),
+    # "not just X" contrast constructions
+    ("'not just' contrast", re.compile(r"\b(?:isn't|not)\s+just\b", re.IGNORECASE)),
+    ("'no solo' contrast", re.compile(r"\bno\s+s[oó]lo\b", re.IGNORECASE)),
+    ("'não apenas' contrast", re.compile(r"\bn[aã]o\s+apenas\b", re.IGNORECASE)),
+    ("'the real difference'", re.compile(r"\bthe\s+real\s+difference\b", re.IGNORECASE)),
 ]
 
 

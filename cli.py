@@ -184,7 +184,11 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
     from workflows.detect_email_responses import detect_email_responses
     from workflows.detect_responses import NoCSVHalt, detect_responses
     from workflows.escalation import escalate
-    from workflows.metrics import DailyRunMetrics
+    from workflows.metrics import (
+        DailyRunMetrics,
+        phase_timer,
+        record_phase_or_skip,
+    )
     from workflows.record_cache import RecordCache, preload_pipeline_persons
     from workflows.run_lock import (
         EXIT_TEMPFAIL,
@@ -289,7 +293,9 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                     # Bulk-preload person records once so all four phases share a warm cache.
                     # Skips ~593 redundant get_person calls per run vs. the per-phase cache pattern.
                     list_id = os.environ.get("ATTIO_LIST_ID", "")
+                    _t_scan = phase_timer()
                     entries = crm.query_list_entries(list_id=list_id)
+                    record_phase_or_skip(metrics, "list_scan_preload_ids", _t_scan)
                     all_record_ids = {e.record_id for e in entries}
                     all_record_ids.discard(None)
                     all_record_ids.discard("")
@@ -714,6 +720,7 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                             dry_run=dry_run, auto_confirm=yes, cache=cache,
                             audit_logger=audit_logger,
                             daily_run=daily_run,  # type: ignore[arg-type]
+                            metrics=metrics,
                         )
                     else:
                         click.echo("Skipping DMs (no PB_MESSAGE_SENDER_ID set)")
@@ -893,7 +900,11 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
         ReopenCollision,
     )
     from workflows.detect_responses import NoCSVHalt, detect_responses
-    from workflows.metrics import DailyRunMetrics
+    from workflows.metrics import (
+        DailyRunMetrics,
+        phase_timer,
+        record_phase_or_skip,
+    )
     from workflows.record_cache import RecordCache, preload_pipeline_persons
     from workflows.run_lock import (
         EXIT_TEMPFAIL,
@@ -1012,7 +1023,9 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
                         raise SystemExit(EXIT_TEMPFAIL)
 
                     list_id = os.environ.get("ATTIO_LIST_ID", "")
+                    _t_scan = phase_timer()
                     entries = crm.query_list_entries(list_id=list_id)
+                    record_phase_or_skip(metrics, "list_scan_preload_ids", _t_scan)
                     all_record_ids = {e.record_id for e in entries}
                     all_record_ids.discard(None)
                     all_record_ids.discard("")
@@ -1075,6 +1088,7 @@ def send_dms(dry_run, yes, batch_size, message_sender_id, inbox_scraper_id, forc
                         audit_logger=audit_logger,
                         daily_run=daily_run,
                         exclude_ids=set(exclude_ids),
+                        metrics=metrics,
                     )
                     click.echo(f"\nCode: {format_provenance(code_provenance)}")
             except NoDailyRunRow as exc:

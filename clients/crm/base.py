@@ -59,7 +59,10 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 # ── Normalized data types ────────────────────────────────────────────────
 #
@@ -244,6 +247,31 @@ class CRMProvider(abc.ABC):
         counter names are the contract — the conformance suite passes a sink with
         exactly these attributes and asserts they reflect the fetch.
         """
+
+    def prefetch_companies_for_persons(
+        self, records: Iterable[Record], *, metrics: Any = None
+    ) -> int:
+        """Warm any employer-lookup cache for these persons' linked companies.
+
+        Optional read-path OPTIMIZATION, not a semantic step — the default
+        implementation is a no-op returning 0, and no engine behavior may
+        depend on it having run. :meth:`extract_person_info` must resolve the
+        employer identically whether or not this ran first. Concrete adapters
+        therefore need not implement it (hence not abstract).
+
+        Adapters whose ``extract_person_info`` follows a per-person record
+        reference (Attio does one blocking company GET per first-seen company,
+        serially) override this to fan the distinct companies out
+        concurrently, so the subsequent per-person resolves become cache hits.
+
+        Fail-open: implementations MUST NOT raise for a per-company fetch
+        failure — an unwarmed company simply resolves lazily as before.
+        ``metrics``, when supplied, is the engine's ``DailyRunMetrics`` sink;
+        an adapter that fans out SHOULD bump
+        ``bulk_fetch_companies_requested`` / ``_returned`` / ``_failed``.
+        Returns the number of companies warmed (0 for the default no-op).
+        """
+        return 0
 
     @abc.abstractmethod
     def search_person_by_linkedin(self, linkedin_url: str) -> Record | None:

@@ -210,6 +210,10 @@ class TestRecordCacheUnknownGuard:
         # Minimal record with no name/company/industry/title.
         record = {"id": {"record_id": "rid_1"}, "values": {}}
         attio = MagicMock(spec=AttioClient)
+        # spec'd mocks carry the class's METHODS but none of its instance
+        # state, so the side-effect caches extract_record_info writes to
+        # have to be supplied by hand.
+        attio._person_language_cache = {}
         # Use the real extract_record_info logic via the actual class
         # (MagicMock can't bind unbound methods automatically).
         result = AttioClient.extract_record_info(attio, record)

@@ -1,5 +1,6 @@
 """Attio CRM API v2 client."""
 
+import json
 import logging
 import os
 import random
@@ -12,6 +13,7 @@ from urllib.parse import unquote
 import httpx
 
 from models.pipeline import STAGE_RANK, PipelineStage
+from models.resolution import LANGUAGE_OVERRIDE_READ_FAILED
 
 logger = logging.getLogger(__name__)
 
@@ -375,6 +377,13 @@ class AttioClient:
         # DM/connection language guard (PR-240) costs at most one company fetch
         # per distinct company per run.
         self._company_hq_country_cache: dict[str, str | None] = {}
+        # person_record_id → raw `people.language` code, or None when the
+        # person carries no override. Populated as a SIDE EFFECT of
+        # extract_record_info (same idiom as _person_to_company) so the
+        # language override rides the existing bulk person preload and
+        # costs zero extra API calls on the send path — which matters,
+        # since this lives inside the send-dms latency budget.
+        self._person_language_cache: dict[str, str | None] = {}
         # Count of stage-regressing add_list_entry PATCHes the defense-in-depth
         # backstop neutralized over this client's lifetime. A batch orchestrator
         # can read this after a run and escalate if it fired — escalate() can't
@@ -510,6 +519,41 @@ class AttioClient:
                 return None
             raise
 
+    def _bulk_fetch_fail_open(
+        self, ids: list[str], fetch_one, on_error, max_workers: int = 8,
+    ):
+        """Yield ``(id, record)`` from a bounded-pool fan-out of `fetch_one`.
+
+        Shared skeleton of the person/company bulk paths. Per-id failures
+        of the fail-open classes — transport, missing-key, malformed
+        response shape, undecodable JSON body — are routed to
+        ``on_error(id, exc)`` and the id is skipped; other exception
+        types propagate so refactor bugs surface immediately instead of
+        silently dropping every id. ``record`` may be None (404) —
+        callers decide what that means. Records are yielded on the
+        calling thread; pool workers only fetch.
+
+        retry_500=False lives in the callers' `fetch_one`: these paths
+        are fail-open per record, so under a systemic 500 outage
+        retrying would burn the full backoff budget per record (hours
+        across a sweep) and still end in the same degraded result —
+        fail fast and let the metrics surface it.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_id = {pool.submit(fetch_one, i): i for i in ids}
+            for future in as_completed(future_to_id):
+                i = future_to_id[future]
+                try:
+                    record = future.result()
+                except (
+                    httpx.HTTPError, KeyError, TypeError, json.JSONDecodeError,
+                ) as exc:
+                    on_error(i, exc)
+                    continue
+                yield i, record
+
     def bulk_fetch_persons_by_record_ids(
         self, record_ids: set[str], max_workers: int = 8,
         *, metrics: Any = None,
@@ -528,48 +572,33 @@ class AttioClient:
         """
         if not record_ids:
             return {}
-        import sys
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         ids = list(record_ids)
         if metrics is not None:
             metrics.bulk_fetch_records_requested += len(ids)
+
+        def on_error(rid: str, exc: Exception) -> None:
+            if metrics is not None:
+                metrics.bulk_fetch_records_failed += 1
+                metrics.warn(
+                    f"bulk_fetch get_person({rid}) failed: "
+                    f"{type(exc).__name__}"
+                )
+            print(
+                f"WARNING: bulk_fetch_persons_by_record_ids: "
+                f"get_person({rid}) failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
         result: dict[str, dict] = {}
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            # retry_500=False: this path is fail-open per record, so under a
-            # systemic 500 outage retrying would burn the full backoff budget
-            # per record (hours across a weekly sweep) and still end in the
-            # same degraded result — fail fast and let the metrics surface it.
-            future_to_id = {
-                pool.submit(self.get_person, rid, retry_500=False): rid for rid in ids
-            }
-            for future in as_completed(future_to_id):
-                rid = future_to_id[future]
-                try:
-                    record = future.result()
-                except (httpx.HTTPError, KeyError, TypeError) as exc:
-                    # Narrowed catch: transport, missing-key, malformed
-                    # response shape. Bugs outside this set (AssertionError,
-                    # ValueError from a refactor) still propagate so they
-                    # surface immediately instead of silently dropping
-                    # every record.
-                    if metrics is not None:
-                        metrics.bulk_fetch_records_failed += 1
-                        metrics.warn(
-                            f"bulk_fetch get_person({rid}) failed: "
-                            f"{type(exc).__name__}"
-                        )
-                    print(
-                        f"WARNING: bulk_fetch_persons_by_record_ids: "
-                        f"get_person({rid}) failed: "
-                        f"{type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
-                    continue
-                if record is not None:
-                    result[rid] = record
-                    if metrics is not None:
-                        metrics.bulk_fetch_records_returned += 1
+        for rid, record in self._bulk_fetch_fail_open(
+            ids, lambda r: self.get_person(r, retry_500=False),
+            on_error, max_workers,
+        ):
+            if record is not None:
+                result[rid] = record
+                if metrics is not None:
+                    metrics.bulk_fetch_records_returned += 1
         return result
 
     def search_person_by_linkedin(self, linkedin_url: str) -> dict | None:
@@ -679,10 +708,16 @@ class AttioClient:
         data = self._request("POST", "/objects/companies/records", json={"data": {"values": attributes}})
         return data.get("data", {})
 
-    def get_company(self, record_id: str) -> dict | None:
-        """Get a company record by its record ID. Returns None if not found."""
+    def get_company(self, record_id: str, *, retry_500: bool = True) -> dict | None:
+        """Get a company record by its record ID. Returns None if not found.
+
+        `retry_500=False` opts back out of transient-500 retry — the
+        fail-open bulk company prefetch uses it so a systemic Attio
+        outage fails fast per record instead of blocking in backoff
+        sleeps (mirrors get_person).
+        """
         try:
-            data = self._request("GET", f"/objects/companies/records/{record_id}", retry_500=True)
+            data = self._request("GET", f"/objects/companies/records/{record_id}", retry_500=retry_500)
             return data.get("data", data)
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
@@ -759,6 +794,25 @@ class AttioClient:
         """Update an existing company record."""
         data = self._request("PATCH", f"/objects/companies/records/{record_id}", json={"data": {"values": attributes}})
         return data.get("data", {})
+
+    def invalidate_company_hq_country(self, company_id: str) -> None:
+        """Drop one company from the HQ-country read cache.
+
+        Public seam for writers that mutate `hq_country_code` and then
+        verify through `company_hq_country_code` (e.g.
+        scripts/backfill_company_hq_country.py) — without reaching into
+        the private cache dict.
+        """
+        self._company_hq_country_cache.pop(company_id, None)
+
+    def invalidate_person_language(self, person_record_id: str) -> None:
+        """Drop one person from the language-override read cache.
+
+        Public seam for writers that set `people.language` and then verify
+        through `person_language_override` (scripts/set_person_language.py),
+        without reaching into the private cache dict.
+        """
+        self._person_language_cache.pop(person_record_id, None)
 
     def search_company_by_domain(self, domain: str) -> dict | None:
         """Find a company record by domain. Returns None if not found."""
@@ -1296,6 +1350,215 @@ class AttioClient:
             return item.get("value", item)
         return None
 
+    @staticmethod
+    def person_company_ref_id(record: dict) -> str | None:
+        """Return the linked company record id from a person record, or None.
+
+        Pure parse — no API call, total over malformed shapes. None when
+        the person has no company field, the field holds a plain value
+        rather than a record reference (extract_record_info renders
+        those verbatim), or the record is off-shape. Totality matters:
+        the preload harvests ids from every fetched person in one
+        comprehension, and one raising record would abort the whole
+        prefetch instead of costing one person.
+        """
+        if not isinstance(record, dict):
+            return None
+        values = record.get("values", {})
+        if not isinstance(values, dict):
+            return None
+        company_data = values.get("company", values.get("primary_company", []))
+        if company_data and isinstance(company_data, list):
+            ref = company_data[0]
+            if isinstance(ref, dict) and ref.get("target_record_id"):
+                return ref["target_record_id"]
+        return None
+
+    def _prime_company(self, cid: str, cr_values: dict) -> tuple[str, str]:
+        """Parse a fetched company's values and populate the per-run caches.
+
+        Shared by extract_record_info's lazy fetch and the bulk prefetch
+        so both paths cache identically. `cr_values` is `{}` when the
+        record was missing or the fetch failed — that primes the same
+        empty-string sentinel the lazy path always cached. Off-shape
+        `name` entries (non-dict — the same shape
+        is_linkedin_clearbit_corrupted already guards against) degrade
+        to the empty sentinel instead of raising.
+        """
+        if not isinstance(cr_values, dict):
+            cr_values = {}
+        # COMPANY name stays the LITERAL "name" — no documented
+        # field_mapping key for company name (full_name is the PERSON
+        # name), so routing it would invent a mapping.
+        company = ""
+        cr_name = cr_values.get("name", [])
+        if isinstance(cr_name, list) and cr_name and isinstance(cr_name[0], dict):
+            company = cr_name[0].get("value", "")
+        industry = first_option_title(cr_values.get("industry_vertical"))
+        self._company_cache[cid] = company
+        self._industry_cache[cid] = industry
+        self._company_corruption_cache[cid] = (
+            is_linkedin_clearbit_corrupted({"values": cr_values}, self._field_slug)
+        )
+        return company, industry
+
+    def bulk_prime_company_caches(
+        self, company_ids: set[str], max_workers: int = 8,
+        *, metrics: Any = None,
+    ) -> int:
+        """Parallel-fetch companies and prime the per-run company caches.
+
+        ``extract_record_info`` otherwise does one blocking company GET
+        per first-seen company, serially, inside the preload prime loop.
+        Pre-fetching the distinct company ids through a bounded pool
+        turns that loop into cache hits.
+
+        Fail-open per company: a fetch or parse failure is logged +
+        counted and the id is left unprimed, so extract_record_info's
+        existing lazy serial fetch covers it. A 404 primes the same
+        empty-string sentinel the lazy path caches, but does NOT count
+        as `bulk_fetch_companies_returned` — mirroring the persons
+        contract, so dangling company refs stay visible as
+        requested != returned + failed. No send-time guard reads these
+        caches (name/industry/corruption only — hq_country_code is
+        deliberately NOT primed here; the language guard resolves it
+        live at queue-build time).
+
+        Returns the number of companies primed (404 sentinels included).
+        """
+        todo = [
+            cid for cid in company_ids
+            if cid and cid not in self._company_cache
+        ]
+        if not todo:
+            return 0
+        if metrics is not None:
+            metrics.bulk_fetch_companies_requested += len(todo)
+
+        def on_error(cid: str, exc: Exception) -> None:
+            if metrics is not None:
+                metrics.bulk_fetch_companies_failed += 1
+                metrics.warn(
+                    f"bulk company prefetch get_company({cid}) "
+                    f"failed: {type(exc).__name__}"
+                )
+            print(
+                f"WARNING: bulk_prime_company_caches: "
+                f"get_company({cid}) failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+        primed = 0
+        for cid, record in self._bulk_fetch_fail_open(
+            todo, lambda c: self.get_company(c, retry_500=False),
+            on_error, max_workers,
+        ):
+            # Primes on the calling thread — pool workers only fetch.
+            # Per-company isolation: a malformed record shape skips that
+            # one company (lazy path covers it) instead of aborting the
+            # rest of the batch.
+            try:
+                self._prime_company(cid, (record or {}).get("values", {}))
+            except (KeyError, TypeError, AttributeError, IndexError) as exc:
+                on_error(cid, exc)
+                continue
+            primed += 1
+            if record is not None and metrics is not None:
+                metrics.bulk_fetch_companies_returned += 1
+        return primed
+
+    @staticmethod
+    def extract_person_select_value(values: dict, field: str) -> str:
+        """Extract a select attribute value from a PERSON RECORD's ``values``.
+
+        Handles the shapes ``GET /v2/objects/people/records/{id}`` returns:
+        - ``{field: [{"value": "pt"}]}``                 (plain value)
+        - ``{field: [{"option": {"title": "pt"}}]}``     (select option)
+        - ``{field: "pt"}``                              (scalar, test fakes)
+
+        Returns "" when absent or off-shape — never raises.
+
+        Canonical home for this shape handling: person-record values carry
+        no ``attribute_type`` discriminator, so ``_extract_value`` (which
+        targets LIST-ENTRY values and branches on it) cannot read them.
+        """
+        raw = values.get(field)
+        if raw is None:
+            return ""
+        if isinstance(raw, str):
+            return raw.strip()
+        if isinstance(raw, list) and raw:
+            item = raw[0]
+            if isinstance(item, dict):
+                opt = item.get("option") or {}
+                if isinstance(opt, dict) and opt.get("title"):
+                    return str(opt["title"]).strip()
+                v = item.get("value")
+                if v is not None:
+                    return str(v).strip()
+        return ""
+
+    @staticmethod
+    def _extract_person_language(values: dict) -> str | None:
+        """Raw `people.language` override code, or None when unset.
+
+        Returns the code verbatim (lower-cased) WITHOUT validating it
+        against the `Language` enum — the CRM select may also offer codes
+        the copy library has no templates for. Validation is the
+        resolver's job (`models.resolution.coerce_language`), so an
+        unsupported value degrades to "no override" at exactly one place
+        instead of being silently dropped here.
+        """
+        code = AttioClient.extract_person_select_value(values, "language")
+        return code.lower() or None
+
+    def person_language_override(self, person_record_id: str) -> str | None:
+        """Return this person's explicit `people.language` override, or None.
+
+        The person-level override outranks every company-derived language
+        inference (see `models.resolution` module docstring). It is a
+        NARROW exception list — empty for almost everyone — so None is the
+        normal answer and means "no human has contradicted the inference".
+
+        Cost: free for any person the run already resolved through
+        `RecordCache.get` / `preload_pipeline_persons`, which is every
+        prospect on the send path. Falls back to a single lazy fetch for
+        an unseen person.
+
+        Never raises. Returns None when the id is empty or the record has
+        no override, and the `LANGUAGE_OVERRIDE_READ_FAILED` sentinel when
+        the fetch itself errored.
+
+        The sentinel matters: None is the NORMAL answer here, and a row
+        with no override can still classify as a corroborated source that
+        prints nothing. Collapsing a failed read into None would therefore
+        make a prospect whose override was just lost look HEALTHIER than an
+        ordinary row — and ship the very message the override existed to
+        prevent. The sentinel keeps the two apart all the way to the
+        operator's screen, and the failure is deliberately NOT cached, so a
+        one-off blip is retried rather than frozen in for the whole run.
+        """
+        if not person_record_id:
+            return None
+        if person_record_id in self._person_language_cache:
+            return self._person_language_cache[person_record_id]
+
+        try:
+            record = self.get_person(person_record_id)
+        except Exception as exc:  # noqa: BLE001 — never raise into the send path
+            print(
+                f"  WARN: person_language_override({person_record_id!r}) hit "
+                f"{type(exc).__name__}: {exc}. Language override UNKNOWN for "
+                f"this prospect (not cached; will retry).",
+                file=sys.stderr,
+            )
+            return LANGUAGE_OVERRIDE_READ_FAILED
+
+        code = self._extract_person_language(record.get("values", {})) if record else None
+        self._person_language_cache[person_record_id] = code
+        return code
+
     def extract_record_info(
         self, record: dict,
     ) -> tuple[str | None, str | None, str, str | None, str]:
@@ -1305,6 +1568,14 @@ class AttioClient:
         Industry comes from the company's industry_vertical field. Title is the
         person's own job_title, surfaced so dry-run output can show it for ICP
         review before sending.
+
+        PRECONDITION — `record` must be a COMPLETE person record, not a
+        projection. This method populates the `_person_language_cache`
+        side-effect cache from `record["values"]`, and a partial record
+        would cache "no override" for a person who has one, silently
+        disabling the override with no signal
+        (`person_language_override` trusts the cache and won't re-fetch).
+        Every caller today passes a full `get_person` / bulk-fetch record.
         """
         values = record.get("values", {})
 
@@ -1322,13 +1593,26 @@ class AttioClient:
             title = str(tv.get("value", tv) if isinstance(tv, dict) else tv)
 
         person_record_id = record.get("id", {}).get("record_id", "")
+        if person_record_id:
+            # Side-effect cache, same idiom as _person_to_company below:
+            # the person record is already in hand, so harvesting the
+            # language override here makes person_language_override() free
+            # for every person the run has resolved. The returned tuple is
+            # deliberately NOT widened — many call sites unpack it
+            # positionally, and none of them want this field.
+            self._person_language_cache[person_record_id] = (
+                self._extract_person_language(values)
+            )
         company = ""
         industry = ""
         company_data = values.get("company", values.get("primary_company", []))
         if company_data and isinstance(company_data, list) and company_data:
             ref = company_data[0]
-            if isinstance(ref, dict) and ref.get("target_record_id"):
-                cid = ref["target_record_id"]
+            # Same parse as the bulk prefetch's id harvest — keeping the
+            # two definitionally identical so the prefetch always covers
+            # exactly the companies this lazy path would fetch.
+            cid = self.person_company_ref_id(record)
+            if cid:
                 if person_record_id:
                     self._person_to_company[person_record_id] = cid
                 if cid in self._company_cache:
@@ -1340,24 +1624,9 @@ class AttioClient:
                         cr = self._request("GET", f"/objects/companies/records/{cid}")
                         cr_data = cr.get("data", cr)
                         cr_values = cr_data.get("values", {})
-                        # COMPANY name stays the LITERAL "name" — no documented
-                        # field_mapping key for company name (full_name is the
-                        # PERSON name), so routing it would invent a mapping.
-                        cr_name = cr_values.get("name", [])
-                        if cr_name:
-                            company = cr_name[0].get("value", "")
-                        iv = cr_values.get("industry_vertical", [])
-                        if iv and isinstance(iv[0], dict):
-                            industry = iv[0].get("option", {}).get("title", "")
                     except httpx.HTTPStatusError:
                         pass
-                    self._company_cache[cid] = company
-                    self._industry_cache[cid] = industry
-                    self._company_corruption_cache[cid] = (
-                        is_linkedin_clearbit_corrupted(
-                            {"values": cr_values}, self._field_slug
-                        )
-                    )
+                    company, industry = self._prime_company(cid, cr_values)
             else:
                 company = str(ref.get("value", ref))
 

@@ -150,7 +150,7 @@ class TestBannedPhrases:
     def test_registry_banned_pattern_blocks(self):
         # Operators register misspellings of their own product name.
         patterns = _banned_patterns_from_claims(self._TYPO_REGISTRY)
-        text = "Hi John, I'm with Acmee — we build AI for production scheduling."
+        text = "Hi John, I'm with Acmee. We build AI for production scheduling."
         findings = _banned_phrases_rule(text, "loc", patterns)
         blocks = _blocks(findings)
         assert len(blocks) >= 1
@@ -159,7 +159,7 @@ class TestBannedPhrases:
     def test_correct_product_name_not_blocked(self):
         # "Acme" is NOT "Acmee" — the word-boundary pattern must not fire.
         patterns = _banned_patterns_from_claims(self._TYPO_REGISTRY)
-        text = "I'm with Acme — we build AI for production scheduling."
+        text = "I'm with Acme. We build AI for production scheduling."
         findings = _banned_phrases_rule(text, "loc", patterns)
         assert _blocks(findings) == [], "the correct spelling should not be flagged"
 
@@ -176,15 +176,67 @@ class TestBannedPhrases:
 
     def test_no_registry_key_uses_defaults_only(self):
         patterns = _banned_patterns_from_claims({})
-        text = "Hi John, I'm with Acmee — muchas ganas de hablar."
+        text = "Hi John, I'm with Acmee. Muchas ganas de hablar."
         findings = _banned_phrases_rule(text, "loc", patterns)
         blocks = _blocks(findings)
         assert len(blocks) == 1, "only the built-in ban should fire"
 
     def test_acme_name_not_blocked(self):
-        text = "I'm with Acme — we build AI for production scheduling."
+        text = "I'm with Acme. We build AI for production scheduling."
         findings = _banned_phrases_rule(text, "loc")
         assert findings == []
+
+    # --- slop punctuation / phrasing ---
+
+    def test_em_dash_blocks(self):
+        text = "I'm with Acme — we build AI for production scheduling."
+        findings = _banned_phrases_rule(text, "loc")
+        assert len(_blocks(findings)) >= 1, "Em dash should BLOCK"
+
+    def test_en_dash_blocks(self):
+        text = "The plan – rebuilt in seconds."
+        findings = _banned_phrases_rule(text, "loc")
+        assert len(_blocks(findings)) >= 1, "En dash should BLOCK"
+
+    def test_double_hyphen_blocks(self):
+        text = "We build AI -- for production scheduling."
+        findings = _banned_phrases_rule(text, "loc")
+        assert len(_blocks(findings)) >= 1, "Double hyphen should BLOCK"
+
+    def test_spaced_hyphen_blocks(self):
+        text = "Trabajamos con plantas como la tuya - sin proyecto de TI."
+        findings = _banned_phrases_rule(text, "loc")
+        assert len(_blocks(findings)) >= 1, "Spaced hyphen used as dash should BLOCK"
+
+    def test_hyphenated_compound_not_blocked(self):
+        text = "Every week it fell apart: shortages, last-minute changes."
+        findings = _banned_phrases_rule(text, "loc")
+        assert _blocks(findings) == [], "Hyphenated compounds should not be flagged"
+
+    def test_numeric_range_not_blocked(self):
+        text = "El programador se aventaba 3-4 horas diarias armando el plan."
+        findings = _banned_phrases_rule(text, "loc")
+        assert _blocks(findings) == [], "Numeric ranges should not be flagged"
+
+    def test_not_just_blocks(self):
+        text = "It's not just scheduling, it's the whole operation."
+        findings = _banned_phrases_rule(text, "loc")
+        assert len(_blocks(findings)) >= 1, "'not just' contrast should BLOCK"
+
+    def test_no_solo_blocks(self):
+        text = "Optimiza para el objetivo real de la planta, no solo productividad."
+        findings = _banned_phrases_rule(text, "loc")
+        assert len(_blocks(findings)) >= 1, "'no solo' contrast should BLOCK"
+
+    def test_nao_apenas_blocks(self):
+        text = "Otimiza para o objetivo real da planta, não apenas produtividade."
+        findings = _banned_phrases_rule(text, "loc")
+        assert len(_blocks(findings)) >= 1, "'não apenas' contrast should BLOCK"
+
+    def test_the_real_difference_blocks(self):
+        text = "The real difference is how fast the team recovers."
+        findings = _banned_phrases_rule(text, "loc")
+        assert len(_blocks(findings)) >= 1, "'the real difference' should BLOCK"
 
     def test_clean_text_no_findings(self):
         text = "Hi, I'd love to connect and share what we're seeing in production planning."
