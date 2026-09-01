@@ -194,7 +194,7 @@ PHASE0_PROSPECT_MIN_BUDGET = 10
 SUSPECTED_STALE_MIN_AGE_DAYS = 4
 
 
-def _build_botdog_sender() -> "BotdogSender":
+def _build_botdog_sender() -> "BotdogSender | None":
     """Construct the OPTIONAL `BotdogSender` for the event drain.
 
     PhantomBuster owns sending: no send path in this module constructs a
@@ -206,11 +206,36 @@ def _build_botdog_sender() -> "BotdogSender":
     BOTDOG_API_KEY or a populated `config/botdog.yaml`. A missing key or
     an unconfigured transport fails loudly here.
 
+    Returns None — with a visible skip line — when the operator's config
+    says ``enabled: false``. That flag is documented as "every Botdog
+    surface is inert", so honoring it is what makes the documentation
+    true: without this check the drain would poll (and the shipped
+    template's ``REPLACE_WITH_...`` campaign ids would be polled as if
+    they were real) purely because BOTDOG_SEND_ENABLED was on.
+
     The blacklist presence gate is deliberately NOT run here: it is a
     PRE-SEND safety step, and the drain is read-only. A gate failure must
     never kill an event drain for a send path that does not exist.
     """
-    from clients.botdog_config import BOTDOG_API_KEY_ENV, load_botdog_config
+    from clients.botdog_config import (
+        BOTDOG_API_KEY_ENV,
+        PLACEHOLDER_MARKER,
+        load_botdog_config,
+    )
+
+    config = load_botdog_config()
+    if not config.enabled:
+        # Config-first, before the key check: a disabled transport must
+        # not demand credentials it will never use.
+        click.echo(
+            "  ⊘ Botdog event drain SKIPPED: the transport is configured "
+            "`enabled: false` (or no config/botdog.yaml exists), which "
+            "means every Botdog surface is inert — BOTDOG_SEND_ENABLED "
+            "alone does not override it. Set `enabled: true` with real "
+            "campaign ids to drain events, or BOTDOG_SEND_ENABLED=false "
+            "to stop asking."
+        )
+        return None
 
     if not os.environ.get(BOTDOG_API_KEY_ENV):
         raise RuntimeError(
@@ -219,7 +244,23 @@ def _build_botdog_sender() -> "BotdogSender":
             f"{BOTDOG_API_KEY_ENV} in .env, or set BOTDOG_SEND_ENABLED=false "
             f"to stop polling Botdog events. Nothing was sent."
         )
-    config = load_botdog_config()
+    # Last stop before a placeholder id would be USED as a real campaign.
+    # `load_botdog_config` already refuses this combination, so reaching
+    # here means the loader's guard was bypassed or regressed — fail loud
+    # rather than poll a campaign that does not exist.
+    placeholders = sorted(
+        role for role, value in config.campaigns.items()
+        if PLACEHOLDER_MARKER in value
+    )
+    if placeholders:
+        raise RuntimeError(
+            f"The Botdog event-ingest drain is active but campaign id(s) "
+            f"{placeholders} still carry the shipped "
+            f"{PLACEHOLDER_MARKER}... placeholder from "
+            f"config/botdog.example.yaml. Fill in the real campaign ids "
+            f"from the Botdog dashboard, or set enabled: false. Nothing "
+            f"was polled and nothing was sent."
+        )
     if not config.campaign_ids:
         raise RuntimeError(
             "The Botdog event-ingest drain is active (BOTDOG_SEND_ENABLED "

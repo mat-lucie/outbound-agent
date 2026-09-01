@@ -496,6 +496,39 @@ class TestDryRun:
         assert report["cursor_after"] is None
 
 
+# ── disabled transport ────────────────────────────────────────────────
+
+
+class TestTransportDisabled:
+    """`enabled: false` in the operator's config means every Botdog
+    surface is inert. The builder answers None; the drain must then touch
+    nothing — no CRM read, no cursor move — rather than crash or poll."""
+
+    def test_none_sender_short_circuits_before_any_work(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(botdog_ingest, "POLL_STATE_DIR", tmp_path)
+        monkeypatch.setattr(
+            botdog_ingest, "POLL_STATE_FILE", tmp_path / "botdog_poll.json"
+        )
+        monkeypatch.setattr(
+            "workflows.daily_check._build_botdog_sender", lambda: None
+        )
+        entries = MagicMock(side_effect=AssertionError("must not read CRM"))
+
+        report = ingest_botdog_events(
+            MagicMock(),
+            now=datetime(2026, 6, 20, 9, 0, tzinfo=UTC),
+            entries_provider=entries,
+        )
+
+        assert report["transport_disabled"] is True
+        assert report["cursor_after"] is None
+        assert not (tmp_path / "botdog_poll.json").exists()
+        entries.assert_not_called()
+        assert "SKIPPED" in botdog_ingest.format_report(report)
+
+
 # ── cursor read/write/catch-up ────────────────────────────────────────
 
 

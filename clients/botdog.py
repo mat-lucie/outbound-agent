@@ -100,7 +100,9 @@ def blacklist_name() -> str:
     ``scripts/seed_botdog_blacklist`` (writes the collection) and the
     pre-send presence gate in
     ``workflows.daily_check_helpers.assert_botdog_blacklist_seeded`` (reads
-    it). If they ever disagreed, the gate would pass on a collection the
+    it — a helper an operator wires into a send path they build; no engine
+    path calls it). If they ever disagreed, the gate would pass on a
+    collection the
     seed never filled and Botdog could cold-contact a never-contact
     company. Operator-overridable via ``config/botdog.yaml``
     (``blacklist.collection_name``).

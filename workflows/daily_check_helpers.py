@@ -76,10 +76,14 @@ def _resolve_send_channel(attrs: dict) -> str:
 # ── Botdog blacklist presence gate ───────────────────────────────────
 # Botdog inherits NONE of PhantomBuster's internal never-contact memory,
 # so `scripts/seed_botdog_blacklist.py --apply` is a hard pre-send step
-# for any operator who wires the Botdog transport. Documentation-only, it
-# would be skippable — and the very first Botdog run could then re-invite
-# someone already burned, or cold-contact a company on the operator's
-# never-contact denylist. This gate makes that step CODE-ENFORCED.
+# for any operator who wires the Botdog transport. The very first Botdog
+# run could otherwise re-invite someone already burned, or cold-contact a
+# company on the operator's never-contact denylist.
+#
+# THIS GATE IS A HELPER, NOT AN AUTOMATIC ONE. This engine sends through
+# PhantomBuster; the Botdog surface is off by default and no production
+# path calls this function. An operator who builds a Botdog send path
+# MUST call it themselves before the first send — nothing else will.
 #
 # Memoized per PROCESS (one `get_blacklists` call per run, not one per
 # send step). `reset_blacklist_gate()` exists for tests.
@@ -110,6 +114,17 @@ def assert_botdog_blacklist_seeded(client: "BotdogClient") -> None:
 
     Both non-blocking paths still set the memo, so the warning prints once
     per run rather than once per step.
+
+    An UNREADABLE lead count (``collection_lead_count`` → None, meaning
+    "unknown", never "empty") also passes — but loudly: the gate then
+    verified EXISTENCE only, not that the set is populated.
+
+    NOT WIRED INTO ANY SEND PATH IN THIS ENGINE. PhantomBuster owns
+    sending here and the Botdog surface is off by default, so nothing
+    calls this today (the Phase 0.7 event drain deliberately does not —
+    it is read-only and sends nothing). It is the ready-made gate for an
+    operator who wires a Botdog send path: call it before building the
+    sender, or the never-contact set is never checked.
     """
     global _blacklist_gate_checked
     if _blacklist_gate_checked:
@@ -161,7 +176,22 @@ def assert_botdog_blacklist_seeded(client: "BotdogClient") -> None:
             f"{BOTDOG_SKIP_BLACKLIST_CHECK_ENV}=1 for emergencies. "
             f"Nothing was sent."
         )
-    if collection_lead_count(match) == 0:
+    lead_count = collection_lead_count(match)
+    if lead_count is None:
+        # "Unknown", never "empty" (see `collection_lead_count`), so the
+        # gate PASSES on existence alone. That pass is deliberate — a
+        # populated collection whose payload omits the count must not
+        # block a run — but it is a WEAKER verdict than the operator
+        # thinks they are getting, so it is never silent.
+        print(
+            f"  ⚠ Botdog blacklist presence gate: the collection {name!r} "
+            f"exists but its payload carries NO readable lead count — the "
+            f"gate is passing on EXISTENCE ONLY and has NOT verified the "
+            f"never-contact set is populated. Confirm it in Botdog, or "
+            f"re-run scripts/seed_botdog_blacklist.py --apply.",
+            file=sys.stderr,
+        )
+    if lead_count == 0:
         raise RuntimeError(
             f"Botdog blacklist not seeded — the collection {name!r} exists "
             f"but is EMPTY (0 leads). Run "

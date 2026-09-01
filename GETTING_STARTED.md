@@ -199,6 +199,9 @@ a read-only event drain. It polls Botdog lead events so rows stamped
 `send_channel=botdog` can absorb their confirming accept / DM-advance / reply
 events. It never sends. Leave it off and the phase is a one-line skip; an
 ordinary run then never needs `BOTDOG_API_KEY` or a `config/botdog.yaml`.
+Both switches must be on: the drain also requires `enabled: true` in
+`config/botdog.yaml`. `enabled: false` means every Botdog surface is inert, and
+the drain then prints a skip line and polls nothing.
 
 The `send_channel` stamp is the safety interlock. A row stamped `botdog` is
 held **out** of PB invites and DMs *and* out of the Phase 0 / 0.5 scrape
@@ -222,12 +225,19 @@ To wire it up:
 4. **Seed the never-contact set before any Botdog send.**
    `python3 scripts/seed_botdog_blacklist.py` previews; `--apply` writes. Botdog
    inherits none of PhantomBuster's internal never-contact memory, so without
-   this it can re-invite someone you already burned. A pre-send gate refuses to
-   build a Botdog sender until the collection exists and is non-empty
+   this it can re-invite someone you already burned. Add any organisation you
+   must never contact on any channel to `blacklist.denylist_companies` in
+   `config/botdog.yaml` — those are seeded at any pipeline stage.
+
+   The repo ships a pre-send gate for this,
+   `workflows.daily_check_helpers.assert_botdog_blacklist_seeded`: it raises
+   unless the collection exists and is non-empty
    (`BOTDOG_SKIP_BLACKLIST_CHECK=1` is a loud emergency override, never a
-   silent one). Add any organisation you must never contact on any channel to
-   `blacklist.denylist_companies` in `config/botdog.yaml` — those are seeded at
-   any pipeline stage.
+   silent one). **It is a helper you must wire in, not an automatic check.**
+   Nothing in this engine calls it — the engine sends through PhantomBuster,
+   and Phase 0.7 is a read-only drain that sends nothing. If you build a
+   Botdog send path, call the gate yourself before the first send; otherwise
+   the never-contact set is never verified.
 
 | Object | Attribute | Type | Purpose |
 |--------|-----------|------|---------|

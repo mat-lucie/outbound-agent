@@ -112,6 +112,23 @@ class TestGatePasses:
         client = _client([{"id": "bl_1", "name": _name()}])
         assert_botdog_blacklist_seeded(client)
 
+    def test_unknown_lead_count_warns_that_it_verified_existence_only(
+        self, capsys
+    ):
+        """The pass is deliberate, but it is a WEAKER verdict than the
+        operator thinks they got — `None` means "unknown", not "0". Saying
+        nothing lets an unreadable count read as a clean gate."""
+        client = _client([{"id": "bl_1", "name": _name()}])
+        assert_botdog_blacklist_seeded(client)
+        err = capsys.readouterr().err
+        assert "NO readable lead count" in err
+        assert "EXISTENCE ONLY" in err
+
+    def test_known_lead_count_does_not_warn(self, capsys):
+        client = _client([{"id": "bl_1", "name": _name(), "leadCount": 42}])
+        assert_botdog_blacklist_seeded(client)
+        assert "EXISTENCE ONLY" not in capsys.readouterr().err
+
     def test_empty_duplicate_does_not_shadow_the_populated_collection(self):
         """Duplicate same-named collections exist in the wild — one empty,
         one populated. The gate must pick the POPULATED one by lead count,
@@ -176,9 +193,20 @@ class TestBuilderWiring:
     ingestion that confirms deliveries. The builder must NOT run it."""
 
     def test_build_botdog_sender_does_not_run_the_gate(self, monkeypatch):
+        from clients.botdog_config import BotdogConfig
         from workflows import daily_check
 
         monkeypatch.setenv("BOTDOG_API_KEY", "bd_test")
+        # The reference config ships `enabled: false` (the engine default
+        # posture), and a disabled transport is now skipped outright — so
+        # this test builds an ENABLED config in-process to reach the
+        # construction path the gate assertion is about.
+        monkeypatch.setattr(
+            "clients.botdog_config.load_botdog_config",
+            lambda: BotdogConfig(
+                enabled=True, campaigns={"invite": "cmp-1"}
+            ),
+        )
         # An account with NO blacklist collections at all — a gate call
         # would raise "not seeded"; the drain builder must not care.
         fake_client = _client([])
@@ -186,5 +214,71 @@ class TestBuilderWiring:
             "clients.botdog.BotdogClient", lambda *a, **k: fake_client
         )
         sender = daily_check._build_botdog_sender()
+        assert sender is not None
         assert sender._client is fake_client
         assert fake_client.get_blacklists.call_count == 0
+
+
+class TestBuilderHonorsEnabledAndPlaceholders:
+    """`config/botdog.example.yaml` documents `enabled: false` as "every
+    Botdog surface is inert". The builder must make that TRUE: reading a
+    disabled config and constructing a sender anyway (polling whatever
+    campaign ids the template happens to carry, placeholders included) is
+    the flag lying about itself."""
+
+    def _config(self, monkeypatch, **kwargs):
+        from clients.botdog_config import BotdogConfig
+
+        monkeypatch.setattr(
+            "clients.botdog_config.load_botdog_config",
+            lambda: BotdogConfig(**kwargs),
+        )
+
+    def test_disabled_config_skips_the_build_visibly(
+        self, monkeypatch, capsys
+    ):
+        from workflows import daily_check
+
+        monkeypatch.setenv("BOTDOG_API_KEY", "bd_test")
+        self._config(
+            monkeypatch, enabled=False, campaigns={"invite": "cmp-1"}
+        )
+        monkeypatch.setattr(
+            "clients.botdog.BotdogClient",
+            lambda *a, **k: pytest.fail("must not construct a client"),
+        )
+
+        assert daily_check._build_botdog_sender() is None
+        assert "SKIPPED" in capsys.readouterr().out
+
+    def test_disabled_config_does_not_demand_an_api_key(
+        self, monkeypatch
+    ):
+        """A transport that will not act must not require credentials it
+        will never use — the enabled check runs FIRST."""
+        from workflows import daily_check
+
+        monkeypatch.delenv("BOTDOG_API_KEY", raising=False)
+        self._config(monkeypatch, enabled=False)
+
+        assert daily_check._build_botdog_sender() is None
+
+    def test_surviving_placeholder_campaign_id_fails_loud(self, monkeypatch):
+        """Last stop before a template value would be used as a real
+        campaign. The loader already refuses this pairing, so reaching
+        here means that guard was bypassed — never poll it anyway."""
+        from workflows import daily_check
+
+        monkeypatch.setenv("BOTDOG_API_KEY", "bd_test")
+        self._config(
+            monkeypatch,
+            enabled=True,
+            campaigns={"invite": "REPLACE_WITH_BOTDOG_INVITE_CAMPAIGN_ID"},
+        )
+        monkeypatch.setattr(
+            "clients.botdog.BotdogClient",
+            lambda *a, **k: pytest.fail("must not construct a client"),
+        )
+
+        with pytest.raises(RuntimeError, match="REPLACE_WITH"):
+            daily_check._build_botdog_sender()

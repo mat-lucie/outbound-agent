@@ -54,8 +54,10 @@ BOTDOG_ACCOUNT_ID_ENV = "BOTDOG_ACCOUNT_ID"
 DEFAULT_BLACKLIST_NAME = "Never-contact (CRM-seeded)"
 
 # Any value still carrying this marker came straight from the shipped
-# template and was never filled in.
-_PLACEHOLDER_MARKER = "REPLACE_WITH"
+# template and was never filled in. Public because the last-stop check in
+# `workflows.daily_check._build_botdog_sender` re-tests it right before a
+# campaign id would actually be USED — one marker, two guards, no drift.
+PLACEHOLDER_MARKER = "REPLACE_WITH"
 
 
 @dataclass(frozen=True)
@@ -197,20 +199,20 @@ def load_botdog_config() -> BotdogConfig:
             )
         placeholders = sorted(
             role for role, value in campaigns.items()
-            if _PLACEHOLDER_MARKER in value
+            if PLACEHOLDER_MARKER in value
         )
         if placeholders:
             raise ConfigError(
                 f"botdog config sets enabled: true but campaign id(s) "
                 f"{placeholders} still carry the shipped "
-                f"{_PLACEHOLDER_MARKER}... placeholder. Fill in the real "
+                f"{PLACEHOLDER_MARKER}... placeholder. Fill in the real "
                 f"campaign ids from the Botdog dashboard, or set "
                 f"enabled: false."
             )
-        if _PLACEHOLDER_MARKER in account_id:
+        if PLACEHOLDER_MARKER in account_id:
             raise ConfigError(
                 "botdog config sets enabled: true but account_id still "
-                f"carries the shipped {_PLACEHOLDER_MARKER}... placeholder."
+                f"carries the shipped {PLACEHOLDER_MARKER}... placeholder."
             )
 
     return BotdogConfig(

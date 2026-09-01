@@ -338,6 +338,9 @@ def _new_report(dry_run: bool) -> _Report:
         # detail read). They emit no events, so they hold the cursor.
         "leads_unread": 0,
         "cursor_write_skipped": False,
+        # True when the operator's config has the transport disabled: the
+        # drain returned before polling anything.
+        "transport_disabled": False,
         "unledgered_message_sent": 0,
         "unledgered_message_sent_urls": [],
         "stale_botdog_invites": 0,
@@ -903,8 +906,11 @@ def ingest_botdog_events(
 
     ``sender`` defaults to ``daily_check._build_botdog_sender()`` (lazy —
     only constructed here, so a pure-PB run that never calls this stays
-    key-free). ``entries_provider`` defaults to
-    ``_get_all_entries_parsed``; both are injectable for tests.
+    key-free). That builder returns None when the operator's config says
+    ``enabled: false``; the drain then reports ``transport_disabled`` and
+    touches nothing — no poll, no writes, no cursor move.
+    ``entries_provider`` defaults to ``_get_all_entries_parsed``; both are
+    injectable for tests.
     """
     now = _as_utc(now or datetime.now(UTC))
     report = _new_report(dry_run)
@@ -917,6 +923,12 @@ def ingest_botdog_events(
     if sender is None:
         from workflows.daily_check import _build_botdog_sender
         sender = _build_botdog_sender()
+        if sender is None:
+            # `enabled: false` means inert (the builder already said so on
+            # stdout). Return before the poll, and BEFORE any cursor write
+            # — a disabled transport must not advance state.
+            report["transport_disabled"] = True
+            return report
 
     # OVERLAP POLL: ask for events since
     # `cursor - BOTDOG_POLL_OVERLAP`, not since the cursor. The cursor
@@ -1126,6 +1138,11 @@ def ingest_botdog_events(
 
 def format_report(report: dict) -> str:
     """One-block human-readable run summary for the daily log."""
+    if report.get("transport_disabled"):
+        return (
+            "Botdog ingest: SKIPPED — the transport is configured "
+            "`enabled: false`, so nothing was polled and no cursor moved."
+        )
     age = report.get("cursor_age_seconds")
     age_str = f"{age / 3600:.1f}h" if isinstance(age, (int, float)) else "n/a"
     by_type = report.get("events_by_type") or {}
