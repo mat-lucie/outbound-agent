@@ -1393,6 +1393,19 @@ class AttioClient:
             "response_received_at": AttioClient._extract_value(values, "response_received_at"),
             "canonical_linkedin_url": AttioClient._extract_value(values, "canonical_linkedin_url"),
             "vanity_url_slug": AttioClient._extract_value(values, "vanity_url_slug"),
+            # ---- Pain-signal discovery lane (PR-280 / PR-284) ----
+            # prospect_source routes the invite-note selection in
+            # _build_invite_send_data (pain note vs persona note);
+            # pain_source_type picks the reference frame (poster = authorship
+            # note; commenter/liker = engagement note). The remaining three
+            # are operator-review + measurement context. None on every
+            # non-pain-lane entry, and on every workspace that never
+            # provisioned the optional attributes.
+            "prospect_source": AttioClient._extract_value(values, "prospect_source"),
+            "pain_source_type": AttioClient._extract_value(values, "pain_source_type"),
+            "pain_snippet": AttioClient._extract_value(values, "pain_snippet"),
+            "source_post_url": AttioClient._extract_value(values, "source_post_url"),
+            "source_post_at": AttioClient._extract_value(values, "source_post_at"),
             # Cohort archaeology sentinel (§3.10). The DQR counts entries
             # stamped legacy_* as the observability metric for how much
             # of the cohort is locked out of sends; without this

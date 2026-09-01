@@ -164,7 +164,50 @@ contract whose other half lives in the Botdog UI.
 
 ---
 
-## 7. Loaded content is still the original operator's defaults
+## 7. The pain-signal discovery lane ships OFF and needs your own keywords
+
+`workflows/pain_signal.py` is a complete second supply lane — LinkedIn post
+keyword search → posters/commenters/likers → Sales Nav enrichment → the normal
+qualify pipeline — but it is inert on a fresh install and cannot be woken by a
+single flag. Two independent gates hold it closed: `OUTBOUND_PAIN_SIGNAL_ENABLED`
+must be the literal `1`, AND `content/pain_keywords.json` must be
+operator-approved. The shipped registry carries the `REPLACE_THIS_TEMPLATE`
+sentinel and `status: "placeholder"`, and the approval check refuses on the
+sentinel **independently of the status stamp** — so flipping the status without
+replacing the queries still cannot scrape (or invite off) the engine's own
+template text.
+
+Three things are your work, not config:
+
+- **The keyword registry is yours to write.** The bundled queries are
+  placeholders; `examples/acme/content/pain_keywords.json` is a synthetic
+  reference showing only the file's shape. Real queries come from real buyer
+  language — call transcripts, not translated playbook English — and every
+  query you add is a claim your invite note makes about the post.
+- **The topic gate proves the phrase, not the note.** A post's people are
+  accepted only when the post text literally contains an enabled query's phrase
+  (accent/case-folded, word-bounded, all terms for a paired query). That stops
+  LinkedIn's inexact "exact phrase" search from feeding you work-anniversary
+  posts and job ads. It cannot verify that your fixed note copy actually
+  describes the post — deciding a stretched query is not worth shipping is an
+  operator judgement at the wet gate.
+- **The engager workers' launch contract is version-dependent.** Only the posts
+  worker's contract is pinned by tests against a known column set. The
+  commenters/likers workers are optional by construction: leave their ids blank
+  and the lane runs posters-only and says so on every run. Their CSV column
+  fallbacks cover the shapes this phantom family has shipped, and a column
+  rename surfaces as a counted, echoed drop rather than a silent "nobody
+  engaged".
+
+There is no operations runbook for it: the upstream one is written around one
+operator's phantoms, container ids and live-verification history. The module
+docstring carries the architecture and the safety posture instead, and
+GETTING_STARTED.md → *(Optional) Pain-signal discovery lane* carries the
+operator-facing setup.
+
+---
+
+## 8. Loaded content is still the original operator's defaults
 
 The files the engine loads at runtime (`content/personas.json`,
 `content/messages.json`, `content/emails.json`, `content/targets.json`,
@@ -213,6 +256,7 @@ operation (see GETTING_STARTED.md §6). Two gaps to be aware of:
 | Email + Sheets not abstracted | Replace `resend_client.py` / `google_sheets.py` manually | Engine degrades gracefully on missing `RESEND_API_KEY` |
 | Partial workflow migration | Some workflows still use raw `AttioClient` | Follow migration pattern in CONTRACT.md |
 | Botdog transport ships unwired | Optional alternative sender exists but no send path routes to it; the event drain is Attio-only | Wire `BotdogSender` yourself; see GETTING_STARTED.md |
+| Pain-signal lane ships OFF with placeholder keywords | The second supply lane is inert until you write your own keyword registry and approve it | Replace `content/pain_keywords.json`, set `OUTBOUND_PAIN_SIGNAL_ENABLED=1`; see GETTING_STARTED.md |
 | Content is the original operator's | `content/` files need replacement | Replace before production use; P5 will ship neutral defaults |
 | Email one-click unsubscribe / webhook | No hosted endpoint; opt-outs are manual via mailto + `email-unsubscribe` CLI | Operator stands up an HTTP endpoint + Resend webhook for full automation |
 | `email-association` skips suppression | Association emails not gated by cross-channel suppression | Curate the list manually; Attio-client plumbing is a tracked follow-up |

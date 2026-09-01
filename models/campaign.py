@@ -227,6 +227,70 @@ def get_message(
     return body
 
 
+# ── Pain-signal lane (PR-280 / PR-284) ───────────────────────────────
+#
+# The pain-signal discovery lane's connection notes live in a dedicated
+# top-level `messages.json` group keyed by SOURCE TYPE, not by persona: the
+# note references the prospect's LinkedIn post (or their reaction to one),
+# which is orthogonal to which persona their title classified into. The group
+# is deliberately NOT a Persona enum member — `Persona.from_attio` silently
+# falls back on unknown values, so a pseudo-persona would risk shipping wrong
+# copy silently. Selection happens in
+# `workflows/daily_check.py::_build_invite_send_data` off the entry's
+# `prospect_source == "pain_signal"` attribute; a missing (source_type,
+# language) body raises `MissingMessageError` so the caller can fall back to
+# the persona note LOUDLY.
+PAIN_SIGNAL_MESSAGE_GROUP = "pain_signal"
+
+# Single source for the valid pain_source_type values — the schema script
+# seeds its select options from this tuple, and the note-frame mapping below
+# must cover exactly these.
+PAIN_SIGNAL_SOURCE_TYPES = ("poster", "commenter", "liker")
+
+# Reference-frame mapping: the engager workers yield three source types but
+# the group ships TWO reference frames. A commenter did not write the post, so
+# the engagement-frame note is the honest one for them — same as a liker. Only
+# a verified author gets the authorship frame.
+_PAIN_NOTE_TEMPLATE_BY_SOURCE = {
+    "poster": "connection_note_poster",
+    "commenter": "connection_note_liker",
+    "liker": "connection_note_liker",
+}
+assert set(_PAIN_NOTE_TEMPLATE_BY_SOURCE) == set(PAIN_SIGNAL_SOURCE_TYPES), (
+    "every pain_source_type needs a note-frame mapping"
+)
+
+
+def get_pain_signal_note(
+    language: Language,
+    *,
+    source_type: str,
+    record_id: str | None = None,
+) -> str:
+    """Get the pain-signal connection-note template for a source type.
+
+    `source_type` is `"poster"` (they wrote the matched post), `"commenter"`
+    (they commented on it), or `"liker"` (they reacted to it). Posters get the
+    authorship reference frame; commenters and likers share the engagement
+    frame — claiming a non-author wrote the post would be wrong on the wire.
+    Unknown source types raise `MissingMessageError` (never guess which
+    reference frame to use).
+    """
+    messages = load_messages()
+    group = messages.get(PAIN_SIGNAL_MESSAGE_GROUP) or {}
+    step_key = _PAIN_NOTE_TEMPLATE_BY_SOURCE.get(source_type)
+    body = (group.get(step_key) or {}).get(language.value) if step_key else None
+    if not body:
+        raise MissingMessageError(
+            persona=PAIN_SIGNAL_MESSAGE_GROUP,
+            language=language.value,
+            dm_step=step_key or f"connection_note_{source_type}",
+            variant="default",
+            record_id=record_id,
+        )
+    return body
+
+
 INDUSTRY_LABELS: dict[str, dict[str, str]] = {
     "Manufacturing": {"es": "manufactura", "en": "manufacturing", "pt": "manufatura"},
     "Food & Beverage": {"es": "alimentos y bebidas", "en": "food & beverage", "pt": "alimentos e bebidas"},

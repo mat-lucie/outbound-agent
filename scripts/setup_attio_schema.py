@@ -28,6 +28,11 @@ wire the optional Botdog transport and need to mark rows it owns. Nothing in
 this engine WRITES the attribute — it is read-only routing state whose sole
 writer is an operator's own migration.
 
+The optional pain-signal discovery lane (``--feature pain_signal``) provisions
+the five list-entry attrs that lane stamps at commit (prospect_source,
+pain_source_type, pain_snippet, source_post_url, source_post_at). The lane is
+off by default, so a fresh install never needs them.
+
 The optional Migration Provenance feature (``--feature provenance``)
 creates the ``last_migrated_by`` back-pointer on the record objects
 ``MigrationRunWriter`` stamps (``people`` and ``companies``). Without it
@@ -44,6 +49,7 @@ Usage:
   python3 scripts/setup_attio_schema.py --feature phase06     # add email-detection attrs
   python3 scripts/setup_attio_schema.py --feature provenance  # add last_migrated_by
   python3 scripts/setup_attio_schema.py --feature botdog      # add send_channel
+  python3 scripts/setup_attio_schema.py --feature pain_signal # add pain-lane attrs
   python3 scripts/setup_attio_schema.py --feature all         # all of the above
 """
 from __future__ import annotations
@@ -60,6 +66,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from clients.attio import AttioClient  # noqa: E402
+from models.campaign import PAIN_SIGNAL_SOURCE_TYPES  # noqa: E402
 from scripts._attio_migration_helpers import (  # noqa: E402
     ensure_attribute,
     reconcile_select_options,
@@ -344,6 +351,79 @@ def _provision_botdog(client: AttioClient, list_id: str, dry_run: bool) -> None:
         click.echo(f"  ✓ {target}: exists ({action})")
 
 
+# ── Pain-signal discovery lane (OPTIONAL) ──────────────────────────────────
+# Five list-entry attributes, written ONCE at PROSPECT-commit by
+# workflows/pain_signal.py (via _commit_prospect's lane_entry_attrs merge).
+# OFF by default: the lane itself is gated behind
+# OUTBOUND_PAIN_SIGNAL_ENABLED and an operator-approved keyword registry, so
+# a fresh install never needs these attributes at all.
+#
+# Deliberately NOT in the core `_build_specs` 400-retry strip set: a pain-lane
+# commit against an unmigrated schema must fail LOUD (run this script), not
+# land silently without the metadata that selects its invite note. The lane's
+# own wet-run preflight probes `prospect_source` AND the `commenter` option
+# before any write, and names this command in its error.
+_PAIN_SIGNAL_ATTRS: list[tuple[str, str, list[str] | None, str]] = [
+    ("prospect_source", "select", ["pain_signal"],
+     "Discovery lane that sourced this prospect. Only 'pain_signal' today; "
+     "weekly-search prospects leave it NULL."),
+    ("pain_source_type", "select", list(PAIN_SIGNAL_SOURCE_TYPES),
+     "Pain-signal lane: poster (wrote the matched post), commenter, or liker "
+     "(engaged with it). Selects the invite-note reference frame — only a "
+     "poster gets the authorship note."),
+    ("pain_snippet", "text", None,
+     "Pain-signal lane: whitespace-collapsed excerpt (<=280 chars) — the "
+     "prospect's own comment for commenters, else the matched post's text."),
+    ("source_post_url", "text", None,
+     "Pain-signal lane: URL of the LinkedIn post that surfaced this "
+     "prospect."),
+    ("source_post_at", "text", None,
+     "Pain-signal lane: ISO timestamp of the matched post (UTC; relative "
+     "LinkedIn labels resolved at scrape time)."),
+]
+
+
+def _provision_pain_signal(
+    client: AttioClient, list_id: str, dry_run: bool
+) -> None:
+    """Idempotently create the pain-signal lane's five entry attributes.
+
+    `ensure_attribute` skips an attribute that already exists and backfills
+    missing select options, so re-running is free — and an operator who
+    provisioned an earlier revision (without the `commenter` option) picks it
+    up here rather than 400-ing mid-batch on their first commenter commit.
+    """
+    click.echo("\nPain-signal discovery lane (optional):")
+    created = skipped = failed = 0
+    for slug, type_, options, description in _PAIN_SIGNAL_ATTRS:
+        target = f"linkedin_outreach.{slug}"
+        try:
+            action = ensure_attribute(
+                client, "list", list_id, slug, type_,
+                options=options, description=description, dry_run=dry_run,
+            )
+        except Exception as exc:  # noqa: BLE001
+            click.echo(f"  ✗ {target}: FAILED — {exc}", err=True)
+            failed += 1
+            continue
+        if action in ("created", "would_create"):
+            tag = "[dry-run] would create" if dry_run else "created"
+            click.echo(f"  + {target} ({type_}): {tag}")
+            created += 1
+        else:
+            click.echo(f"  ✓ {target}: exists ({action})")
+            skipped += 1
+
+    click.echo(
+        f"Pain-signal attributes: created={created}, skipped={skipped}, "
+        f"failed={failed}."
+    )
+    if failed:
+        raise click.ClickException(
+            f"{failed} pain-signal item(s) failed to provision."
+        )
+
+
 # Spec: each entry is (parent_kind, parent_id_or_slug, attribute body).
 # parent_kind is "list" or "object".
 def _build_specs(list_id: str) -> list[tuple[str, str, dict]]:
@@ -604,7 +684,8 @@ def _create_option(
 @click.option(
     "--feature",
     type=click.Choice(
-        ["core", "radar", "phase06", "provenance", "botdog", "all"]
+        ["core", "radar", "phase06", "provenance", "botdog", "pain_signal",
+         "all"]
     ),
     default="core",
     show_default=True,
@@ -614,9 +695,10 @@ def _create_option(
         "'phase06' = email response detection attrs only (PR-243). "
         "'provenance' = the §3.13 last_migrated_by back-pointers only. "
         "'botdog' = the optional send_channel routing attribute only. "
-        "'all' = all of them. Radar, phase06, provenance and botdog are "
-        "off by default; provision them only when you want those features "
-        "(see GETTING_STARTED.md)."
+        "'pain_signal' = the optional pain-signal discovery lane's five "
+        "entry attrs only. 'all' = all of them. Radar, phase06, provenance, "
+        "botdog and pain_signal are off by default; provision them only when "
+        "you want those features (see GETTING_STARTED.md)."
     ),
 )
 def main(dry_run: bool, feature: str) -> int:
@@ -635,6 +717,9 @@ def main(dry_run: bool, feature: str) -> int:
             return 0
         if feature == "botdog":
             _provision_botdog(client, list_id, dry_run)
+            return 0
+        if feature == "pain_signal":
+            _provision_pain_signal(client, list_id, dry_run)
             return 0
         # Cache existing slugs per parent so we make one GET per parent
         cache: dict[tuple[str, str], set[str]] = {}
@@ -688,6 +773,7 @@ def main(dry_run: bool, feature: str) -> int:
             _provision_phase06(client, dry_run)
             _provision_provenance(client, dry_run)
             _provision_botdog(client, list_id, dry_run)
+            _provision_pain_signal(client, list_id, dry_run)
     return 0
 
 

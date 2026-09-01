@@ -49,6 +49,14 @@ _AGENT_ENV_BY_KEY: dict[str, str] = {
     "sales_nav_profile_scraper": "PB_SALES_NAV_PROFILE_SCRAPER_ID",
     "sales_nav_url_converter": "PB_SALES_NAV_URL_CONVERTER_ID",
     "inbox_scraper": "PB_INBOX_SCRAPER_ID",
+    # Pain-signal discovery lane workers (PR-280/PR-284/PR-285). All three
+    # are OPTIONAL: the lane is off by default, and even when enabled the
+    # commenters/likers workers may be left unset (posters-only mode). The
+    # workflow PARENT is deliberately absent — its API launches are no-ops
+    # and the lane drives the workers directly.
+    "pain_posts_worker": "PB_PAIN_POSTS_WORKER_ID",
+    "pain_commenters_worker": "PB_PAIN_COMMENTERS_WORKER_ID",
+    "pain_likers_worker": "PB_PAIN_LIKERS_WORKER_ID",
 }
 
 # Pre-invite degree-check backend: env var + YAML key + the current code
@@ -123,6 +131,11 @@ class PBConfig:
     sales_nav_profile_scraper_id: str
     sales_nav_url_converter_id: str
     inbox_scraper_id: str
+    # Pain-signal lane workers — "" when unset. The lane is off by default;
+    # an unset commenters/likers worker skips that engager type loudly.
+    pain_posts_worker_id: str
+    pain_commenters_worker_id: str
+    pain_likers_worker_id: str
 
     # Pre-invite degree-check backend, RAW (not validated). The "regular" /
     # "sales_nav" validation stays in workflows.daily_check_helpers so the
@@ -240,6 +253,19 @@ def load_pb_config() -> PBConfig:
         ),
         inbox_scraper_id=_resolve_agent_id(
             agents, "inbox_scraper", _AGENT_ENV_BY_KEY["inbox_scraper"]
+        ),
+        pain_posts_worker_id=_resolve_agent_id(
+            agents, "pain_posts_worker", _AGENT_ENV_BY_KEY["pain_posts_worker"]
+        ),
+        pain_commenters_worker_id=_resolve_agent_id(
+            agents,
+            "pain_commenters_worker",
+            _AGENT_ENV_BY_KEY["pain_commenters_worker"],
+        ),
+        pain_likers_worker_id=_resolve_agent_id(
+            agents,
+            "pain_likers_worker",
+            _AGENT_ENV_BY_KEY["pain_likers_worker"],
         ),
         degree_check_backend_raw=_resolve_backend(raw),
     )

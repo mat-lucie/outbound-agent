@@ -136,8 +136,20 @@ class _DryRunDailyRun:
         pass
 
 
+def _pb_agent_unconfigured(value: str) -> bool:
+    """True when a PhantomBuster agent id is blank or still a placeholder.
+
+    The shipped `config/phantombuster.example.yaml` carries
+    ``REPLACE_WITH_...`` placeholders, and an operator half-way through
+    setup may leave a ``TODO``. Treating those as "configured" would launch
+    against a nonexistent agent and 404 mid-run, after spend.
+    """
+    return not value or "REPLACE_WITH" in value or "TODO" in value.upper()
+
+
 def _experiment_registry_preflight(command: str) -> None:
-    """Experiment-registry pre-flight shared by daily / send-dms / weekly.
+    """Experiment-registry pre-flight shared by daily / send-dms / weekly /
+    pain-signal.
 
     §0 invariant #9 + the 2026-08-23 silent-failure review: the registry is
     re-read per prospect commit (workflows.weekly_prospect.
@@ -646,6 +658,76 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                                 f"botdog_ingest_phase_failed="
                                 f"{type(exc).__name__}"
                             )
+
+                    # Phase 0.9: pain-signal discovery — OFF BY DEFAULT.
+                    #
+                    # One-daily-command policy: the lane's 24h client-side
+                    # recency window pairs with the daily cadence, so it runs
+                    # here, inside the daily lock (which is what serializes it
+                    # against the degree check's shared autoconnect sheet).
+                    # Every gate travels with the lane; when any gate is
+                    # closed this phase is ONE status line, never a halt, and
+                    # the daily run continues regardless. The lane only
+                    # COMMITS Prospect-stage rows behind the standard
+                    # quarantine — it sends nothing, and the invites those
+                    # rows earn still go through this run's per-batch review
+                    # on a later day.
+                    #
+                    # BROAD except by design, same as Phase 0.7: an
+                    # optional-by-construction discovery lane must never take
+                    # down the sends that run after it. Skipping it costs one
+                    # day of discovery supply, nothing else.
+                    click.echo("--- Phase 0.9: Pain-Signal Discovery ---")
+                    from workflows.pain_signal import (
+                        PAIN_SIGNAL_ENABLED_ENV,
+                        is_pain_signal_enabled,
+                    )
+                    if not is_pain_signal_enabled():
+                        click.echo(
+                            f"Skipping ({PAIN_SIGNAL_ENABLED_ENV} unset — "
+                            f"the lane is off by default)\n"
+                        )
+                    else:
+                        pain_posts_worker = load_pb_config().pain_posts_worker_id
+                        pain_sn_scraper = (
+                            load_pb_config().sales_nav_profile_scraper_id
+                        )
+                        if _pb_agent_unconfigured(pain_posts_worker):
+                            click.echo(
+                                f"  ⚠ Skipping: {PAIN_SIGNAL_ENABLED_ENV} is "
+                                f"on but the posts worker is not configured "
+                                f"(agents.pain_posts_worker / "
+                                f"PB_PAIN_POSTS_WORKER_ID). No posts, no "
+                                f"lane.\n",
+                                err=True,
+                            )
+                        else:
+                            try:
+                                from workflows.pain_signal import (
+                                    run_pain_signal_discovery,
+                                )
+                                run_pain_signal_discovery(
+                                    crm, pb,
+                                    pain_posts_worker,
+                                    load_pb_config().pain_commenters_worker_id,
+                                    load_pb_config().pain_likers_worker_id,
+                                    pain_sn_scraper,
+                                    dry_run=mode.is_dry_run(),
+                                )
+                                click.echo("")
+                            except Exception as exc:  # noqa: BLE001 — see above
+                                click.echo(
+                                    f"  ⚠ Pain-signal discovery SKIPPED "
+                                    f"[{type(exc).__name__}: {exc}] — no "
+                                    f"prospects were sourced from this lane "
+                                    f"today. Invites and DMs are "
+                                    f"unaffected.\n",
+                                    err=True,
+                                )
+                                metrics.warn(
+                                    f"pain_signal_phase_failed="
+                                    f"{type(exc).__name__}"
+                                )
 
                     # Pipeline-starvation check (PR-43).
                     click.echo("--- Pipeline starvation check ---")
@@ -1261,6 +1343,147 @@ def weekly(dry_run, batch_size, search_export_id, yes, allow_stale):
                 crm, pb, search_export_id,
                 batch_size=batch_size, dry_run=dry_run,
                 code_provenance=code_provenance,
+            )
+    except RunLockHeld as exc:
+        log_lock_refused(lock_name, exc)
+        raise SystemExit(EXIT_TEMPFAIL) from exc
+
+
+@cli.command("pain-signal")
+@click.option(
+    "--dry-run", is_flag=True,
+    help="Launch the discovery + enrichment scrapes (PhantomBuster spend — "
+         "previews need real posts and real engagers with real titles) but "
+         "write NOTHING to the CRM; echo candidate + invite-note previews.",
+)
+@click.option(
+    "--yes", "-y", is_flag=True, help="Skip the wet-run confirmation prompt"
+)
+@click.option(
+    "--posts-worker-id",
+    default=lambda: load_pb_config().pain_posts_worker_id or "",
+    help="PhantomBuster posts-worker agent ID — the post-extractor phantom "
+         "inside the engager-scraper workflow (takes a content-search URL, "
+         "exports matching posts). Default: config/phantombuster.yaml "
+         "agents.pain_posts_worker -> PB_PAIN_POSTS_WORKER_ID.",
+)
+@click.option(
+    "--commenters-worker-id",
+    default=lambda: load_pb_config().pain_commenters_worker_id or "",
+    help="PhantomBuster commenters-worker agent ID (one launch per post "
+         "URL). OPTIONAL: unset skips commenter harvesting loudly. Default: "
+         "config/phantombuster.yaml agents.pain_commenters_worker -> "
+         "PB_PAIN_COMMENTERS_WORKER_ID.",
+)
+@click.option(
+    "--likers-worker-id",
+    default=lambda: load_pb_config().pain_likers_worker_id or "",
+    help="PhantomBuster likers-worker agent ID (one launch per post URL). "
+         "OPTIONAL: unset skips liker harvesting loudly. Default: "
+         "config/phantombuster.yaml agents.pain_likers_worker -> "
+         "PB_PAIN_LIKERS_WORKER_ID.",
+)
+@click.option(
+    "--sales-nav-profile-scraper-id",
+    default=lambda: load_pb_config().sales_nav_profile_scraper_id or "",
+    help="PhantomBuster Sales Navigator Profile Scraper agent ID (the same "
+         "phantom the daily degree check uses) — enriches candidates with "
+         "title/company/location before ICP scoring.",
+)
+def pain_signal(
+    dry_run, yes, posts_worker_id, commenters_worker_id, likers_worker_id,
+    sales_nav_profile_scraper_id,
+):
+    """Pain-signal discovery: post keyword search -> posts -> authors +
+    commenters + likers -> enrich -> qualify.
+
+    OFF BY DEFAULT. Gated behind OUTBOUND_PAIN_SIGNAL_ENABLED=1 and an
+    operator-approved content/pain_keywords.json (the shipped registry is a
+    placeholder and is refused). Recency is client-side on postTimestamp
+    (LinkedIn's datePosted search filter returns zero results). Commits
+    prospects at Prospect stage only — invites go out later via the daily
+    run, behind its per-batch review. See GETTING_STARTED.md.
+    """
+    from clients.phantombuster import PhantomBusterClient
+    from workflows.pain_signal import (
+        PAIN_SIGNAL_ENABLED_ENV,
+        is_pain_signal_enabled,
+        run_pain_signal_discovery,
+    )
+    from workflows.run_lock import (
+        EXIT_TEMPFAIL,
+        RunLockHeld,
+        acquire_run_lock,
+        log_lock_refused,
+    )
+
+    click.echo("=== Outbound Agent -- Pain-Signal Discovery ===\n")
+
+    if not is_pain_signal_enabled():
+        click.echo(
+            f"ABORT: the pain-signal lane is disabled. Set "
+            f"{PAIN_SIGNAL_ENABLED_ENV}=1 in .env to enable it (default off "
+            "by design — see GETTING_STARTED.md).",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    if _pb_agent_unconfigured(posts_worker_id):
+        click.echo(
+            "ABORT: the pain-signal posts worker is not configured. The lane "
+            "drives the workflow's POSTS worker directly — the workflow "
+            "parent's API launches are no-ops, so never use the parent's id. "
+            "Set agents.pain_posts_worker in config/phantombuster.yaml (or "
+            "PB_PAIN_POSTS_WORKER_ID in .env).",
+            err=True,
+        )
+        raise SystemExit(1)
+    if _pb_agent_unconfigured(sales_nav_profile_scraper_id):
+        click.echo(
+            "ABORT: PB_SALES_NAV_PROFILE_SCRAPER_ID not configured. The pain "
+            "lane enriches candidates through the Sales Nav Profile Scraper "
+            "(the daily degree-check phantom) before scoring — candidates "
+            "carry no company and ICP scoring runs on title.",
+            err=True,
+        )
+        raise SystemExit(1)
+    # Placeholder-shaped OPTIONAL worker ids are treated as unset (the lane
+    # skips that engager type loudly) rather than aborting.
+    if _pb_agent_unconfigured(commenters_worker_id):
+        commenters_worker_id = ""
+    if _pb_agent_unconfigured(likers_worker_id):
+        likers_worker_id = ""
+
+    # The pain lane stamps its OWN experiment_id, but the commit path still
+    # resolves the global one first — so the shared registry pre-flight
+    # applies here too.
+    _experiment_registry_preflight("pain-signal")
+
+    if not dry_run and not yes:
+        click.confirm(
+            "WET run: qualified candidates will be committed to the CRM at "
+            "Prospect stage (no sends). Continue?",
+            abort=True,
+        )
+
+    # Shares the weekly lock: both are prospect-commit paths whose dedup
+    # snapshots are per-process — running them concurrently could
+    # double-commit the same person. KNOWN HAZARD: the enrichment scrape's
+    # multi-URL wet path writes the SHARED production autoconnect sheet that
+    # the daily run's degree check also clears and rewrites, and daily holds
+    # a DIFFERENT lock ("sales-daily") — nothing serializes the two. Failure
+    # directions are degrade-safe (a clobbered sheet yields an empty scrape,
+    # a dropped batch, a loud enrichment degrade), but do not run pain-signal
+    # concurrently with a daily run.
+    lock_name = "sales-weekly"
+    run_id = f"pain-signal-{date.today().isoformat()}-{os.getpid()}"
+    try:
+        with acquire_run_lock(lock_name, run_id=run_id), \
+                _crm_provider() as crm, PhantomBusterClient() as pb:
+            run_pain_signal_discovery(
+                crm, pb, posts_worker_id, commenters_worker_id,
+                likers_worker_id, sales_nav_profile_scraper_id,
+                dry_run=dry_run,
             )
     except RunLockHeld as exc:
         log_lock_refused(lock_name, exc)

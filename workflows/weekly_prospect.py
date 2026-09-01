@@ -58,6 +58,8 @@ if TYPE_CHECKING:
     # Annotation-only: the CRM seam dataclasses + the PB client type. With
     # `from __future__ import annotations` every annotation is a string, so
     # these never need to exist at runtime in this module.
+    from collections.abc import Callable
+
     from clients.crm.base import CRMProvider, Entry
     from clients.phantombuster import PhantomBusterClient
 
@@ -1157,12 +1159,21 @@ def _commit_prospect(
     existing_entries: list[Entry] | None = None,
     in_list_record_ids: set[str] | None = None,
     summary: dict | None = None,
+    lane_entry_attrs: dict | None = None,
 ) -> bool:
     """Upsert a qualified prospect to Attio and add them to the pipeline list.
 
     `stage_name` is the initial pipeline stage for the new list entry — PROSPECT
     for normal (2nd/3rd-degree, invitable) prospects, ACCEPTED for 1st-degree
     (already-connected) prospects routed straight into the DM cadence.
+
+    `lane_entry_attrs` (pain-signal lane, PR-280): extra entry attributes
+    merged into the standard attrs AFTER `_build_prospect_entry_attrs`, so a
+    lane may deliberately override the cohort stamp (the pain lane stamps its
+    own `experiment_id` instead of the globally-running one — its cohort must
+    never pollute the running DM experiment's measurement) and attach lane
+    metadata (pain snippet, source post URL, source type). None for all
+    existing callers — zero behavior change.
 
     Returns True on success, False on failure (write error or missing record_id).
 
@@ -1300,6 +1311,10 @@ def _commit_prospect(
     canonical = _canonical_linkedin_url(prospect_data.get("linkedin_url") or "")
     if canonical:
         entry_attrs["canonical_linkedin_url"] = canonical
+    # Lane metadata merges LAST so a lane's explicit cohort stamp wins over
+    # the get_current_experiment_id() default (see the docstring).
+    if lane_entry_attrs:
+        entry_attrs.update(lane_entry_attrs)
 
     new_entry = _safe_add_list_entry(
         crm,
@@ -2028,6 +2043,84 @@ def _enrich_prospect_industry(
             prospect_data["industry_vertical_status"] = industry_status
 
 
+def new_process_summary() -> dict[str, Any]:
+    """Summary-dict contract keys `_process_prospects` / `_commit_prospect`
+    mutate with bare `+=` (plus the setdefault'd counters, pre-seeded here so
+    every lane prints them consistently). Single source of truth: the weekly
+    run AND the pain-signal lane both build their summaries from this factory,
+    so a counter added for one lane can never KeyError the other mid-run (the
+    two init blocks had already diverged into copy-paste).
+    """
+    return {
+        "exported": 0,
+        "scored": 0,
+        "qualified": 0,
+        "duplicates": 0,
+        "rejected": 0,
+        "added": 0,
+        # Supply accounting: of the commits counted in `added`, how many were
+        # genuine net-new pipeline entries vs re-stamps of records that were
+        # already in the list at run start. `added` conflates the two.
+        "net_new_created": 0,
+        "restamped_existing": 0,
+        "borderline_staged": 0,
+        # PR-222 Rec D: of the borderlines staged (fail-open), how many landed
+        # there because an INFRA signal — not a quality signal — blocked LLM
+        # vetting. Distinct buckets so the operator can tell a cost-ceiling
+        # breach from a transient Haiku error from a budget-ledger outage,
+        # instead of all three vanishing into borderline_staged. A borderline
+        # staged for lack of a client (the normal case) increments none of them.
+        "cost_exhausted_staged": 0,
+        "llm_error_staged": 0,
+        "ledger_unavailable_staged": 0,
+        "reprospect_review": 0,
+        # Name+company dedup gate: suspected duplicates committed WITHOUT
+        # company confirmation (the gate degraded open).
+        "dedup_gate_degraded": 0,
+        # Signal health (PR-227, 2026-07-06 RCA): deterministic passes counted
+        # apart from LLM borderline passes, plus per-signal abstain/miss rates
+        # the end-of-run alarms read.
+        "deterministic_qualified": 0,
+        "size_abstained": 0,
+        "industry_missing": 0,
+        "write_errors": 0,
+        # Never-contact denylist hard block — enforced for every lane in
+        # `_process_prospects`; counted here so the drop is never silent.
+        "denylist_blocked": 0,
+        # Per-verdict-path rejection counts, surfaced in the run summary so
+        # the weekly report / learn loop can see which filter caught how many.
+        # E.g. `deterministic_reject_sales_role` flags wrong-role leakage trends.
+        "rejected_by_path": {},
+    }
+
+
+def is_denylisted_candidate(
+    company: str | None, name: str | None, title: str | None = None
+) -> bool:
+    """True when a prospect candidate matches the operator's configured
+    never-contact denylist (``blacklist.denylist_companies`` — see
+    ``config/botdog.example.yaml``). Never contact, any channel, any person,
+    ever.
+
+    Reuses the canonical matcher from the blacklist seeder so enforcement
+    points cannot drift. The title/headline is checked too: post-engager rows
+    often carry their company only inside the headline ("Director @ Acme"). A
+    false positive merely skips a candidate; a false negative contacts someone
+    the operator explicitly excluded.
+
+    An operator with no denylist configured has zero tokens, so this is a
+    no-op on a default install.
+    """
+    from scripts.seed_botdog_blacklist import denylist_tokens, matches_denylist
+
+    tokens = denylist_tokens()
+    if not tokens:
+        return False
+    return matches_denylist(company, name, tokens) or (
+        title is not None and matches_denylist(title, None, tokens)
+    )
+
+
 def _process_prospects(
     prospects_raw: list[dict],
     crm: CRMProvider,
@@ -2047,8 +2140,25 @@ def _process_prospects(
     in_list_canonical_urls: set[str] | None = None,
     name_index: NameIndex | None = None,
     industry_cache: dict[str, tuple[str | None, str | None]] | None = None,
+    lane_entry_attrs: Callable[[dict], dict] | None = None,
+    default_language: str | None = None,
+    agent_gate: bool = True,
 ) -> None:
     """Score, dedup, and load prospects into Attio. Mutates summary and seen_urls in place.
+
+    Pain-signal lane params (PR-280), all defaulted to preserve existing
+    behavior exactly:
+    - `lane_entry_attrs`: called with each committed candidate's raw row; the
+      returned dict merges into the entry attrs after
+      `_build_prospect_entry_attrs` (see `_commit_prospect`).
+    - `default_language`: applied to `score_result["language"]` when the raw
+      row carries NO location — post/engager exports have no location column,
+      and the matched keyword's language is a stronger signal than the
+      scorer's location-less fallback.
+    - `agent_gate`: threaded to `score_prospect`. The weekly run stages
+      borderlines for the subagent fan-out (True); the pain lane resolves them
+      inline via the LLM dispatch path (False) — its per-run candidate volume
+      is small enough that inline qualification is cheap.
 
     When persona_config has target_company_mode=true, scoring uses mid-market-optimized
     size bands and assigns the triggering persona directly rather than re-routing by title.
@@ -2103,6 +2213,26 @@ def _process_prospects(
         }
 
         if not prospect_data["linkedin_url"]:
+            continue
+
+        # Never-contact denylist hard block (PR-280): a configured denylist
+        # entry must never enter the pipeline from ANY lane. Enforced here so
+        # weekly, pain-signal, and every future lane inherit it at ingest —
+        # not only at the terminal blacklist-seeding stage.
+        if is_denylisted_candidate(
+            prospect_data.get("company"),
+            prospect_data.get("name"),
+            prospect_data.get("title"),
+        ):
+            summary.setdefault("denylist_blocked", 0)
+            summary["denylist_blocked"] += 1
+            click.echo(
+                f"      → ⛔ DENYLIST HARD BLOCK: dropped "
+                f"{prospect_data.get('name') or prospect_data['linkedin_url']!r}"
+                f" ({prospect_data.get('company')!r}) at ingest — never "
+                f"contact.",
+                err=True,
+            )
             continue
 
         # Target company filter: skip profiles not on the curated list
@@ -2194,7 +2324,13 @@ def _process_prospects(
             )
 
         click.echo(f"    Scoring: {prospect_data['name']} ({prospect_data['company']})...")
-        score_result = score_prospect(prospect_data, persona_config=persona_config, agent_gate=True)
+        score_result = score_prospect(prospect_data, persona_config=persona_config, agent_gate=agent_gate)
+        # Pain-signal lane: post/engager exports carry no location column, so
+        # the scorer's language detection runs blind. The matched keyword's
+        # language is authoritative in that case. Rows WITH a location keep
+        # the scorer's verdict.
+        if default_language and not prospect_data.get("location"):
+            score_result["language"] = default_language
         summary["scored"] += 1
         # Signal-health counters (PR-227): a component that abstains/misses on
         # ~100% of a run means a dead signal (the 2026-07-06 RCA class of
@@ -2396,6 +2532,7 @@ def _process_prospects(
             existing_entries=existing_entries,
             in_list_record_ids=in_list_record_ids,
             summary=summary,
+            lane_entry_attrs=lane_entry_attrs(raw) if lane_entry_attrs else None,
         )
         if not ok:
             summary.setdefault("write_errors", 0)
@@ -2627,40 +2764,9 @@ def run_weekly_prospecting(
 
     searches = _get_all_searches(personas_data)
 
-    summary: dict[str, Any] = {
-        "exported": 0,
-        "scored": 0,
-        "qualified": 0,
-        "duplicates": 0,
-        "rejected": 0,
-        "added": 0,
-        # Supply accounting: of the commits counted in `added`, how many were
-        # genuine net-new pipeline entries vs re-stamps of records that were
-        # already in the list at run start. `added` conflates the two.
-        "net_new_created": 0,
-        "restamped_existing": 0,
-        "borderline_staged": 0,
-        # PR-222 Rec D: of the borderlines staged (fail-open), how many landed
-        # there because an INFRA signal — not a quality signal — blocked LLM
-        # vetting. Distinct buckets so the operator can tell a cost-ceiling
-        # breach from a transient Haiku error from a budget-ledger outage,
-        # instead of all three vanishing into borderline_staged. A borderline
-        # staged for lack of a client (the normal case) increments none of them.
-        "cost_exhausted_staged": 0,
-        "llm_error_staged": 0,
-        "ledger_unavailable_staged": 0,
-        "reprospect_review": 0,
-        # Signal health (PR-227, 2026-07-06 RCA): deterministic passes counted
-        # apart from LLM borderline passes, plus per-signal abstain/miss rates
-        # the end-of-run alarms read.
-        "deterministic_qualified": 0,
-        "size_abstained": 0,
-        "industry_missing": 0,
-        # Per-verdict-path rejection counts, surfaced in the run summary so
-        # sales-weekly / sales-learn can see which filter caught how many.
-        # E.g. `deterministic_reject_sales_role` flags wrong-role leakage trends.
-        "rejected_by_path": {},
-    }
+    # Contract keys live in `new_process_summary` (shared with the pain-signal
+    # lane — PR-280); per-key rationale documented there.
+    summary: dict[str, Any] = new_process_summary()
     borderline_stage: list[dict] = []
     reprospect_review: list[dict] = []
 
@@ -2857,6 +2963,12 @@ def run_weekly_prospecting(
             f"classified at ingest · {summary.get('industry_resolve_errors', 0)} resolve errors"
         )
     click.echo(f"Duplicates: {summary['duplicates']}")
+    if summary.get("denylist_blocked"):
+        click.echo(
+            f"⛔ Denylist: {summary['denylist_blocked']} candidate(s) "
+            "hard-blocked at ingest (never-contact rule).",
+            err=True,
+        )
     click.echo(f"Rejected:   {summary['rejected']}")
     if summary["rejected_by_path"]:
         for path, count in sorted(

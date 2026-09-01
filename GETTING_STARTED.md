@@ -279,6 +279,99 @@ To wire it up:
 |--------|-----------|------|---------|
 | linkedin_outreach | `send_channel` | select (`pb` \| `botdog`) | Which transport owns this prospect's sends. Unset = `pb`. Read-only routing state — no engine code writes it. |
 
+### (Optional) Pain-signal discovery lane
+
+**Off by default, on two independent switches.** The normal supply lane is
+`sales weekly`: a Sales Navigator saved search, scored against your ICP. The
+pain-signal lane is a second, narrower source — it searches LinkedIn *posts*
+for phrases your buyers actually use, then treats the people who **wrote**,
+**commented on**, or **reacted to** a matching post as prospect candidates.
+They go through the exact same qualify pipeline (ICP scoring, all four dedup
+layers, the re-prospect review stage), and the lane **commits at Prospect stage
+only** — it never sends anything.
+
+Both switches must be on before a single scrape runs:
+
+1. `OUTBOUND_PAIN_SIGNAL_ENABLED=1` in `.env` (strict — only the literal `1`).
+2. `content/pain_keywords.json` must be **approved by you**. The shipped file
+   is a placeholder: it carries the `REPLACE_THIS_TEMPLATE` sentinel and
+   `status: "placeholder"`, and the lane refuses on *either* alone. Flipping
+   the status without replacing the queries still refuses — otherwise you would
+   be searching, and inviting off, the engine's own template text.
+
+```bash
+# preview — scrapes run (PhantomBuster spend) but nothing is written
+OUTBOUND_PAIN_SIGNAL_ENABLED=1 python3 cli.py pain-signal --dry-run
+```
+
+Read the dry-run output before going wet: every candidate prints with the exact
+invite note it would receive. `examples/acme/content/pain_keywords.json` is a
+synthetic reference registry showing the file's shape.
+
+Once enabled, the lane also runs as **Phase 0.9** inside `sales daily` — its
+24-hour recency window pairs with the daily cadence, and running it inside the
+daily lock is what serializes its enrichment scrape against the degree check
+(they share a Google Sheet). Leave the flag unset and the phase is a one-line
+skip; if the lane errors, the phase warns and the day's invites and DMs
+continue unaffected.
+
+Things worth understanding before you enable it:
+
+- **The note makes a claim about the post.** A poster gets a note that
+  references the post they wrote; a commenter or liker gets a note that says
+  you crossed paths on it, and never that they wrote it. The lane enforces a
+  **topic gate** — a post's people are accepted only when the post text
+  literally contains an enabled query's phrase (accent- and case-folded,
+  word-bounded; every term for a paired query). LinkedIn's "exact phrase"
+  content search is not exact, and without this gate you would invite people
+  off a work-anniversary post that merely shares vocabulary. The gate proves
+  the *phrase* is present; it cannot prove your fixed note copy describes the
+  post. Disable any query whose phrase stretches that claim.
+- **Recency is client-side and fail-closed.** LinkedIn's `datePosted` search
+  filter returns zero results, so the lane filters on each post's timestamp
+  itself. A post whose timestamp cannot be parsed is DROPPED, never assumed
+  fresh. The window is capped at 168h because the engagement note places the
+  post inside the past week — a wider window refuses to run rather than ship a
+  time overclaim.
+- **Spend is bounded three ways**: only posts with non-zero engagement get an
+  engager scrape, at most `max_engager_scrape_posts_per_run` posts get one per
+  run, and the assembled batch is capped at `max_engagers_per_run` before the
+  enrichment scrape — so one viral post cannot flood your Sales Navigator
+  phantom. Three consecutive scrape failures trip a circuit breaker that stops
+  further launches while keeping everything already harvested.
+- **Your never-contact denylist applies at ingest.** Anything matching
+  `blacklist.denylist_companies` in `config/botdog.yaml` is dropped before the
+  preview renders and before any enrichment scrape is spent — the headline is
+  checked too, since these candidates carry no company until enrichment.
+
+To wire it up:
+
+1. Replace every query in `content/pain_keywords.json` with phrases harvested
+   from real buyer conversations, then set `_meta.status: "approved"`,
+   `_meta.approved_by` and `_meta.approved_at`.
+2. Clone a "post commenter and liker scraper" workflow in PhantomBuster and put
+   its **worker** phantom ids — not the workflow parent's — in
+   `config/phantombuster.yaml` under `agents.pain_posts_worker` /
+   `pain_commenters_worker` / `pain_likers_worker` (or the matching `PB_PAIN_*`
+   env vars). The parent is an orchestrator shell whose API launches are
+   silent no-ops. Only the posts worker is required; leaving the other two
+   blank runs the lane in posters-only mode, and it says so on every run.
+3. `python3 scripts/setup_attio_schema.py --feature pain_signal` (idempotent)
+   to add the five entry attributes. A wet run refuses before any write if
+   they are missing.
+4. Add the `pain_signal` group to your `content/messages.json` — a
+   `connection_note_poster` (authorship frame) and a `connection_note_liker`
+   (engagement frame), per language. A language with no pain copy falls back to
+   your persona note, loudly.
+
+| Object | Attribute | Type | Purpose |
+|--------|-----------|------|---------|
+| linkedin_outreach | `prospect_source` | select (`pain_signal`) | Which discovery lane sourced the prospect. NULL for weekly-search prospects. |
+| linkedin_outreach | `pain_source_type` | select (`poster` \| `commenter` \| `liker`) | Relationship to the matched post — selects the note's reference frame. |
+| linkedin_outreach | `pain_snippet` | text | Review context: the commenter's own comment, else the post's text (≤280 chars). |
+| linkedin_outreach | `source_post_url` | text | The post that surfaced this prospect — verify the note's claim against it. |
+| linkedin_outreach | `source_post_at` | text | ISO UTC timestamp of the matched post. |
+
 ---
 
 ## 3. Create the PhantomBuster phantoms
@@ -413,6 +506,7 @@ Once you're live, this is the rhythm:
 | **Weekly** | `sales sales-approve` | Review the borderline prospects the scorer wasn't sure about; approve/reject. |
 | **Daily** | `sales daily` | Send the day's connection invites (Part A) + DMs to people who accepted (Part B). |
 | **Daily** | `sales check-responses` | Detect replies and advance pipeline stages (fires hot-lead alerts if Resend is configured). |
+| **Daily** (optional) | `sales pain-signal --dry-run` | Pain-signal discovery — OFF by default; also runs as Phase 0.9 inside `sales daily`. |
 | **Weekly** | `sales report --send` | Email a pipeline summary (omit `--send` to just print it). |
 | **Periodically** | `sales learn` | Surface response patterns to inform ICP tuning. |
 

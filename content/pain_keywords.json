@@ -1,0 +1,40 @@
+{
+  "_meta": {
+    "description": "Pain-signal discovery lane keyword registry — SHIPPED PLACEHOLDER. Each query becomes one LinkedIn content-search (posts) scrape; the people who wrote, commented on, or reacted to a matching post become prospect candidates. Replace every query below with phrases your buyers actually use (harvest them from real call transcripts, not from translated playbook English), then approve the file. The lane refuses to launch a single scrape while this file still carries the REPLACE_THIS_TEMPLATE sentinel, and refuses again while _meta.status is not 'approved'.",
+    "status": "placeholder",
+    "approved_by": null,
+    "approved_at": null,
+    "operator_notes": [
+      "APPROVAL: after replacing the queries, set _meta.status='approved', _meta.approved_by='<your name>' and _meta.approved_at='<YYYY-MM-DD>'. Nothing scrapes until then.",
+      "TOPIC HONESTY: the connection note tells the prospect the post was about your pain phrase. The lane verifies the phrase is literally present in the post text, but it cannot verify that your fixed note copy describes the post. Disable any query whose phrase stretches the note's claim.",
+      "REGISTER: query the words your market actually types. Regional variants of the same concept are separate queries, not one.",
+      "PAIRED QUERIES: an unquoted term next to a quoted phrase is an AND — use it to cut noise (e.g. '\"rush order\" scheduling'). Every term must appear in the post text for it to pass the topic gate.",
+      "AVOID single generic words (Excel, ERP, SAP) as standalone queries — uselessly noisy. They earn their place only inside a paired query.",
+      "ACRONYMS: check for collisions in every language you query before shipping a bare acronym."
+    ]
+  },
+  "config": {
+    "post_max_age_hours_default": 24,
+    "max_engager_scrape_posts_per_run": 8,
+    "max_engagers_per_run": 40,
+    "pain_snippet_max_chars": 280
+  },
+  "queries": [
+    {
+      "id": "placeholder-exact-phrase",
+      "language": "en",
+      "query": "\"REPLACE_THIS_TEMPLATE exact pain phrase\"",
+      "tier": "high_precision",
+      "enabled": true,
+      "source": "placeholder — replace with a phrase harvested from a real buyer conversation"
+    },
+    {
+      "id": "placeholder-paired",
+      "language": "en",
+      "query": "\"REPLACE_THIS_TEMPLATE pain phrase\" qualifier",
+      "tier": "paired",
+      "enabled": true,
+      "source": "placeholder — a paired query ANDs the quoted phrase with each bare term"
+    }
+  ]
+}

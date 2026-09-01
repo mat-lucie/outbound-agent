@@ -323,6 +323,30 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
     ("linkedin_outreach", "send_channel"): [
         "scripts.attio_dedup",
     ],
+
+    # ---- LinkedIn Outreach: pain-signal discovery lane (OPTIONAL) ----
+    # Stamped ONCE at PROSPECT-commit by the pain lane, through
+    # `_commit_prospect(lane_entry_attrs=...)`. Nothing else in the engine
+    # writes them: the daily invite builder only READS prospect_source /
+    # pain_source_type to pick the note frame, and no send path touches
+    # them. The lane is off by default and the attributes are provisioned
+    # only with `setup_attio_schema.py --feature pain_signal`, so a fresh
+    # install carries none of them (parse_entry then reads None).
+    ("linkedin_outreach", "prospect_source"): [
+        "workflows.pain_signal.run_pain_signal_discovery",
+    ],
+    ("linkedin_outreach", "pain_source_type"): [
+        "workflows.pain_signal.run_pain_signal_discovery",
+    ],
+    ("linkedin_outreach", "pain_snippet"): [
+        "workflows.pain_signal.run_pain_signal_discovery",
+    ],
+    ("linkedin_outreach", "source_post_url"): [
+        "workflows.pain_signal.run_pain_signal_discovery",
+    ],
+    ("linkedin_outreach", "source_post_at"): [
+        "workflows.pain_signal.run_pain_signal_discovery",
+    ],
     # PR-20 B-SD-008: written by the false-positive guard branch in
     # detect_responses (when the prospect's only inbox message looks
     # like LinkedIn's auto-acceptance note).

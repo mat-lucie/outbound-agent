@@ -52,10 +52,21 @@ a phantom, find its **Phantom ID** — it's in the URL
 | **LinkedIn Profile Scraper** | Connection-degree check (legacy backend) | daily pre-invite + Phase 0, `regular` backend |
 | **Sales Navigator Profile Scraper** | Connection-degree check (Sales Nav backend) | daily pre-invite + Phase 0, `sales_nav` backend |
 | **(Sales Nav) Inbox Scraper** | Detects message replies | daily Phase 0.5 |
+| **Post commenter and liker scraper** (workflow) | Pain-signal discovery — OPTIONAL | daily Phase 0.9, `sales pain-signal` |
 
 > The **Sales Navigator URL Converter** phantom is **not needed** — the Sales
 > Nav Profile Scraper auto-converts `/in/<slug>` URLs internally. Leave its
 > slot blank.
+
+> **The pain-signal workflow is optional and off by default.** Skip it unless
+> you are enabling the pain-signal lane (GETTING_STARTED.md → *(Optional)
+> Pain-signal discovery lane*). If you do enable it, capture the **worker**
+> phantom ids inside the workflow — the post extractor, the commenters worker
+> and the likers worker — and NOT the workflow parent's id. The parent is an
+> orchestrator shell: launching it via the API is a silent no-op that re-serves
+> its cumulative leads database, and changing its launch type breaks every
+> worker launch. Only the posts worker is required; blank commenters/likers
+> ids run the lane in posters-only mode, announced on every run.
 
 Now copy the template and paste each ID:
 
@@ -74,6 +85,12 @@ agents:
   sales_nav_profile_scraper: "1234567890123460"   # MUST differ from profile_scraper
   sales_nav_url_converter: ""                       # not needed
   inbox_scraper: "1234567890123461"
+
+  # Optional — only when the pain-signal lane is enabled. WORKER ids, never
+  # the workflow parent's id.
+  pain_posts_worker: ""            # required when the lane is on
+  pain_commenters_worker: ""       # blank = posters-only, announced loudly
+  pain_likers_worker: ""           # blank = posters-only, announced loudly
 ```
 
 `config/phantombuster.yaml` is gitignored — your IDs stay local. (You can
