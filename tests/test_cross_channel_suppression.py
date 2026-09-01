@@ -9,11 +9,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from workflows.cross_channel_suppression import (
+    EMAIL_HARD_DECLINE_STAGES,
     LINKEDIN_OUTREACH_LIST_ID_ENV,
     NEGATIVE_RESPONSE_CLASSIFICATIONS,
     SUPPRESSED_STAGES,
     apply_suppression,
     build_suppression_set,
+    email_hard_decline_ids,
+    email_person_ids_in_stages,
     is_suppressed,
 )
 
@@ -206,3 +209,72 @@ class TestImportSurface:
 
             import workflows.cross_channel_suppression as mod
             importlib.reload(mod)
+
+
+class TestEmailHardDeclineIds:
+    """§3.1 email-channel hard declines — fail CLOSED-HARD like
+    build_suppression_set (a holed set could re-contact a hard no)."""
+
+    def _attio_with_stages(self, by_stage: dict, broken: set | None = None):
+        attio = MagicMock()
+
+        def search_people(filter_=None, limit=0, *, fail_if_truncated=False):
+            stage = (filter_ or {}).get("email_campaign_stage")
+            if broken and stage in broken:
+                raise RuntimeError("attio 503")
+            return [{"id": {"record_id": rid}} for rid in by_stage.get(stage, ())]
+
+        attio.search_people.side_effect = search_people
+        return attio
+
+    def test_collects_both_decline_stages(self):
+        attio = self._attio_with_stages({
+            "email_not_interested": ["rec-A"],
+            "unsubscribed": ["rec-B"],
+            "email_responded": ["rec-C"],  # NOT a decline — must not appear
+        })
+        assert email_hard_decline_ids(attio) == {"rec-A", "rec-B"}
+
+    def test_declines_canonical(self):
+        # Exactly the two hard-decline stages; RESPONDED must never join
+        # (a live human-owned thread is not suppression).
+        assert tuple(s.value for s in EMAIL_HARD_DECLINE_STAGES) == (
+            "email_not_interested",
+            "unsubscribed",
+        )
+
+    def test_partial_fetch_raises(self):
+        attio = self._attio_with_stages(
+            {"email_not_interested": ["rec-A"]}, broken={"unsubscribed"},
+        )
+        with pytest.raises(RuntimeError, match="hard-decline"):
+            email_hard_decline_ids(attio)
+
+
+class TestEmailPersonIdsInStages:
+    def test_partial_failure_returns_partial_set_and_flag(self):
+        attio = MagicMock()
+
+        def search_people(filter_=None, limit=0, *, fail_if_truncated=False):
+            stage = (filter_ or {}).get("email_campaign_stage")
+            if stage == "unsubscribed":
+                raise RuntimeError("attio 503")
+            return [{"id": {"record_id": "rec-A"}}]
+
+        attio.search_people.side_effect = search_people
+        ids, ok = email_person_ids_in_stages(
+            attio, EMAIL_HARD_DECLINE_STAGES, "hard-decline"
+        )
+        # The helper itself fails soft — (partial ids, ok=False); each
+        # wrapper picks its own philosophy on top.
+        assert ids == {"rec-A"}
+        assert ok is False
+
+    def test_rows_without_record_id_skipped(self):
+        attio = MagicMock()
+        attio.search_people.return_value = [{"id": {}}, {}, {"id": {"record_id": "rec-A"}}]
+        ids, ok = email_person_ids_in_stages(
+            attio, EMAIL_HARD_DECLINE_STAGES, "hard-decline"
+        )
+        assert ids == {"rec-A"}
+        assert ok is True

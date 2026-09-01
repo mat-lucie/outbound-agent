@@ -8,12 +8,14 @@ went quiet: replied, booked a call, got demo'd, or have an open deal.
 Scope of THIS module (Python, Attio-REST only):
   * detect warm candidates from ``linkedin_outreach`` + ``deals``
   * exclude declines and active-cadence overlap (mid cold-email-drip) so a
-    warm nudge never double-touches. General OWED/NUDGE-path decline
-    suppression is via ``build_suppression_set`` on entry signals (entry
-    stage + response_classification). The email-terminal-decline exclusion
-    (``_EMAIL_TERMINAL_STAGES``, keyed on people.email_campaign_stage) is
-    WAITING-lane-scoped — consulted only inside ``_waiting_pre_pass``. The
-    skill-layer C.2 gate is the final cross-channel decline check.
+    warm nudge never double-touches. LinkedIn-side decline suppression is via
+    ``build_suppression_set`` on entry signals (entry stage +
+    response_classification); EMAIL-side hard declines (not-interested /
+    unsubscribed, keyed on people.email_campaign_stage) come from
+    ``cross_channel_suppression.email_hard_decline_ids`` and suppress EVERY
+    lane. ``email_responded`` is NOT a decline: it stays out of the WAITING
+    lane but still surfaces, annotated. The skill-layer C.2 gate is the final
+    cross-channel decline check.
   * compute a *coarse* staleness/urgency from Attio-resident timestamps
   * render a ranked, lane-split digest (Owed vs Nudge)
 
@@ -77,7 +79,11 @@ from models.followup import (
     is_positive_nurture,
     urgency_score,
 )
-from workflows.cross_channel_suppression import build_suppression_set
+from workflows.cross_channel_suppression import (
+    build_suppression_set,
+    email_hard_decline_ids,
+    email_person_ids_in_stages,
+)
 from workflows.metrics import DailyRunMetrics
 
 if TYPE_CHECKING:
@@ -187,6 +193,12 @@ class FollowupCandidate:
     # candidate (the skill layer/operator decides); it just annotates so a
     # "you went quiet" digest line can be reconciled against the real inbox.
     email_reply_seen: bool = False
+    # True when the person (any associated person, for deals) replied to the
+    # email drip (people.email_campaign_stage == "email_responded"). NOT a
+    # decline and NOT suppression: the row surfaces so the account isn't
+    # forgotten, but a human owns that thread — the skill layer renders it
+    # and must never auto-draft on it (any channel).
+    email_responded: bool = False
     notes: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -219,6 +231,12 @@ class RadarResult:
     # never silently dropped.
     waiting_expired: int = 0
     waiting_exhausted: int = 0
+    # Records hidden radar-wide by the §3.1 email hard-decline set (person
+    # said no to / unsubscribed from the drip; deals count when ANY
+    # associated person declined). Counted, never rendered per-row: a live
+    # deal vanishing because one contact unsubscribed must be auditable,
+    # not silent — the operator can re-associate people or close the deal.
+    email_declined_suppressed: int = 0
 
 
 def _parse_attio_date(val) -> date | None:
@@ -539,16 +557,17 @@ def _derive_channel_hint(
     return "email" if has_email else "linkedin_only"
 
 
-# Email-terminal stages: the prospect replied to (or opted out of) the email
-# drip. NOT_INTERESTED/UNSUBSCRIBED said no — the §3.1 red line; RESPONDED is
-# in a human's hands. None of them may enter the WAITING lane: the LinkedIn
-# suppression set can't see these (it reads entry stages, not
-# people.email_campaign_stage), so this is WAITING's own exclusion.
-_EMAIL_TERMINAL_STAGES = (
-    EmailStage.RESPONDED,
-    EmailStage.NOT_INTERESTED,
-    EmailStage.UNSUBSCRIBED,
-)
+# Email-terminal stages split into two radar policies (the LinkedIn
+# suppression set can't see either — it reads entry stages, not
+# people.email_campaign_stage):
+#   * HARD DECLINES (email_not_interested / unsubscribed) suppress EVERY lane
+#     — the §3.1 red line, enforced via cross_channel_suppression.
+#     email_hard_decline_ids (fail closed-hard: fetch failure aborts the run).
+#   * RESPONDED is in a human's hands — NOT a decline. It still never enters
+#     the WAITING lane (the wait is over), and every other candidate carrying
+#     it is ANNOTATED (`email_responded`) so the skill layer surfaces the row
+#     without ever auto-drafting over the human-owned thread.
+_EMAIL_RESPONDED_STAGES = (EmailStage.RESPONDED,)
 
 
 def _awaiting_reply_state(attrs: dict, today: date) -> tuple[str, date | None, int]:
@@ -644,8 +663,8 @@ def _waiting_pre_pass(
     record_id: str,
     entry_id: str,
     partner_blocked: bool,
-    terminal_person_ids,
-    terminal_set: _LazyTerminalEmailSet,
+    responded_person_ids,
+    responded_set: set[str] | None,
     value_mult_fn,
     counters: dict[str, int],
     parked: dict[str, int],
@@ -656,8 +675,8 @@ def _waiting_pre_pass(
     """The WAITING lane's shared per-record pre-pass (entries AND deals).
 
     ONE implementation on purpose — the entry and deal loops feed it their
-    loop-local differences (partner check, which person ids the terminal set
-    tests, value multiplier) and everything else (state classification,
+    loop-local differences (partner check, which person ids the responded
+    set tests, value multiplier) and everything else (state classification,
     expired/exhausted counting, the inbound-advance-only state gate, the
     fresh-send suppression, callback precedence, emission) stays structurally
     identical; a rule change lands in both lanes or neither.
@@ -667,9 +686,12 @@ def _waiting_pre_pass(
         the caller must ``continue`` (dedup: no stage-derived candidate).
         ``candidate`` may still be None (parked / in cooldown / fresh send).
       * ``consumed=False`` — WAITING doesn't apply (no/invalid stamp, partner
-        precedence, terminal email stage, terminal set unreadable, or the
-        stamp is expired/exhausted — those two are counted here); the caller
-        proceeds down the normal stage-derived path.
+        precedence, prospect replied on email (``responded_set``), responded
+        set unreadable (``responded_set is None`` — fail the lane closed), or
+        the stamp is expired/exhausted — those two are counted here); the
+        caller proceeds down the normal stage-derived path. Hard email
+        declines never reach this pre-pass at all — they are suppressed from
+        every lane before it (entry loop top / deal pass 1).
 
     The state gate deliberately receives NO activity date (inbound-advance-
     only): Attio's ``people.last_interaction`` counts the operator's own
@@ -680,9 +702,12 @@ def _waiting_pre_pass(
     aw_state, aw_since, aw_nudges = _awaiting_reply_state(attrs, today)
     if aw_state == "none" or aw_since is None or partner_blocked:
         return (False, None)
-    terminal = terminal_set.contains(terminal_person_ids)
-    if terminal is None or terminal:
-        return (False, None)  # unreadable set fails the lane closed; terminal = never nudge
+    if isinstance(responded_person_ids, str):
+        responded_person_ids = (responded_person_ids,)
+    if responded_set is None or any(p in responded_set for p in responded_person_ids):
+        # Unreadable set fails the lane closed; a reply on record means the
+        # wait is over — never nudge (the skill layer clears the stamp).
+        return (False, None)
     if aw_state == "expired":
         counters["waiting_expired"] += 1
         return (False, None)
@@ -740,79 +765,6 @@ def _waiting_pre_pass(
     ))
 
 
-def _email_person_ids_in_stages(
-    attio: AttioClient, stages, label: str,
-) -> tuple[set[str], bool]:
-    """Person record_ids whose ``email_campaign_stage`` is in ``stages``.
-
-    Shared scan for the two email exclusion sets (active drip / terminal) so
-    the query shape, limit, and partial-failure contract can never diverge.
-    Returns ``(ids, ok)``; ``ok`` is False if ANY stage query failed — each
-    caller decides its own failure philosophy (see the wrappers).
-    """
-    ids: set[str] = set()
-    ok = True
-    for stage in stages:
-        try:
-            records = attio.search_people(
-                filter_={"email_campaign_stage": stage.value}, limit=10_000
-            )
-        except Exception as exc:  # noqa: BLE001 — partial set is tracked via ok
-            ok = False
-            print(
-                f"WARNING: followup_radar: could not fetch {label} email stage "
-                f"{stage.value!r}: {type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            continue
-        for rec in records:
-            rid = (rec.get("id") or {}).get("record_id")
-            if rid:
-                ids.add(rid)
-    return ids, ok
-
-
-class _LazyTerminalEmailSet:
-    """Lazily-fetched person ids in a TERMINAL email stage (WAITING exclusion).
-
-    The WAITING lane must never surface (let alone nudge) a prospect who
-    replied to the drip or opted out — ``email_not_interested`` is an explicit
-    no (the §3.1 red line), and the LinkedIn suppression set structurally
-    cannot see email stages. UNLIKE the active-drip set, a holed TERMINAL set
-    fails CLOSED for the lane: ``contains`` returns None when the fetch
-    failed, and callers skip WAITING emission entirely (degrading loudly).
-
-    Lazy because the 3 stage queries are pure waste on any run where no
-    record carries an awaiting stamp — which is every run until the
-    followup-state-v3 migration lands, and many runs after.
-    """
-
-    def __init__(self, attio: AttioClient, degraded: list[str]):
-        self._attio = attio
-        self._degraded = degraded
-        self._ids: set[str] | None = None
-        self._ok = True
-
-    def contains(self, person_ids) -> bool | None:
-        """True/False = membership of ANY given id; None = set unreadable
-        (fail the lane closed). Fetches on first use only."""
-        if self._ids is None:
-            self._ids, self._ok = _email_person_ids_in_stages(
-                self._attio, _EMAIL_TERMINAL_STAGES, "terminal"
-            )
-            if not self._ok:
-                self._degraded.append(
-                    "terminal email-stage exclusion unreadable — WAITING lane "
-                    "skipped this run (fail closed: a holed set could nudge a "
-                    "declined prospect); other lanes unaffected"
-                )
-        if not self._ok:
-            return None
-        if isinstance(person_ids, str):
-            person_ids = (person_ids,)
-        return any(pid in self._ids for pid in person_ids)
-
-
 def _active_email_person_ids(attio: AttioClient) -> tuple[set[str], bool]:
     """Person record_ids currently in an active cold-email-drip stage.
 
@@ -825,7 +777,21 @@ def _active_email_person_ids(attio: AttioClient) -> tuple[set[str], bool]:
     but still uses the partial set — exclusion still runs for the stages that
     did resolve.
     """
-    return _email_person_ids_in_stages(attio, EMAIL_ACTIVE_STAGES, "active")
+    return email_person_ids_in_stages(attio, EMAIL_ACTIVE_STAGES, "active")
+
+
+def _responded_email_person_ids(attio: AttioClient) -> tuple[set[str], bool]:
+    """Person record_ids whose email drip got a (non-decline) reply.
+
+    Used two ways, with split failure philosophies on ``ok=False``:
+      * WAITING-lane exclusion — fails CLOSED for the lane (a holed set could
+        nudge someone whose reply is sitting in the inbox).
+      * ``email_responded`` candidate annotation — fails OPEN-SOFT (the
+        annotation may be missing on some rows; the run is marked degraded and
+        the skill layer's per-candidate email-thread re-check remains the
+        authoritative catch before any draft).
+    """
+    return email_person_ids_in_stages(attio, _EMAIL_RESPONDED_STAGES, "responded")
 
 
 def _resolve_list_id(list_id: str | None) -> str:
@@ -1031,23 +997,37 @@ def detect_candidates(
     """
     today = today or operator_today()
     resolved_list_id = _resolve_list_id(list_id)
-    # NOTE: the two exclusion sets fail with OPPOSITE philosophies, deliberately.
-    # build_suppression_set fails CLOSED-HARD (raises) — without it we could nag
-    # a hard-no, the §3.1 red line. _active_email_person_ids fails OPEN-SOFT
-    # (partial set + degraded flag) — a holed set only over-includes, and the
-    # skill layer's per-candidate Gmail re-verify (SKILL C.2) catches any real
-    # cold-drip overlap. Do not "harmonize" these.
+    # NOTE: the exclusion sets fail with OPPOSITE philosophies, deliberately.
+    # build_suppression_set and email_hard_decline_ids fail CLOSED-HARD
+    # (raise) — without either we could nag a hard-no, the §3.1 red line.
+    # _active_email_person_ids and _responded_email_person_ids fail OPEN-SOFT
+    # (partial set + degraded flag) — a holed set only over-includes /
+    # under-annotates, and the skill layer's per-candidate email re-verify
+    # (SKILL C.2) catches any real overlap. Do not "harmonize" these.
     suppressed = build_suppression_set(attio)
+    email_declined = email_hard_decline_ids(attio)
     active_email, active_email_ok = _active_email_person_ids(attio)
+    responded_email, responded_email_ok = _responded_email_person_ids(attio)
 
     candidates: list[FollowupCandidate] = []
     degraded: list[str] = []
     dropped_no_touch = 0
     parked = {"muted": 0, "snoozed": 0, "callback": 0}
-    # WAITING-lane exclusion: prospects in a terminal email stage (replied /
-    # said no / unsubscribed). LAZY — fetched on the first stamped record
-    # only (3 queries wasted otherwise) — and fail-CLOSED for the lane.
-    terminal_email = _LazyTerminalEmailSet(attio, degraded)
+    # WAITING-lane responded exclusion fails CLOSED for the lane: pass None
+    # so the pre-pass skips WAITING emission entirely (a holed set could
+    # nudge someone whose reply is sitting in the inbox). The annotation
+    # side below keeps using the partial set (fail open-soft).
+    responded_for_waiting: set[str] | None = (
+        responded_email if responded_email_ok else None
+    )
+    if not responded_email_ok:
+        degraded.append(
+            "email-responded set unreadable/incomplete — no WAITING nudges "
+            "this run (stamped accounts fall back to their stage lane), and "
+            "some rows may be missing the email_responded annotation; the "
+            "C.2 thread re-check is the only remaining guard — verify before "
+            "drafting"
+        )
     # Mutable counters, shared with the WAITING pre-pass helper (which can't
     # rebind the caller's ints). drafted_skipped lives here too so the stage
     # paths and the pre-pass accumulate into ONE place; parked is passed to
@@ -1056,7 +1036,14 @@ def detect_candidates(
         "waiting_expired": 0,
         "waiting_exhausted": 0,
         "drafted_skipped": 0,
+        "email_declined_suppressed": 0,
     }
+    # deal record_id → associated person ids, filled in the deal pass and
+    # used by the email_responded annotation post-pass (deals are
+    # company-scoped; membership is any-associated-person, matching the
+    # suppression checks). Declared here so the post-pass runs even when the
+    # deals schema check fails and only entry candidates exist.
+    deal_people: dict[str, tuple[str, ...]] = {}
 
     if not active_email_ok:
         degraded.append(
@@ -1085,6 +1072,14 @@ def detect_candidates(
                 continue
             if record_id in suppressed or record_id in active_email:
                 continue
+            # email_declined is the §3.1 hard-decline set (said no to /
+            # unsubscribed from the email drip) — suppresses EVERY lane,
+            # exactly like the LinkedIn suppression set, but COUNTED (new
+            # behavior this run could hide from the operator, unlike the
+            # long-standing silent LinkedIn-set skip above).
+            if record_id in email_declined:
+                counters["email_declined_suppressed"] += 1
+                continue
             # merged_into losers are soft-deleted duplicates — skip.
             if attrs.get("merged_into"):
                 continue
@@ -1100,7 +1095,7 @@ def detect_candidates(
             # ── WAITING pre-pass (state-derived, evaluated BEFORE the stage
             # early-out: a C.2-stamped unanswered send surfaces even from a
             # non-warm stage — the stamp is stronger evidence than the stage;
-            # red lines stay covered by the suppression/terminal sets).
+            # red lines stay covered by the suppression/hard-decline sets).
             # Precedence: PARTNER (stage) > WAITING > stage lane. An eligible
             # stamp fully preempts the stage path for this entry (dedup — one
             # candidate per record), and a BELOW-THRESHOLD stamp suppresses it
@@ -1116,8 +1111,8 @@ def detect_candidates(
                 record_id=record_id,
                 entry_id=attrs.get("entry_id", ""),
                 partner_blocked=reason is FollowupReason.PARTNER_INTRO_UNWORKED,
-                terminal_person_ids=record_id,
-                terminal_set=terminal_email,
+                responded_person_ids=record_id,
+                responded_set=responded_for_waiting,
                 value_mult_fn=lambda attrs=attrs: _entry_value_mult(attrs),
                 counters=counters,
                 parked=parked,
@@ -1264,9 +1259,19 @@ def detect_candidates(
                 continue
             if not deal.get("record_id"):
                 continue
+            associated = tuple(deal.get("associated_people") or ())
+            # §3.1 hard-decline suppression, deal side: any associated person
+            # who declined/unsubscribed on the email drip kills the whole
+            # deal's follow-up (every lane, WAITING included). Any-person is
+            # deliberate over-exclusion — the fail-closed direction for a
+            # company-scoped record (same call as the WAITING-lane check).
+            if any(pid in email_declined for pid in associated):
+                counters["email_declined_suppressed"] += 1
+                continue
+            deal_people[deal["record_id"]] = associated
             warm_deals.append((record, deal, reason))
             if _state_gate(deal, today, None)[0] != "exclude":
-                join_person_ids.update(deal.get("associated_people") or [])
+                join_person_ids.update(associated)
         interactions, join_degraded = _fetch_deal_interactions(attio, join_person_ids)
         degraded.extend(join_degraded)
 
@@ -1284,8 +1289,9 @@ def detect_candidates(
             # ── WAITING pre-pass — deal-side twin of the entry pre-pass (ONE
             # shared implementation; see _waiting_pre_pass for the semantics).
             # LOST deals never reach here (warm_deals is DEAL_STAGE_REASONS-
-            # filtered), which is exactly the "never nudge a dead deal" rule.
-            # Terminal-email check is any-associated-person (over-exclude, the
+            # filtered), which is exactly the "never nudge a dead deal" rule;
+            # hard email declines never reach here either (dropped in pass 1).
+            # Responded check is any-associated-person (over-exclude, the
             # fail-closed direction for a company-scoped record).
             waiting_consumed, waiting_cand = _waiting_pre_pass(
                 attrs=deal,
@@ -1294,8 +1300,11 @@ def detect_candidates(
                 record_id=record_id,
                 entry_id="",
                 partner_blocked=has_partner_ref,
-                terminal_person_ids=deal.get("associated_people") or (),
-                terminal_set=terminal_email,
+                # The pass-1 tuple (deal_people) — same person set the
+                # hard-decline check and the annotation post-pass use, so the
+                # three membership checks can never diverge.
+                responded_person_ids=deal_people[record_id],
+                responded_set=responded_for_waiting,
                 value_mult_fn=lambda deal=deal: _deal_value_mult(deal.get("value")),
                 counters=counters,
                 parked=parked,
@@ -1411,6 +1420,21 @@ def detect_candidates(
     else:
         degraded.append("deal follow-ups skipped — deals schema unreadable/drifted")
 
+    # ── email_responded annotation post-pass ───────────────────────────
+    # ONE place on purpose (candidates are constructed at five sites — a
+    # per-site flag would eventually miss one). RESPONDED is not a decline:
+    # the row still surfaces, but the skill layer must never auto-draft over
+    # a human-owned email thread. WAITING candidates can't carry the flag
+    # (the pre-pass excludes responded accounts from the lane entirely).
+    for c in candidates:
+        pids = (
+            (c.record_id,)
+            if c.object == "linkedin_outreach"
+            else deal_people.get(c.record_id, ())
+        )
+        if any(pid in responded_email for pid in pids):
+            c.email_responded = True
+
     candidates.sort(key=lambda c: c.urgency, reverse=True)
     return RadarResult(
         candidates=candidates,
@@ -1420,6 +1444,7 @@ def detect_candidates(
         parked=parked,
         waiting_expired=counters["waiting_expired"],
         waiting_exhausted=counters["waiting_exhausted"],
+        email_declined_suppressed=counters["email_declined_suppressed"],
     )
 
 
@@ -1484,6 +1509,9 @@ def to_json(candidates: list[FollowupCandidate]) -> list[dict]:
             "awaiting_reply_note_id": c.awaiting_reply_note_id,
             "awaiting_reply_nudge_count": c.awaiting_reply_nudge_count,
             "email_reply_seen": c.email_reply_seen,
+            # True → surface only, NEVER auto-draft (a human owns the email
+            # thread — see SKILL.md C.3).
+            "email_responded": c.email_responded,
         }
         for c in candidates
     ]
@@ -1642,6 +1670,7 @@ def render_digest(
     waiting_expired: int = 0,
     waiting_exhausted: int = 0,
     waiting_capped: int = 0,
+    email_declined_suppressed: int = 0,
     full: bool = False,
 ) -> str:
     """Render the scannable operator digest (markdown).
@@ -1672,6 +1701,8 @@ def render_digest(
             if waiting_exhausted else "",
             f"{waiting_expired} waiting stamps expired (>{_WAITING_TTL_DAYS}d)"
             if waiting_expired else "",
+            f"{email_declined_suppressed} hidden by email hard declines (§3.1)"
+            if email_declined_suppressed else "",
         ) if b]
         if banner:
             empty_lines = ["**Follow-up Radar** — 0 surfaced, but detection was degraded:", *banner]
@@ -1723,6 +1754,9 @@ def render_digest(
         # drafted-stale/waiting account that actually REPLIED must not read
         # "you went quiet, N days silent" with no counter-signal.
         reply_seen = " · ↩ reply seen" if c.email_reply_seen else ""
+        # A human owns this account's email thread (they replied to the
+        # drip) — the row is informational; the skill layer never drafts it.
+        resp = " · ✉ replied by email — no auto-draft" if c.email_responded else ""
         # Partner-referred deals name the introducing partner so the operator
         # knows whose credibility is on the line. Best-effort: only rendered
         # when referred_by is actually a non-empty string.
@@ -1737,7 +1771,7 @@ def render_digest(
         )
         return (
             f"- **{_who(c)}** — {label} · {silence} "
-            f"· urgency {c.urgency}{reply_seen}{via}{note}"
+            f"· urgency {c.urgency}{reply_seen}{via}{resp}{note}"
         )
 
     lines: list[str] = ["**Follow-up Radar**"]
@@ -1834,6 +1868,12 @@ def render_digest(
             f" _{waiting_capped} more waiting row(s) displaced by the "
             f"{_WAITING_DRAFT_SLOT_CAP}-slot draft cap — `sales followup "
             "--full` shows all._"
+        )
+    if email_declined_suppressed:
+        footer += (
+            f" _{email_declined_suppressed} record(s) hidden by an email "
+            "hard decline (said no / unsubscribed — §3.1, never re-contact; "
+            "for a deal, one declined contact hides the whole deal)._"
         )
     if parked_str:
         footer += f" _{parked_str}._"
@@ -2056,6 +2096,7 @@ def run_followup_radar(
         waiting_expired=result.waiting_expired,
         waiting_exhausted=result.waiting_exhausted,
         waiting_capped=waiting_capped,
+        email_declined_suppressed=result.email_declined_suppressed,
         full=full,
     )
     # Disjoint counts from the SAME partition the digest header uses —
@@ -2076,6 +2117,7 @@ def run_followup_radar(
         "waiting_expired": result.waiting_expired,
         "waiting_exhausted": result.waiting_exhausted,
         "waiting_capped": waiting_capped,
+        "email_declined_suppressed": result.email_declined_suppressed,
         "candidates": to_json(surfaced),
         "digest": digest,
     }

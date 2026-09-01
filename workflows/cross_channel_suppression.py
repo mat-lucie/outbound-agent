@@ -21,6 +21,13 @@ This module exposes two surfaces:
   ``build_suppression_set`` BEFORE every send.  Even if the persisted flag missed
   a row, the response-classification and stage checks catch it.
 
+  The read side also covers the EMAIL channel: ``email_hard_decline_ids``
+  (backed by the shared ``email_person_ids_in_stages`` scan) returns Person
+  ids who declined or unsubscribed on the email drip — the same §3.1 red
+  line arriving via ``people.email_campaign_stage`` instead of entry signals.
+  ``workflows.followup_radar`` consults it radar-wide; it fails CLOSED-HARD
+  (raises on a partial fetch), exactly like ``build_suppression_set``.
+
 * **Write side** — ``apply_suppression`` issues a single typed PATCH via
   ``AttioWriter.apply(WriteIntent(...))`` with ``writer_module`` set to this
   module's dotted path so the §3.15 registry authorizes the write.  Idempotent:
@@ -30,8 +37,10 @@ This module exposes two surfaces:
 from __future__ import annotations
 
 import os
+import sys
 from typing import TYPE_CHECKING
 
+from models.email_campaign import EmailStage
 from models.pipeline import PipelineStage
 
 if TYPE_CHECKING:
@@ -43,6 +52,15 @@ SUPPRESSED_STAGES: frozenset[str] = frozenset({
     PipelineStage.NOT_INTERESTED.value,
     PipelineStage.DEFENSIVE_HOLD.value,
 })
+
+# Email-channel HARD declines: the prospect said no to the drip (explicit
+# "not interested" reply) or unsubscribed. Per §3.1 these suppress re-contact
+# on EVERY channel — unlike EmailStage.RESPONDED, which is a live human-owned
+# thread, not a decline, and must never be treated as suppression.
+EMAIL_HARD_DECLINE_STAGES: tuple[EmailStage, ...] = (
+    EmailStage.NOT_INTERESTED,
+    EmailStage.UNSUBSCRIBED,
+)
 
 LINKEDIN_OUTREACH_LIST_ID_ENV = "ATTIO_LIST_ID"
 WRITER_MODULE = "workflows.cross_channel_suppression"
@@ -108,6 +126,66 @@ def build_suppression_set(attio: AttioClient) -> set[str]:
             if record_id:
                 suppressed.add(record_id)
     return suppressed
+
+
+def email_person_ids_in_stages(
+    attio: AttioClient, stages, label: str,
+) -> tuple[set[str], bool]:
+    """Person record_ids whose ``email_campaign_stage`` is in ``stages``.
+
+    Shared scan for the email exclusion sets (active drip / hard decline /
+    responded) so the query shape, limit, and partial-failure contract can
+    never diverge. Returns ``(ids, ok)``; ``ok`` is False if ANY stage query
+    failed — each caller decides its own failure philosophy (see the
+    wrappers here and in ``workflows.followup_radar``).
+    """
+    ids: set[str] = set()
+    ok = True
+    for stage in stages:
+        try:
+            # fail_if_truncated: a silently-truncated scan would drop the
+            # tail of the set with no signal — on the hard-decline path that
+            # is an unsuppressed §3.1 prospect. Truncation raises, lands in
+            # the except below, and flows out as ok=False so each caller's
+            # failure philosophy (raise vs degrade) applies to it too.
+            records = attio.search_people(
+                filter_={"email_campaign_stage": stage.value},
+                limit=10_000,
+                fail_if_truncated=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — partial set is tracked via ok
+            ok = False
+            print(
+                f"WARNING: cross_channel_suppression: could not fetch {label} "
+                f"email stage {stage.value!r}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        for rec in records:
+            rid = (rec.get("id") or {}).get("record_id")
+            if rid:
+                ids.add(rid)
+    return ids, ok
+
+
+def email_hard_decline_ids(attio: AttioClient) -> set[str]:
+    """Person record_ids in an email HARD-DECLINE stage (§3.1 suppression).
+
+    Fails CLOSED-HARD, exactly like ``build_suppression_set``: a holed set
+    could re-contact a prospect who explicitly said no or unsubscribed, so a
+    partial fetch raises instead of returning what it found.
+
+    Raises:
+        RuntimeError: if any of the hard-decline stage queries failed.
+    """
+    ids, ok = email_person_ids_in_stages(attio, EMAIL_HARD_DECLINE_STAGES, "hard-decline")
+    if not ok:
+        raise RuntimeError(
+            "email hard-decline suppression set unreadable (Attio people "
+            "search failed) — refusing to proceed on a partial set: a holed "
+            "set could re-contact a prospect who said no (§3.1)."
+        )
+    return ids
 
 
 def stamp_outreach_channel(
