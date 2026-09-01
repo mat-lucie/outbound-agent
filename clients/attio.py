@@ -787,6 +787,16 @@ class AttioClient:
         data = self._request("PATCH", f"/objects/companies/records/{record_id}", json={"data": {"values": attributes}})
         return data.get("data", {})
 
+    def invalidate_company_hq_country(self, company_id: str) -> None:
+        """Drop one company from the HQ-country read cache.
+
+        Public seam for writers that mutate `hq_country_code` and then
+        verify through `company_hq_country_code` (e.g.
+        scripts/backfill_company_hq_country.py) — without reaching into
+        the private cache dict.
+        """
+        self._company_hq_country_cache.pop(company_id, None)
+
     def search_company_by_domain(self, domain: str) -> dict | None:
         """Find a company record by domain. Returns None if not found."""
         results = self.search_companies(

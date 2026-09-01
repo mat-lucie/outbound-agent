@@ -3596,6 +3596,9 @@ def run_dm_sequencing(
         "skipped_language_mismatch": 0,
         "skipped_company_throttled": queue_throttled_count,
         "skipped_missing_copy": 0,
+        # Advisory count (dry-run only): rows whose language is a lane
+        # default because the company HQ country is unknown.
+        "language_hq_unknown": 0,
         "dry_run": {"dm1": 0, "dm2": 0, "dm3": 0},
     }
     if queue_throttled_count:
@@ -3695,6 +3698,32 @@ def run_dm_sequencing(
                 )
                 results["skipped_language_mismatch"] += 1
                 continue
+            # When the HQ-derived expectation is undeterminable (no linked
+            # company, or the company lacks hq_country_code), the stored
+            # language is a lane default nobody verified — the flip-day
+            # misfire class. Dry-run-only advisory so the operator checks it
+            # during review; the send itself is NOT gated (the narrowed
+            # mismatch guard above stays the only skip authority). us_mode is
+            # excluded: its expectation is EN by construction, never
+            # HQ-derived.
+            if (
+                dry_run
+                and expected_lang is None
+                and (attrs.get("scoring_lane") or "") != "us_mode"
+            ):
+                results["language_hq_unknown"] += 1
+                # getattr shape-tolerance: resolve_language returns a
+                # Language enum in production, but advisory text must not
+                # crash on a plain code string (test fakes patch it so).
+                _lang_code = getattr(language, "value", language)
+                click.echo(
+                    f"  ⚠ {name or attrs['record_id']} ({step.value}): "
+                    f"language {_lang_code!r} is lane-default — "
+                    f"{company or 'company'} has no HQ country in the CRM; "
+                    f"verify before approving. "
+                    f"(scripts/backfill_company_hq_country.py fixes the data.)",
+                    err=True,
+                )
             # PR-16 (B-PD-005): MissingMessageError → missing_copy queue
             # row + skip. Pre-PR-16 silent Spanish fallback would have
             # shipped wrong-language DMs.
@@ -4081,6 +4110,16 @@ def run_dm_sequencing(
             f"  Skipped {results['skipped_missing_language']} prospect(s) with "
             f"missing/invalid language — see `missing_language` Operator "
             f"Review Queue rows."
+        )
+    if results["language_hq_unknown"]:
+        # Advisory rollup (dry-run only — the counter never increments
+        # wet): per-row warnings scroll away in a long dry-run; this line
+        # puts the total where the operator reads the summary.
+        click.echo(
+            f"  ⚠ {results['language_hq_unknown']} queued DM(s) carry a "
+            f"lane-default language (company HQ country unknown) — verify "
+            f"before approving; scripts/backfill_company_hq_country.py "
+            f"fixes the data."
         )
     if results["skipped_language_mismatch"]:
         click.echo(
