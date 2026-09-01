@@ -24,6 +24,7 @@ import click
 
 from clients.crm.attio_provider import AttioProvider
 from clients.crm.base import CRMProvider
+from workflows.metrics import phase_timer, record_phase_or_skip
 
 if TYPE_CHECKING:
     from clients.attio import AttioClient
@@ -114,13 +115,20 @@ def preload_pipeline_persons(
     if not record_ids:
         return 0
     crm: CRMProvider = attio if isinstance(attio, CRMProvider) else AttioProvider(attio)
+    _t = phase_timer()
     try:
         records = crm.bulk_fetch_persons(record_ids, metrics=metrics)
     except Exception as e:
         click.echo(f"  Warning: bulk preload failed ({e}); falling back to per-record fetches.")
         return 0
+    finally:
+        record_phase_or_skip(metrics, "preload_person_fetch_parallel", _t)
     primed = 0
     failures = 0
+    # Timed separately from the pool fetch above: extract_person_info does a
+    # blocking company GET per first-seen company, serially on this thread —
+    # a distinct latency bucket with a different remedy.
+    _t = phase_timer()
     for rid, record in records.items():
         try:
             info = crm.extract_person_info(record)
@@ -131,6 +139,7 @@ def preload_pipeline_persons(
             primed += 1
         except Exception:
             failures += 1
+    record_phase_or_skip(metrics, "preload_company_resolve_serial", _t)
     if failures:
         click.echo(
             f"  Warning: {failures} record(s) failed to prime "

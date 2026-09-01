@@ -3,7 +3,7 @@
 import os
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import click
 import httpx
@@ -74,6 +74,7 @@ from workflows.content_guard import assert_content_replaced
 from workflows.daily_run import DailyRun
 from workflows.dm_sequencer import NEXT_STAGE, STAGE_FOR_DM, get_pending_dms
 from workflows.escalation import escalate
+from workflows.metrics import phase_timer, record_phase_or_skip
 from workflows.pb_advance_gate import emit_pb_inmail_dead_end, emit_pb_silent_no_op
 from workflows.pre_invite_check import (
     _IMMUTABLE_FROZEN_AT_VALUES,
@@ -3139,6 +3140,7 @@ def run_dm_sequencing(
     cache: RecordCache | None = None,
     audit_logger: AuditLogger | None = None,
     exclude_ids: set[str] | None = None,
+    metrics: Any = None,
 ) -> dict:
     """Part B: Send DMs to accepted connections based on timing.
 
@@ -3150,6 +3152,11 @@ def run_dm_sequencing(
     the exclusion simply prunes ``all_parsed`` before the DM-due selection
     loop; upstream additionally had to place it ahead of its ownership claim
     filter, which does not exist here.
+
+    ``metrics``: optional DailyRunMetrics. When provided, Part B records
+    coarse phase timings (dm_list_scan / dedup_index_build / queue_build /
+    pb_send_loop) via record_phase — latency evidence for the send-dms
+    latency work. Timing only; no behavior depends on it.
 
     `cache` may be supplied by the caller to reuse person records pre-fetched
     by earlier phases; if None, a fresh cache is built. Standalone debug runs
@@ -3233,7 +3240,9 @@ def run_dm_sequencing(
     # consistency sweep can reuse the snapshot on write-free exits instead of
     # re-fetching the same ~50k-entry list (up to ~500 paged round-trips).
     _raw_entries_snapshot: list[dict] | None
+    _t_phase = phase_timer()
     _raw_entries_snapshot, all_parsed = _get_all_entries_with_raw(attio)
+    record_phase_or_skip(metrics, "dm_list_scan", _t_phase)
     today = date.today()
     if cache is None:
         cache = RecordCache(attio)
@@ -3348,6 +3357,7 @@ def run_dm_sequencing(
         f"  Building duplicate-URL stage-rank index "
         f"({len(all_parsed)} entries, {len(unique_record_ids)} unique records)..."
     )
+    _t_phase = phase_timer()
     url_to_max_rank: dict[str, int] = {}
     url_to_stages: dict[str, list[tuple[str, str]]] = {}  # url -> [(stage, entry_id), ...]
     for attrs in all_parsed:
@@ -3363,6 +3373,10 @@ def run_dm_sequencing(
         if rank > url_to_max_rank.get(key, -1):
             url_to_max_rank[key] = rank
         url_to_stages.setdefault(key, []).append((s.value, attrs["entry_id"]))
+    # NB: with a cold cache this loop lazy-fetches person records one by
+    # one (cache.get → get_person) — the timer exists to expose exactly
+    # that.
+    record_phase_or_skip(metrics, "dedup_index_build", _t_phase)
 
     # Surface URLs with duplicate Attio entries at divergent stages — the most
     # common source of repeat-DM bugs. Print before queueing so dry-run reveals
@@ -3417,6 +3431,7 @@ def run_dm_sequencing(
     # Part-B analogue of the 2026-07-02 invite starvation bug). This loop
     # maps exclusion reasons to escalations, then applies the gates that
     # need record-cache lookups (sibling guard, company throttle).
+    _t_phase = phase_timer()
     for attrs in all_parsed:
         verdict = dm_due_step(attrs, today, audit_logger=audit_logger)
         if verdict.step is None:
@@ -3473,6 +3488,7 @@ def run_dm_sequencing(
             continue
 
         dm_queues[pending_dm].append(attrs)
+    record_phase_or_skip(metrics, "queue_build", _t_phase)
 
     total_messages = sum(len(q) for q in dm_queues.values())
     if total_messages == 0:
@@ -3593,6 +3609,7 @@ def run_dm_sequencing(
             f"throttle (§3.8 {DEFAULT_THROTTLE_WINDOW_DAYS}-day window) — {throttle_row_note}."
         )
 
+    _t_phase = phase_timer()
     for step, queue in dm_queues.items():
         if not queue:
             continue
@@ -4056,6 +4073,8 @@ def run_dm_sequencing(
             f"PB-flagged skipped: {len(pb_flagged_skipped)}, "
             f"PB-unreported: {len(pb_unreported)}."
         )
+
+    record_phase_or_skip(metrics, "pb_send_loop", _t_phase)
 
     if results["skipped_missing_language"]:
         click.echo(
