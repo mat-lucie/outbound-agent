@@ -80,6 +80,7 @@ from models.followup import (
     urgency_score,
 )
 from workflows.cross_channel_suppression import (
+    EmailLaneNotProvisioned,
     build_suppression_set,
     email_hard_decline_ids,
     email_person_ids_in_stages,
@@ -562,7 +563,8 @@ def _derive_channel_hint(
 # people.email_campaign_stage):
 #   * HARD DECLINES (email_not_interested / unsubscribed) suppress EVERY lane
 #     — the §3.1 red line, enforced via cross_channel_suppression.
-#     email_hard_decline_ids (fail closed-hard: fetch failure aborts the run).
+#     email_hard_decline_ids (fail closed-hard: a fetch failure aborts the run
+#     — except when the email lane was never provisioned, which degrades).
 #   * RESPONDED is in a human's hands — NOT a decline. It still never enters
 #     the WAITING lane (the wait is over), and every other candidate carrying
 #     it is ANNOTATED (`email_responded`) so the skill layer surfaces the row
@@ -1004,13 +1006,35 @@ def detect_candidates(
     # (partial set + degraded flag) — a holed set only over-includes /
     # under-annotates, and the skill layer's per-candidate email re-verify
     # (SKILL C.2) catches any real overlap. Do not "harmonize" these.
+    #
+    # The whole email block is skipped when the OPTIONAL email lane was never
+    # installed: people.email_campaign_stage does not exist, every filter 400s,
+    # and there is no email state to exclude on. Aborting there would produce
+    # NO digest at all on an install that simply doesn't run email — so degrade
+    # loudly and carry on with empty (not holed) sets. All three sets come from
+    # the same attribute, so one absence answers for all three.
     suppressed = build_suppression_set(attio)
-    email_declined = email_hard_decline_ids(attio)
-    active_email, active_email_ok = _active_email_person_ids(attio)
-    responded_email, responded_email_ok = _responded_email_person_ids(attio)
+    degraded: list[str] = []
+    try:
+        email_declined = email_hard_decline_ids(attio)
+        active_email, active_email_ok = _active_email_person_ids(attio)
+        responded_email, responded_email_ok = _responded_email_person_ids(attio)
+    except EmailLaneNotProvisioned as exc:
+        print(
+            f"WARNING: followup_radar: {exc} Skipping every email exclusion "
+            "this run (nothing to exclude on).",
+            file=sys.stderr,
+        )
+        email_declined, active_email, responded_email = set(), set(), set()
+        active_email_ok = responded_email_ok = True
+        degraded.append(
+            "email lane not provisioned (people.email_campaign_stage absent) — "
+            "email declines/drip/replies were NOT consulted this run; harmless "
+            "if you never ran the email lane, otherwise provision the "
+            "attribute and re-run"
+        )
 
     candidates: list[FollowupCandidate] = []
-    degraded: list[str] = []
     dropped_no_touch = 0
     parked = {"muted": 0, "snoozed": 0, "callback": 0}
     # WAITING-lane responded exclusion fails CLOSED for the lane: pass None
