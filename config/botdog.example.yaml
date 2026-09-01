@@ -1,0 +1,78 @@
+# Botdog transport configuration — template. OPTIONAL, OFF BY DEFAULT.
+#
+# PhantomBuster owns sending in this engine (clients/sender.py: PBSender is the
+# default and only wired send transport). Botdog is an ALTERNATIVE, poll-based
+# transport whose surface ships here for operators who want it: a REST client,
+# a submission-only sender, an event-ingest drain, a local submission ledger, a
+# limits sync, and a never-contact blacklist seeder.
+#
+# Nothing in the engine routes a send to Botdog. Leaving this file untouched —
+# or deleting it — is a fully supported configuration: the loader then returns
+# a disabled config and every Botdog surface stays inert.
+#
+# Copy this file to config/botdog.yaml to configure it. The live
+# config/botdog.yaml is gitignored (see config/.gitignore); only this
+# *.example.yaml template is tracked.
+#
+# Secrets NEVER live in this file. The API key stays in your .env as
+# BOTDOG_API_KEY. See config/README.md.
+
+# ---------------------------------------------------------------------------
+# Master switch.
+# ---------------------------------------------------------------------------
+# false (the default) = every Botdog surface is inert. Setting it true does NOT
+# make Botdog send anything — no send path routes to it. It declares that the
+# identity below is real, so the seeder / limits sync / event drain may act.
+#
+# Validation is fail-loud: enabled: true with no campaigns, or with a
+# REPLACE_WITH_... placeholder still in place, raises ConfigError at load time
+# rather than submitting prospects into a campaign that does not exist.
+enabled: false
+
+# ---------------------------------------------------------------------------
+# Campaign ids — NON-SECRET, per-seat identity (like phantom IDs).
+# ---------------------------------------------------------------------------
+# One single-step Botdog campaign per invite language. Roles are resolved
+# most-specific-first: an invite row whose copy language is `es` tries
+# `invite_es`, then falls back to the catch-all `invite`. A row with no
+# language goes straight to `invite`.
+#
+# Find a campaign id in the Botdog dashboard (open the campaign; the id is in
+# the URL). Delete the language rows you do not run.
+#
+# OPERATOR CONTRACT: every invite campaign's connection-note template MUST
+# reference the note variable verbatim as {{inviteMessage}} — see
+# clients/sender.py:BOTDOG_INVITE_NOTE_VARIABLE. A mismatch is SILENT: the API
+# accepts the lead and LinkedIn gets an invite with an empty note.
+campaigns:
+  invite: "REPLACE_WITH_BOTDOG_INVITE_CAMPAIGN_ID"
+  # invite_es: "REPLACE_WITH_BOTDOG_ES_INVITE_CAMPAIGN_ID"
+  # invite_en: "REPLACE_WITH_BOTDOG_EN_INVITE_CAMPAIGN_ID"
+  # invite_pt: "REPLACE_WITH_BOTDOG_PT_INVITE_CAMPAIGN_ID"
+
+# ---------------------------------------------------------------------------
+# Connected LinkedIn account id — used ONLY by the limits sync command.
+# ---------------------------------------------------------------------------
+# Leave blank to auto-resolve when exactly one account is connected. Env
+# fallback: BOTDOG_ACCOUNT_ID.
+account_id: ""
+
+# ---------------------------------------------------------------------------
+# Never-contact blacklist.
+# ---------------------------------------------------------------------------
+# Botdog inherits NONE of PhantomBuster's internal never-contact memory, so the
+# set has to be seeded explicitly (scripts/seed_botdog_blacklist.py --apply)
+# before any Botdog send. A pre-send presence gate refuses to build a Botdog
+# sender until the collection exists and is non-empty.
+blacklist:
+  # The collection name is the idempotency key: the seeder and the presence
+  # gate BOTH resolve it by name, so it must stay stable across runs.
+  collection_name: "Never-contact (CRM-seeded)"
+
+  # Hard-block name tokens. The seeder derives the never-contact set from your
+  # CRM (merged-away rows, suppressed rows, declines, anyone ever contacted).
+  # This list is the explicit override for organisations the CRM cannot
+  # express — a company you must never contact on any channel, at any pipeline
+  # stage. Matched as a lowercased substring against the person's company and,
+  # defensively, their name.
+  denylist_companies: []

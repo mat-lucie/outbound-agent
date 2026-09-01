@@ -823,6 +823,11 @@ class TestWriterRegistryParity:
         "scripts.backfill_experiment_id_archaeology",
         # Phase C: 8th writer — reconciliation sweep re-stamps connection_sent.
         "workflows.pending_invite_reconciliation.run_pending_invite_reconciliation",
+        # 9th writer — the optional Botdog event drain freezes the cohort at
+        # "connection_sent" on an event-confirmed invite, exactly as the PB
+        # invite path does, so botdog-stamped rows are measured against the
+        # same freeze boundary as their PB counterparts.
+        "workflows.botdog_ingest.apply_lead_events",
     }
 
     def test_experiment_id_has_all_6_writers(self):
@@ -836,9 +841,10 @@ class TestWriterRegistryParity:
             f"got {sorted(owners)}, expected {sorted(self.EXPECTED_WRITERS_EXPERIMENT_ID)}"
         )
 
-    def test_experiment_id_frozen_at_has_all_8_writers(self):
+    def test_experiment_id_frozen_at_has_all_9_writers(self):
         """PR-22: 7th writer (archaeology backfill). Phase C: 8th writer
-        (pending_invite_reconciliation re-stamps connection_sent)."""
+        (pending_invite_reconciliation re-stamps connection_sent). 9th:
+        the optional Botdog event drain's invite-confirmed freeze."""
         from clients.attio_writer_registry import get_authorized_writers
 
         owners = get_authorized_writers("linkedin_outreach", "experiment_id_frozen_at")

@@ -1,0 +1,25 @@
+# Acme synthetic reference operator — OPTIONAL Botdog transport identity.
+#
+# A fully worked example of the config/botdog.example.yaml schema, with
+# SYNTHETIC ids. The test suite resolves this file via the conftest
+# OUTBOUND_CONFIG_DIR pin.
+#
+# Kept `enabled: false` on purpose: PhantomBuster owns sending, and the Acme
+# reference operator ships the same posture the engine defaults to. Tests that
+# need an enabled config build one in-process rather than flipping this file.
+
+enabled: false
+
+campaigns:
+  invite: "acme-campaign-invite"
+  invite_es: "acme-campaign-invite-es"
+  invite_en: "acme-campaign-invite-en"
+
+account_id: "acme-account-1"
+
+blacklist:
+  collection_name: "Acme never-contact (CRM-seeded)"
+  # Synthetic hard-block: Acme never contacts this organisation on any
+  # channel, at any pipeline stage.
+  denylist_companies:
+    - "Contoso Holdings"

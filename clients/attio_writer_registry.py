@@ -96,6 +96,11 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
         # tally (source of truth for confirmed sends) when the in-run
         # advance failed. Same guarded write path.
         "workflows.consistency_sweep.run_company_tally_consistency_sweep",
+        # Event-confirmed advance from the OPTIONAL Botdog transport:
+        # the poll-based drain applies the same advance PB's scrape
+        # phases apply, through the same AttioWriter path, but only
+        # for entries stamped send_channel=botdog.
+        "workflows.botdog_ingest.apply_lead_events",
     ],
     ("linkedin_outreach", "stage"): [
         "workflows.daily_check.run_dm_sequencing",
@@ -122,6 +127,11 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
         # STALE_CONNECTION_SENT_ESCALATE_DAYS at UNREACHABLE (forward-only;
         # they are permanently past the acceptance-detection window).
         "scripts.remediate_stale_connection_sent_20260615",
+        # Event-confirmed advance from the OPTIONAL Botdog transport:
+        # the poll-based drain applies the same advance PB's scrape
+        # phases apply, through the same AttioWriter path, but only
+        # for entries stamped send_channel=botdog.
+        "workflows.botdog_ingest.apply_lead_events",
     ],
     # last_contact_date — multi-writer: DM cadence (run_dm_sequencing),
     # PR-9.5 dedup union-merge MAX-of-duplicates per §3.11, and PR-15
@@ -142,6 +152,11 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
         # Phase C reconciliation sweep (stamps last_contact_date alongside the
         # PROSPECT→CONNECTION_SENT flip).
         "workflows.pending_invite_reconciliation.run_pending_invite_reconciliation",
+        # Event-confirmed advance from the OPTIONAL Botdog transport:
+        # the poll-based drain applies the same advance PB's scrape
+        # phases apply, through the same AttioWriter path, but only
+        # for entries stamped send_channel=botdog.
+        "workflows.botdog_ingest.apply_lead_events",
     ],
     ("linkedin_outreach", "quality_score"):
         "workflows.quality_gate.score_prospect",
@@ -164,6 +179,11 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
         "scripts.attio_dedup",
         "workflows.pb_send_recovery.recover_unrecorded_dm_sends",
         "workflows.consistency_sweep.run_company_tally_consistency_sweep",
+        # Event-confirmed advance from the OPTIONAL Botdog transport:
+        # the poll-based drain applies the same advance PB's scrape
+        # phases apply, through the same AttioWriter path, but only
+        # for entries stamped send_channel=botdog.
+        "workflows.botdog_ingest.apply_lead_events",
     ],
     ("linkedin_outreach", "dm2_sent_at"): [
         "workflows.daily_check.run_dm_sequencing",
@@ -171,6 +191,11 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
         "scripts.attio_dedup",
         "workflows.pb_send_recovery.recover_unrecorded_dm_sends",
         "workflows.consistency_sweep.run_company_tally_consistency_sweep",
+        # Event-confirmed advance from the OPTIONAL Botdog transport:
+        # the poll-based drain applies the same advance PB's scrape
+        # phases apply, through the same AttioWriter path, but only
+        # for entries stamped send_channel=botdog.
+        "workflows.botdog_ingest.apply_lead_events",
     ],
     ("linkedin_outreach", "dm3_sent_at"): [
         "workflows.daily_check.run_dm_sequencing",
@@ -178,12 +203,22 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
         "scripts.attio_dedup",
         "workflows.pb_send_recovery.recover_unrecorded_dm_sends",
         "workflows.consistency_sweep.run_company_tally_consistency_sweep",
+        # Event-confirmed advance from the OPTIONAL Botdog transport:
+        # the poll-based drain applies the same advance PB's scrape
+        # phases apply, through the same AttioWriter path, but only
+        # for entries stamped send_channel=botdog.
+        "workflows.botdog_ingest.apply_lead_events",
     ],
     # response_received_at — primary writer is classify_reply; PR-9.5
     # union-merge takes MAX-non-null across duplicates.
     ("linkedin_outreach", "response_received_at"): [
         "workflows.detect_responses.classify_reply",
         "scripts.attio_dedup",
+        # Event-confirmed advance from the OPTIONAL Botdog transport:
+        # the poll-based drain applies the same advance PB's scrape
+        # phases apply, through the same AttioWriter path, but only
+        # for entries stamped send_channel=botdog.
+        "workflows.botdog_ingest.apply_lead_events",
     ],
 
     # ---- LinkedIn Outreach: canonical url + dedup bookkeeping ----
@@ -243,6 +278,11 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
         # Phase C reconciliation sweep: re-stamps connection_sent on the
         # PROSPECT→CONNECTION_SENT flip (same guard as pre_invite_check).
         "workflows.pending_invite_reconciliation.run_pending_invite_reconciliation",
+        # Event-confirmed advance from the OPTIONAL Botdog transport:
+        # the poll-based drain applies the same advance PB's scrape
+        # phases apply, through the same AttioWriter path, but only
+        # for entries stamped send_channel=botdog.
+        "workflows.botdog_ingest.apply_lead_events",
     ],
     ("linkedin_outreach", "experiment_id_backfill_confidence"):
         "scripts.backfill_experiment_id_archaeology",
@@ -267,6 +307,20 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
     ],
     ("linkedin_outreach", "suppress_re_engagement"): [
         "workflows.cross_channel_suppression",
+        "scripts.attio_dedup",
+    ],
+
+    # ---- LinkedIn Outreach: delivery-transport routing (OPTIONAL) ----
+    # `send_channel` marks which transport owns a prospect's LinkedIn
+    # sends. PhantomBuster owns sending, so no SEND path writes it: the
+    # routing code only READS the field (missing/unset resolves to "pb"),
+    # and a row stamped "botdog" is held out of every send and of the
+    # Phase 0 / 0.5 scrape detectors until it is re-stamped "pb".
+    # Sole writer: the union-merge, which must carry a "botdog" stamp from
+    # ANY merged member onto the surviving entry. Dropping it there would
+    # silently make the survivor PB-sendable again — the double-send this
+    # attribute exists to prevent.
+    ("linkedin_outreach", "send_channel"): [
         "scripts.attio_dedup",
     ],
     # PR-20 B-SD-008: written by the false-positive guard branch in
@@ -298,6 +352,11 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
         # tally (source of truth for confirmed sends) when the in-run
         # advance failed. Same guarded write path.
         "workflows.consistency_sweep.run_company_tally_consistency_sweep",
+        # Event-confirmed advance from the OPTIONAL Botdog transport:
+        # the poll-based drain applies the same advance PB's scrape
+        # phases apply, through the same AttioWriter path, but only
+        # for entries stamped send_channel=botdog.
+        "workflows.botdog_ingest.apply_lead_events",
     ],
     ("linkedin_outreach", "nurture_re_eligible_at"): [
         "workflows.gtm.nurture_backfill",
