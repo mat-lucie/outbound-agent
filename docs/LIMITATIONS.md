@@ -131,9 +131,40 @@ non-Attio CRM they would need the migration slice applied first.
 The migration pattern is documented in `clients/crm/CONTRACT.md`; each slice
 is a mechanical substitution with no behavior change.
 
+`workflows/botdog_ingest.py` is one of them: it takes an `AttioClient`, reads
+`ATTIO_LIST_ID` directly, and applies its advances through
+`daily_check._attio_advance_with_escalation`. That is deliberate — it shares the
+`daily` slice's escape hatch rather than inventing a second write path — but it
+means the optional Botdog event drain is Attio-only until that slice migrates.
+
 ---
 
-## 6. Loaded content is still the original operator's defaults
+## 6. The optional Botdog transport is shipped but not wired to send
+
+PhantomBuster is the only wired send transport. `clients/sender.py` defines a
+`Sender` protocol with two implementations — `PBSender` (the default, used by
+both send loops) and `BotdogSender` — but nothing in the engine constructs a
+`BotdogSender` for a send. Its surface (`clients/botdog.py`,
+`workflows/botdog_ingest.py`, `botdog_ledger.py`, `botdog_limits.py`,
+`scripts/seed_botdog_blacklist.py`) ships complete and tested for operators who
+want to route sends through it, but wiring that up is your work, not a config
+flag: `BOTDOG_SEND_ENABLED` only turns on the read-only event drain.
+
+The `send_channel` stamp is the interlock. A row stamped `botdog` is held out of
+PB sends *and* of the Phase 0 / 0.5 scrape detectors, so it gets no outreach
+from any transport — loudly counted, never silent. Unset resolves to `pb`, so a
+fresh install is unaffected. See GETTING_STARTED.md → *(Optional) Botdog
+delivery transport*.
+
+There is no operations runbook for it: the upstream one is written around a
+specific operator's campaigns, accounts and teardown history, and was not worth
+neutralising. The module docstrings carry the operational contract instead —
+`clients/sender.py:BOTDOG_INVITE_NOTE_VARIABLE` in particular is half of a
+contract whose other half lives in the Botdog UI.
+
+---
+
+## 7. Loaded content is still the original operator's defaults
 
 The files the engine loads at runtime (`content/personas.json`,
 `content/messages.json`, `content/emails.json`, `content/targets.json`,
@@ -181,6 +212,7 @@ operation (see GETTING_STARTED.md §6). Two gaps to be aware of:
 | Write path Attio-coupled | `AttioWriter` rollback model is Attio-specific | Provider seam covers typed writes; exception model is a later increment |
 | Email + Sheets not abstracted | Replace `resend_client.py` / `google_sheets.py` manually | Engine degrades gracefully on missing `RESEND_API_KEY` |
 | Partial workflow migration | Some workflows still use raw `AttioClient` | Follow migration pattern in CONTRACT.md |
+| Botdog transport ships unwired | Optional alternative sender exists but no send path routes to it; the event drain is Attio-only | Wire `BotdogSender` yourself; see GETTING_STARTED.md |
 | Content is the original operator's | `content/` files need replacement | Replace before production use; P5 will ship neutral defaults |
 | Email one-click unsubscribe / webhook | No hosted endpoint; opt-outs are manual via mailto + `email-unsubscribe` CLI | Operator stands up an HTTP endpoint + Resend webhook for full automation |
 | `email-association` skips suppression | Association emails not gated by cross-channel suppression | Curate the list manually; Attio-client plumbing is a tracked follow-up |

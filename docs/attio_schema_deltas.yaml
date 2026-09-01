@@ -41,7 +41,7 @@
 
 schema_version: 1
 plan_version: "1.7"
-last_updated: "2026-06-01"  # Wave-2-A holdback rethink: experiment + weekly_kpi_snapshot → descoped (filesystem); cohort_membership/person_merge_audit/weekly_strategy_brief/diagnostic_run deleted (unbuilt/dead; all 404 live).
+last_updated: "2026-08-31"  # Optional Botdog transport: linkedin_outreach.send_channel (read-only delivery routing) added, status=planned.  # Wave-2-A holdback rethink: experiment + weekly_kpi_snapshot → descoped (filesystem); cohort_membership/person_merge_audit/weekly_strategy_brief/diagnostic_run deleted (unbuilt/dead; all 404 live).
 
 # Wave-2-A deploy holdback per agent-4 rethink (2026-05-25):
 # These new_objects + every attribute targeting them are NOT to be
@@ -264,7 +264,7 @@ attributes:
     options: null
     pr_id: PR-9a
     status: shipped
-    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends, workflows.consistency_sweep.run_company_tally_consistency_sweep]
+    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends, workflows.consistency_sweep.run_company_tally_consistency_sweep, workflows.botdog_ingest.apply_lead_events]
     note: |
       §3.15 backfill exception: PR-9b's scripts.backfill_per_step_timestamps
       is the second authorized writer, scoped to one-shot historical
@@ -287,7 +287,7 @@ attributes:
     options: null
     pr_id: PR-9a
     status: shipped
-    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends, workflows.consistency_sweep.run_company_tally_consistency_sweep]
+    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends, workflows.consistency_sweep.run_company_tally_consistency_sweep, workflows.botdog_ingest.apply_lead_events]
     note: "Multi-writer per §3.15 + §3.11 union-merge + crash-recovery (see dm1_sent_at note)."
 
   - object: linkedin_outreach
@@ -296,7 +296,7 @@ attributes:
     options: null
     pr_id: PR-9a
     status: shipped
-    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends, workflows.consistency_sweep.run_company_tally_consistency_sweep]
+    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends, workflows.consistency_sweep.run_company_tally_consistency_sweep, workflows.botdog_ingest.apply_lead_events]
     note: "Multi-writer per §3.15 + §3.11 union-merge + crash-recovery (see dm1_sent_at note)."
 
   - object: linkedin_outreach
@@ -305,7 +305,7 @@ attributes:
     options: null
     pr_id: PR-9a
     status: shipped
-    write_owner_module: [workflows.detect_responses.classify_reply, scripts.attio_dedup]
+    write_owner_module: [workflows.detect_responses.classify_reply, scripts.attio_dedup, workflows.botdog_ingest.apply_lead_events]
     note: "Multi-writer per §3.11: dedup applies MAX-non-null union-merge across duplicates at merge time."
 
   - object: linkedin_outreach
@@ -375,6 +375,7 @@ attributes:
       - scripts.attio_dedup
       - scripts.backfill_experiment_id_archaeology
       - workflows.pending_invite_reconciliation.run_pending_invite_reconciliation
+      - workflows.botdog_ingest.apply_lead_events
     note: |
       §3.1 full enum (6 values — no "no_active_experiment" sentinel, never add it).
       Seven authorized writers (PR-22 adds 7th):
@@ -437,6 +438,7 @@ attributes:
     write_owner_module:
       - workflows.daily_check.run_dm_sequencing
       - workflows.consistency_sweep.run_company_tally_consistency_sweep
+      - workflows.botdog_ingest.apply_lead_events
     note: "Forward-only cadence floor stamped after each confirmed DM send. Computed via models.business_calendar.advance_off_weekend (Sat -> Mon, Sun -> Mon); never shorter than the in-memory dm_sequencer.earliest_send_date. 2026-06-09: consistency_sweep added as co-writer for desync repair path."
 
   - object: linkedin_outreach
@@ -1691,3 +1693,28 @@ attributes:
     status: shipped
     write_owner_module: workflows.email_campaign.run_email_daily
     note: "Resend message id of the most recent outreach email (previously discarded). Enables future thread-id reply matching. Written via direct attio.update_person (email-lane convention, not AttioWriter); registry entry exists for manifest parity. Forward-compat: sends fall back to writing without this key until the attribute exists in the workspace."
+
+  # ---- LinkedIn Outreach: delivery-transport routing (OPTIONAL) ----
+  - object: linkedin_outreach
+    slug: send_channel
+    type: select
+    options: ["pb", "botdog"]
+    pr_id: PR-279
+    status: planned
+    write_owner_module:
+      - scripts.attio_dedup
+    note: |
+      Delivery-transport stamp for the OPTIONAL Botdog transport.
+      PhantomBuster owns sending: `run_dm_sequencing` /
+      `run_connection_requests` only READ this field (missing/None ->
+      daily_check_helpers.SEND_CHANNEL_DEFAULT = "pb"), and no send path
+      routes to Botdog. A row stamped `botdog` is HELD OUT of PB invites
+      and DMs and of the Phase 0 / 0.5 scrape detectors, so it gets no
+      outreach from any transport until an operator re-stamps it `pb` —
+      the double-send guard for a prospect a Botdog campaign may still
+      hold. Deliberately absent from
+      schema_preflight.DM_ENTRY_WRITER_ATTRS (the send path never writes
+      it). The only registered writer is scripts.attio_dedup, which must
+      carry the stamp onto the surviving entry when it merges records.
+      Provision it only with `scripts/setup_attio_schema.py --feature
+      botdog`; a fresh install never needs the attribute at all.

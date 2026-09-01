@@ -49,6 +49,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import httpx  # noqa: E402
 
 from clients.attio import AttioClient, linkedin_identity_key  # noqa: E402
+from workflows.daily_check_helpers import SEND_CHANNEL_BOTDOG  # noqa: E402
 from workflows.escalation import escalate  # noqa: E402
 
 # Transient errors that can legitimately happen mid-run against Attio and
@@ -1668,6 +1669,20 @@ def compute_union_merge_attrs(winner_attrs: dict, loser_attrs_list: list[dict]) 
     new_hcn = _any_truthy(*[a.get("had_connection_note") for a in all_attrs])
     if new_hcn is True and not winner_attrs.get("had_connection_note"):
         delta["had_connection_note"] = True
+
+    # --- send_channel: a `botdog` stamp on ANY member wins ---
+    # The stamp marks a prospect another transport may already hold, and a
+    # stamped row is HELD OUT of every send. Dropping it during a merge
+    # would silently make the surviving entry PB-sendable again — the exact
+    # double-send this attribute exists to prevent. So the merge inherits
+    # the most restrictive value, never the winner's by default. Mirrors
+    # run_dm_sequencing's sibling-identity hold-out, which already treats
+    # one stamped duplicate as covering the whole LinkedIn identity.
+    if any(
+        (a.get("send_channel") or "") == SEND_CHANNEL_BOTDOG
+        for a in all_attrs
+    ) and (winner_attrs.get("send_channel") or "") != SEND_CHANNEL_BOTDOG:
+        delta["send_channel"] = SEND_CHANNEL_BOTDOG
 
     return delta
 

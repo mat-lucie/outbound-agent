@@ -766,7 +766,10 @@ class TestHonestDmSendCounts:
             container_id="cid_dm1",
             next_day_drift_key="drift_key_dm1",
         )
-        monkeypatch.setattr(daily_check, "parse_send_outcome", lambda **kw: fake_outcome)
+        # Sender seam: the CSV parse now lives in clients.sender (PBSender
+        # owns the transport hop), so the patch binds there.
+        import clients.sender as sender_mod
+        monkeypatch.setattr(sender_mod, "parse_send_outcome", lambda **kw: fake_outcome)
         monkeypatch.setattr(daily_check, "should_advance_batch", lambda *a, **kw: True)
         monkeypatch.setattr(daily_check, "get_current_experiment_id", lambda: None)
 

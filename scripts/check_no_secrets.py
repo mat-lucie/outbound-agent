@@ -228,7 +228,8 @@ NAMES_DENYLIST = (
     "sigma",                        # Sigma Alimentos
     "therese",                      # López-Therese (founder surname)
     "pepe",                         # nickname carried in a dedup fixture
-    "bachoco", "suzano", "canela",  # other real companies from private notes
+    # other real companies from private notes
+    "bachoco", "suzano", "canela", "bafar",
 )
 
 for _name in NAMES_DENYLIST:

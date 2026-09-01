@@ -31,7 +31,11 @@ from models.campaign import (
     personalize,
 )
 from models.pipeline import STAGE_RANK, PipelineStage
-from workflows.daily_check_helpers import _pb_session_args
+from workflows.daily_check_helpers import (
+    SEND_CHANNEL_BOTDOG,
+    _pb_session_args,
+    _resolve_send_channel,
+)
 from workflows.escalation import escalate
 from workflows.hot_lead_alert import (
     HotLeadEmitFailed,
@@ -1132,6 +1136,15 @@ def detect_responses(
     for entry in entries:
         attrs = AttioClient.parse_entry(entry)
         if attrs["stage"] not in dm_stages:
+            continue
+        # botdog-channel scope guard: reply detection for a row stamped
+        # send_channel=botdog comes from Botdog lead events
+        # (workflows.botdog_ingest, LEAD_MESSAGE_REPLIED → Responded), not
+        # the SN Inbox Scraper. Skip it here so Phase 0.5 doesn't race /
+        # double-write the event-confirmed flip. Uses the SHARED resolver
+        # so this skip, the send path and the ingest scope guard can never
+        # disagree about which transport owns a row.
+        if _resolve_send_channel(attrs) == SEND_CHANNEL_BOTDOG:
             continue
         name, company, _, _, _ = cache.get(attrs["record_id"])
         if not name:

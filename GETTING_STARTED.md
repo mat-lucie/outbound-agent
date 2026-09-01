@@ -184,6 +184,65 @@ modified before you provision this stay un-stamped.
 | people | `last_migrated_by` | record reference → `migration_run` | Migration Run that last modified this person. |
 | companies | `last_migrated_by` | record reference → `migration_run` | Migration Run that last modified this company. |
 
+### (Optional) Botdog delivery transport
+
+**Off by default, and it does not send.** PhantomBuster is the engine's only
+wired send transport: every invite and DM goes out through the PB phantoms. The
+repo also ships a complete, hardened surface for [Botdog](https://botdog.co) —
+a REST client, a submission-only sender, a poll-based event-ingest drain, a
+local submission ledger, an account-limit sync, and a never-contact blacklist
+seeder — for operators who want to route sends through it themselves. No code
+path in the engine routes a send to Botdog, and no `.env` value can make it.
+
+What the flag actually does: `BOTDOG_SEND_ENABLED=true` turns on **Phase 0.7**,
+a read-only event drain. It polls Botdog lead events so rows stamped
+`send_channel=botdog` can absorb their confirming accept / DM-advance / reply
+events. It never sends. Leave it off and the phase is a one-line skip; an
+ordinary run then never needs `BOTDOG_API_KEY` or a `config/botdog.yaml`.
+Both switches must be on: the drain also requires `enabled: true` in
+`config/botdog.yaml`. `enabled: false` means every Botdog surface is inert, and
+the drain then prints a skip line and polls nothing.
+
+The `send_channel` stamp is the safety interlock. A row stamped `botdog` is
+held **out** of PB invites and DMs *and* out of the Phase 0 / 0.5 scrape
+detectors — it receives no outreach from any transport, and the run says so
+loudly on every pass (per-step DM hold-out counts, an invite exclusion count,
+and a residual census across all stages). That is deliberate: a prospect a
+Botdog campaign still holds must never get a second first-touch from PB.
+Re-stamp such rows `send_channel=pb` only after the Botdog campaigns are paused
+and their leads removed. Missing/unset resolves to `pb`, so a fresh install is
+unaffected.
+
+To wire it up:
+
+1. `cp config/botdog.example.yaml config/botdog.yaml`, fill in your campaign
+   ids, set `enabled: true`. Validation is fail-loud — `enabled: true` with no
+   campaigns, or with a `REPLACE_WITH_...` placeholder left in, raises at load
+   time rather than submitting prospects into a campaign that does not exist.
+2. Put `BOTDOG_API_KEY` in `.env`.
+3. `python3 scripts/setup_attio_schema.py --feature botdog` (idempotent) to add
+   the `send_channel` attribute.
+4. **Seed the never-contact set before any Botdog send.**
+   `python3 scripts/seed_botdog_blacklist.py` previews; `--apply` writes. Botdog
+   inherits none of PhantomBuster's internal never-contact memory, so without
+   this it can re-invite someone you already burned. Add any organisation you
+   must never contact on any channel to `blacklist.denylist_companies` in
+   `config/botdog.yaml` — those are seeded at any pipeline stage.
+
+   The repo ships a pre-send gate for this,
+   `workflows.daily_check_helpers.assert_botdog_blacklist_seeded`: it raises
+   unless the collection exists and is non-empty
+   (`BOTDOG_SKIP_BLACKLIST_CHECK=1` is a loud emergency override, never a
+   silent one). **It is a helper you must wire in, not an automatic check.**
+   Nothing in this engine calls it — the engine sends through PhantomBuster,
+   and Phase 0.7 is a read-only drain that sends nothing. If you build a
+   Botdog send path, call the gate yourself before the first send; otherwise
+   the never-contact set is never verified.
+
+| Object | Attribute | Type | Purpose |
+|--------|-----------|------|---------|
+| linkedin_outreach | `send_channel` | select (`pb` \| `botdog`) | Which transport owns this prospect's sends. Unset = `pb`. Read-only routing state — no engine code writes it. |
+
 ---
 
 ## 3. Create the PhantomBuster phantoms

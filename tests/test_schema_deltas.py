@@ -111,6 +111,12 @@ class TestShippedManifest:
                 # Phase C: reconciliation sweep re-stamps connection_sent on the
                 # PROSPECT→CONNECTION_SENT flip (same guard as pre_invite_check).
                 "workflows.pending_invite_reconciliation.run_pending_invite_reconciliation",
+                # The optional Botdog event drain freezes the cohort at
+                # "connection_sent" on an event-confirmed invite, exactly as
+                # the PB invite path does — without it, botdog-stamped rows
+                # would be measured against a later freeze boundary than
+                # their PB counterparts and skew every A/B comparison.
+                "workflows.botdog_ingest.apply_lead_events",
             },
             ("linkedin_outreach", "suppress_re_engagement"): {
                 "workflows.cross_channel_suppression",

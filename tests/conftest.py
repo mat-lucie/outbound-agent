@@ -213,6 +213,32 @@ def _isolate_safety_limits(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_botdog_state(monkeypatch, tmp_path):
+    """Redirect the Botdog submission ledger + poll cursor to temp paths.
+
+    Both live under ``~/.outbound-agent/`` alongside the other local state.
+    ``record_submission`` and ``write_cursor`` are plain file writes with no
+    dry-run guard, so any test that reaches the submission ledger or the
+    event drain unpatched would write into the operator's real home — and
+    the ledger is a duplicate-SEND guard, so a stale test entry there could
+    suppress a real DM. Isolated for every test by default; tests that need
+    specific state stack their own setattr on top of this baseline.
+    """
+    from workflows import botdog_ingest, botdog_ledger
+
+    ledger_dir = tmp_path / "botdog-ledger"
+    poll_dir = tmp_path / "botdog-poll"
+    monkeypatch.setattr(botdog_ledger, "LEDGER_DIR", ledger_dir)
+    monkeypatch.setattr(
+        botdog_ledger, "LEDGER_FILE", ledger_dir / "botdog_submissions.json"
+    )
+    monkeypatch.setattr(botdog_ingest, "POLL_STATE_DIR", poll_dir)
+    monkeypatch.setattr(
+        botdog_ingest, "POLL_STATE_FILE", poll_dir / "botdog_poll.json"
+    )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_audit_dir(monkeypatch, tmp_path):
     """Redirect the audit JSONL dir to a per-test temp path.
 

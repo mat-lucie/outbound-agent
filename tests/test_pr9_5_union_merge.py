@@ -1103,3 +1103,57 @@ class TestPayloadDisjointness:
         }
         with pytest.raises(EscalationSchemaError, match="duplicates"):
             _validate_payload_against_typeddict("dedup_review", payload)
+
+
+class TestSendChannelUnionMerge:
+    """A `send_channel=botdog` stamp must survive a union-merge.
+
+    The stamp marks a prospect an alternative transport may already hold,
+    and a stamped row is held out of every send. If the merge kept the
+    winner's (unset → `pb`) value, the surviving entry would silently
+    become PB-sendable and the prospect could get a second first-touch —
+    the exact double-send the attribute exists to prevent.
+    """
+
+    def test_botdog_stamp_on_a_loser_is_inherited_by_the_winner(self):
+        from scripts.attio_dedup import compute_union_merge_attrs
+
+        winner = {"stage": "Connection Sent"}
+        loser = {"stage": "Connection Sent", "send_channel": "botdog"}
+
+        delta = compute_union_merge_attrs(winner, [loser])
+
+        assert delta["send_channel"] == "botdog"
+
+    def test_botdog_stamp_already_on_the_winner_is_not_re_written(self):
+        """Idempotency: the delta carries only attributes that CHANGE."""
+        from scripts.attio_dedup import compute_union_merge_attrs
+
+        winner = {"stage": "Connection Sent", "send_channel": "botdog"}
+        loser = {"stage": "Connection Sent", "send_channel": "botdog"}
+
+        delta = compute_union_merge_attrs(winner, [loser])
+
+        assert "send_channel" not in delta
+
+    def test_all_pb_members_leave_send_channel_untouched(self):
+        """No stamp anywhere → nothing to inherit. The merge must not
+        invent a `pb` write on a workspace that never provisioned the
+        attribute."""
+        from scripts.attio_dedup import compute_union_merge_attrs
+
+        winner = {"stage": "Connection Sent", "send_channel": "pb"}
+        loser = {"stage": "Connection Sent"}
+
+        delta = compute_union_merge_attrs(winner, [loser])
+
+        assert "send_channel" not in delta
+
+    def test_dedup_is_a_registered_writer_of_send_channel(self):
+        """The merge above WRITES the attribute, so AttioWriter's
+        authorized-writer gate has to know about it."""
+        from clients.attio_writer_registry import is_authorized_writer
+
+        assert is_authorized_writer(
+            "linkedin_outreach", "send_channel", "scripts.attio_dedup"
+        )

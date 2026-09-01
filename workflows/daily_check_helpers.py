@@ -8,6 +8,7 @@ Attio state — safe to test in isolation.
 import json
 import os
 import re
+import sys
 from typing import TYPE_CHECKING
 from urllib.parse import unquote
 
@@ -23,6 +24,7 @@ from clients.pb_config import (
 from clients.phantombuster import get_phantombuster_credentials
 
 if TYPE_CHECKING:
+    from clients.botdog import BotdogClient
     from clients.phantombuster import PhantomBusterClient
 
 
@@ -34,6 +36,172 @@ def _normalize_linkedin_url(url: str) -> str:
     return unquote(url).replace("://www.", "://").rstrip("/").lower()
 
 
+# ── delivery-transport send-channel routing ──────────────────────────
+# Channel values for the `send_channel` list-entry attribute (manifest:
+# docs/attio_schema_deltas.yaml).
+#
+# HOME: these live here, in the dependency-free helper module, rather than
+# in `workflows/daily_check.py`, because THREE modules must agree on the
+# answer — daily_check (send routing), detect_responses (Phase 0.5 skip)
+# and botdog_ingest (ingest scope guard) — and neither of the latter two
+# can import daily_check without a module-load cycle. One definition means
+# the routing question is a SINGLE switch; duplicated, a change would move
+# the send path and leave the detection paths behind, splitting a
+# prospect's cadence across two transports. `workflows.daily_check`
+# re-exports both constants and the resolver.
+SEND_CHANNEL_PB = "pb"
+SEND_CHANNEL_BOTDOG = "botdog"
+
+# Channel resolved for entries whose `send_channel` attribute is unset —
+# which is every row this engine writes. PhantomBuster owns sending: no
+# code path stamps `botdog`, and no send path routes to Botdog. The
+# constant exists so a row that WAS stamped (by an operator's own
+# migration, or a prior deployment) is held OUT of PB sends rather than
+# double-messaged by two transports.
+SEND_CHANNEL_DEFAULT = SEND_CHANNEL_PB
+
+
+def _resolve_send_channel(attrs: dict) -> str:
+    """Resolve a parsed entry's delivery transport channel.
+
+    Missing/empty `send_channel` → SEND_CHANNEL_DEFAULT (`pb`). Any
+    unexpected stored value is passed through verbatim — the caller's
+    channel comparison then treats it as non-botdog (== PB path), which is
+    the safe direction: an unknown channel must never trigger a send on an
+    unwired transport.
+    """
+    return attrs.get("send_channel") or SEND_CHANNEL_DEFAULT
+
+
+# ── Botdog blacklist presence gate ───────────────────────────────────
+# Botdog inherits NONE of PhantomBuster's internal never-contact memory,
+# so `scripts/seed_botdog_blacklist.py --apply` is a hard pre-send step
+# for any operator who wires the Botdog transport. The very first Botdog
+# run could otherwise re-invite someone already burned, or cold-contact a
+# company on the operator's never-contact denylist.
+#
+# THIS GATE IS A HELPER, NOT AN AUTOMATIC ONE. This engine sends through
+# PhantomBuster; the Botdog surface is off by default and no production
+# path calls this function. An operator who builds a Botdog send path
+# MUST call it themselves before the first send — nothing else will.
+#
+# Memoized per PROCESS (one `get_blacklists` call per run, not one per
+# send step). `reset_blacklist_gate()` exists for tests.
+BOTDOG_SKIP_BLACKLIST_CHECK_ENV = "BOTDOG_SKIP_BLACKLIST_CHECK"
+
+_blacklist_gate_checked = False
+
+
+def reset_blacklist_gate() -> None:
+    """Clear the per-process memo (tests only)."""
+    global _blacklist_gate_checked
+    _blacklist_gate_checked = False
+
+
+def assert_botdog_blacklist_seeded(client: "BotdogClient") -> None:
+    """Refuse to build a Botdog sender until the never-contact set is seeded.
+
+    Blocks (RuntimeError) when the named collection is absent, or is
+    present and explicitly empty. Two deliberate NON-blocking paths:
+
+      * ``BOTDOG_SKIP_BLACKLIST_CHECK=1`` — operator emergency override,
+        downgraded to a loud warning (a wet run must never be hostage to
+        this gate at 2am, but it must be impossible to skip silently);
+      * a ``BotdogError`` raised BY THE CHECK ITSELF — an API blip must
+        not kill a run. The sends downstream carry their own error
+        handling; failing the whole run on a flaky read would be a bigger
+        outage than the risk it guards.
+
+    Both non-blocking paths still set the memo, so the warning prints once
+    per run rather than once per step.
+
+    An UNREADABLE lead count (``collection_lead_count`` → None, meaning
+    "unknown", never "empty") also passes — but loudly: the gate then
+    verified EXISTENCE only, not that the set is populated.
+
+    NOT WIRED INTO ANY SEND PATH IN THIS ENGINE. PhantomBuster owns
+    sending here and the Botdog surface is off by default, so nothing
+    calls this today (the Phase 0.7 event drain deliberately does not —
+    it is read-only and sends nothing). It is the ready-made gate for an
+    operator who wires a Botdog send path: call it before building the
+    sender, or the never-contact set is never checked.
+    """
+    global _blacklist_gate_checked
+    if _blacklist_gate_checked:
+        return
+
+    from clients.botdog import (
+        BotdogError,
+        blacklist_name,
+        collection_lead_count,
+        select_blacklist,
+    )
+
+    name = blacklist_name()
+
+    if os.environ.get(BOTDOG_SKIP_BLACKLIST_CHECK_ENV) == "1":
+        print(
+            f"  ⚠ {BOTDOG_SKIP_BLACKLIST_CHECK_ENV}=1 — Botdog blacklist "
+            f"presence gate BYPASSED. Sends proceed with the never-contact "
+            f"set UNVERIFIED. Unset it and run "
+            f"scripts/seed_botdog_blacklist.py --apply as soon as you can.",
+            file=sys.stderr,
+        )
+        _blacklist_gate_checked = True
+        return
+
+    try:
+        blacklists = client.get_blacklists()
+    except BotdogError as exc:
+        print(
+            f"  ⚠ Botdog blacklist presence gate could not run "
+            f"[{type(exc).__name__}: {exc}] — NOT blocking the run (an API "
+            f"blip must not kill it), but the never-contact set is "
+            f"UNVERIFIED this run. Re-check before the next wet send.",
+            file=sys.stderr,
+        )
+        _blacklist_gate_checked = True
+        return
+
+    # Duplicate same-named collections exist in the wild (an empty
+    # duplicate beside the populated one). Pick the POPULATED one by max
+    # leadCount, not the first by list order — otherwise the API returning
+    # the empty duplicate first would read 0 leads and block every send.
+    match = select_blacklist(blacklists, name)
+    if match is None:
+        raise RuntimeError(
+            f"Botdog blacklist not seeded — no collection named {name!r} "
+            f"exists. Run scripts/seed_botdog_blacklist.py --apply before "
+            f"enabling sends; override with "
+            f"{BOTDOG_SKIP_BLACKLIST_CHECK_ENV}=1 for emergencies. "
+            f"Nothing was sent."
+        )
+    lead_count = collection_lead_count(match)
+    if lead_count is None:
+        # "Unknown", never "empty" (see `collection_lead_count`), so the
+        # gate PASSES on existence alone. That pass is deliberate — a
+        # populated collection whose payload omits the count must not
+        # block a run — but it is a WEAKER verdict than the operator
+        # thinks they are getting, so it is never silent.
+        print(
+            f"  ⚠ Botdog blacklist presence gate: the collection {name!r} "
+            f"exists but its payload carries NO readable lead count — the "
+            f"gate is passing on EXISTENCE ONLY and has NOT verified the "
+            f"never-contact set is populated. Confirm it in Botdog, or "
+            f"re-run scripts/seed_botdog_blacklist.py --apply.",
+            file=sys.stderr,
+        )
+    if lead_count == 0:
+        raise RuntimeError(
+            f"Botdog blacklist not seeded — the collection {name!r} exists "
+            f"but is EMPTY (0 leads). Run "
+            f"scripts/seed_botdog_blacklist.py --apply before enabling "
+            f"sends; override with {BOTDOG_SKIP_BLACKLIST_CHECK_ENV}=1 for "
+            f"emergencies. Nothing was sent."
+        )
+    _blacklist_gate_checked = True
+
+
 # Pattern for any remaining bracket placeholder (e.g. [industria similar], [Name]).
 # Used as a pre-send guard — a batch with unresolved placeholders must not ship.
 _PLACEHOLDER_RE = re.compile(r"\[[^\[\]\n]+\]")
@@ -41,6 +209,10 @@ _PLACEHOLDER_RE = re.compile(r"\[[^\[\]\n]+\]")
 
 class UnresolvedPlaceholderError(RuntimeError):
     """Raised when an outbound message still contains a [...] template token."""
+
+
+class BlankMessageError(RuntimeError):
+    """Raised when an outbound message rendered to empty/whitespace text."""
 
 
 def _dedupe_by_linkedin_url(rows: list[dict]) -> tuple[list[dict], list[str]]:
@@ -104,6 +276,37 @@ def _assert_no_unresolved_placeholders(rows: list[dict], step_label: str) -> Non
         raise UnresolvedPlaceholderError(
             f"Refusing to send {step_label}: {len(offenders)} message(s) contain "
             f"unresolved placeholders. Examples: {preview}"
+        )
+
+
+def _assert_no_blank_messages(rows: list[dict], step_label: str) -> None:
+    """Refuse to ship any row whose message rendered to empty/whitespace.
+
+    A blank rendered message means template rendering broke upstream (e.g. a
+    template variable rename emptying every render) — a batch-level, systemic
+    condition, not a per-prospect one. Without this guard the run would
+    reserve a lease, iterate every row, and finish "successfully" with 0
+    sends, which reads as N flaky prospects rather than one broken template.
+    Aborting the batch before its lease is reserved keeps the failure
+    attributed to the template, loudly. A transport that validates per row
+    (Botdog rejects blank text) is only a backstop — invite notes and PB rows
+    have no transport-level blank check, so this guard is their only line of
+    defence.
+    """
+    blank = [
+        row.get("linkedInUrl", "?")
+        for row in rows
+        if not (row.get("message") or "").strip()
+    ]
+    if blank:
+        preview = "; ".join(blank[:5])
+        raise BlankMessageError(
+            f"Refusing to send {step_label}: {len(blank)}/{len(rows)} rendered "
+            f"message(s) are blank — template rendering likely broke upstream "
+            f"(check the {step_label} templates before re-running; nothing in "
+            f"THIS {step_label} batch was sent and its lease was never "
+            f"reserved — earlier batches in the same run may already have "
+            f"sent). Affected: {preview}"
         )
 
 
