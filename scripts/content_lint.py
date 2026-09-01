@@ -408,8 +408,10 @@ def _is_cta_required(step_key: str) -> bool:
     for skip in _NO_CTA_REQUIRED_STEPS:
         if step_key == skip or step_key.startswith("dm3"):
             return False
-    # connection_note is short and doesn't need a CTA
-    return step_key != "connection_note"
+    # connection_note is short and doesn't need a CTA. The prefix match
+    # covers the pain-signal lane's connection_note_poster /
+    # connection_note_liker variants (same short-note class).
+    return not step_key.startswith("connection_note")
 
 
 def _cta_presence_rule(

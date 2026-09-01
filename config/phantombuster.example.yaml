@@ -62,6 +62,31 @@ agents:
   # Env fallback: PB_INBOX_SCRAPER_ID
   inbox_scraper: "REPLACE_WITH_INBOX_SCRAPER_PHANTOM_ID"
 
+  # ---- Pain-signal discovery lane (OPTIONAL, OFF BY DEFAULT) ----
+  # Only needed when OUTBOUND_PAIN_SIGNAL_ENABLED=1. These are the WORKER
+  # phantoms inside a "post commenter and liker scraper" workflow — NOT the
+  # workflow parent. The parent is an orchestrator shell whose API launches
+  # are no-ops; the lane drives the workers directly (save-then-launch), so
+  # never put the parent's ID here. Leave all three blank to keep the lane
+  # inert. See GETTING_STARTED.md § "Pain-signal discovery lane".
+  #
+  # Posts worker: a LinkedIn activity extractor. Takes one content-search URL
+  # per approved keyword query and exports matching posts. REQUIRED when the
+  # lane is enabled — without posts there is no lane.
+  # Env fallback: PB_PAIN_POSTS_WORKER_ID
+  pain_posts_worker: ""
+
+  # Commenters worker: one launch per surviving post URL, exporting the people
+  # who commented. OPTIONAL — blank skips commenter harvesting loudly
+  # (posters are still processed).
+  # Env fallback: PB_PAIN_COMMENTERS_WORKER_ID
+  pain_commenters_worker: ""
+
+  # Likers worker: one launch per surviving post URL, exporting the people who
+  # reacted. OPTIONAL — blank skips liker harvesting loudly.
+  # Env fallback: PB_PAIN_LIKERS_WORKER_ID
+  pain_likers_worker: ""
+
 # ---------------------------------------------------------------------------
 # Pre-invite degree-check backend — NON-SECRET. Resolution: yaml → env → code default.
 # ---------------------------------------------------------------------------

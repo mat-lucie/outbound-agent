@@ -202,5 +202,17 @@
     "dm1_v3": {
       "es": "Hola [Name], REPLACE_THIS_TEMPLATE: aquí va tu primer DM para [Company]. Reemplázalo con tu propio mensaje."
     }
+  },
+  "pain_signal": {
+    "connection_note_poster": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE: aquí va tu nota para alguien que ESCRIBIÓ el post que encontraste. Puedes referirte a su post directamente. Reemplázala con tu propio mensaje.",
+      "en": "Hi [Name], REPLACE_THIS_TEMPLATE: your note for someone who WROTE the post you matched goes here. You may reference their post directly. Replace this with your own message.",
+      "pt": "Olá [Name], REPLACE_THIS_TEMPLATE: sua nota para quem ESCREVEU o post encontrado vai aqui. Você pode se referir ao post diretamente. Substitua por sua própria mensagem."
+    },
+    "connection_note_liker": {
+      "es": "Hola [Name], REPLACE_THIS_TEMPLATE: aquí va tu nota para alguien que COMENTÓ o REACCIONÓ al post. Nunca digas que ellos lo escribieron. Reemplázala con tu propio mensaje.",
+      "en": "Hi [Name], REPLACE_THIS_TEMPLATE: your note for someone who COMMENTED ON or REACTED TO the post goes here. Never claim they wrote it. Replace this with your own message.",
+      "pt": "Olá [Name], REPLACE_THIS_TEMPLATE: sua nota para quem COMENTOU ou REAGIU ao post vai aqui. Nunca diga que foi essa pessoa quem escreveu. Substitua por sua própria mensagem."
+    }
   }
 }

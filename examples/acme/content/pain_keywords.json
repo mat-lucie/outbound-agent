@@ -1,0 +1,81 @@
+{
+  "_meta": {
+    "description": "SYNTHETIC reference registry for the fictional operator Acme (acme.example.com). Every phrase here is invented for documentation + tests — it is NOT a researched keyword program. Use it to see the file's SHAPE, then write your own from real buyer language.",
+    "status": "approved",
+    "approved_by": "acme-operator",
+    "approved_at": "2026-01-01",
+    "harvested_at": "2026-01-01",
+    "harvest_sources": [
+      "synthetic — invented for the bundled example, no real transcripts"
+    ],
+    "operator_notes": [
+      "The three tiers demonstrate the query grammar: high_precision (one quoted phrase), paired (quoted phrase AND a bare term), surgical_low_volume (a verbatim sentence that only the right person writes).",
+      "Register: the same concept is queried once per regional variant — 'production scheduling' and 'programación de la producción' are separate queries with separate languages, because the language picks the note template.",
+      "en-planning-spreadsheet is a deliberately STRETCHED example: it can surface posts about spreadsheets in general, not about scheduling. A real operator disables queries like it unless the note copy is broad enough to stay honest."
+    ]
+  },
+  "config": {
+    "post_max_age_hours_default": 24,
+    "max_engager_scrape_posts_per_run": 8,
+    "max_engagers_per_run": 40,
+    "pain_snippet_max_chars": 280
+  },
+  "queries": [
+    {
+      "id": "en-production-scheduling",
+      "language": "en",
+      "query": "\"production scheduling\"",
+      "tier": "high_precision",
+      "enabled": true,
+      "source": "synthetic — the core term for the example ICP"
+    },
+    {
+      "id": "en-production-plan",
+      "language": "en",
+      "query": "\"production plan\"",
+      "tier": "high_precision",
+      "enabled": true,
+      "source": "synthetic — the plan artifact itself"
+    },
+    {
+      "id": "en-rush-order-scheduling",
+      "language": "en",
+      "query": "\"rush order\" scheduling",
+      "tier": "paired",
+      "enabled": true,
+      "source": "synthetic — paired with 'scheduling' to cut e-commerce noise"
+    },
+    {
+      "id": "en-the-plan-falls-apart",
+      "language": "en",
+      "query": "\"the plan falls apart\"",
+      "tier": "surgical_low_volume",
+      "enabled": true,
+      "source": "synthetic — a verbatim complaint, very low volume, very high precision"
+    },
+    {
+      "id": "en-planning-spreadsheet",
+      "language": "en",
+      "query": "\"planning spreadsheet\"",
+      "tier": "surgical_low_volume",
+      "enabled": false,
+      "source": "synthetic — DISABLED on purpose: it stretches the note's topic claim (see operator_notes)"
+    },
+    {
+      "id": "es-programacion-de-la-produccion",
+      "language": "es",
+      "query": "\"programación de la producción\"",
+      "tier": "high_precision",
+      "enabled": true,
+      "source": "synthetic — the ES-register equivalent of en-production-scheduling"
+    },
+    {
+      "id": "pt-programacao-da-producao",
+      "language": "pt",
+      "query": "\"programação da produção\"",
+      "tier": "high_precision",
+      "enabled": true,
+      "source": "synthetic — the PT-register equivalent of en-production-scheduling"
+    }
+  ]
+}

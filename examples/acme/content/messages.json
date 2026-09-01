@@ -202,5 +202,17 @@
     "dm1_v3": {
       "es": "Hola [Name], gracias por aceptar. Soy de Acme, hacemos IA para programaci\u00f3n de producci\u00f3n. Algo que vemos hasta en las plantas m\u00e1s ordenadas: el plan de producci\u00f3n vive solo en la cabeza del programador. Cuando \u00e9l se enferma o sale, el resto del equipo queda a ciegas. \u00bfEn [Company] ya todos ven el mismo plan, o sigue dependiendo de una persona? Si es tema, con gusto te lo comento."
     }
+  },
+  "pain_signal": {
+    "connection_note_poster": {
+      "es": "Hola [Name], vi tu post sobre la programaci\u00f3n de la producci\u00f3n. Es justo el tema en el que trabajamos en Acme (acme.example.com): el plan que se desarma y hay que rehacer a mano. Me gustar\u00eda conectar y seguir leyendo tu perspectiva.",
+      "en": "Hi [Name], I saw your post about production scheduling. It's exactly what we work on at Acme (acme.example.com): the plan that falls apart and gets rebuilt by hand. I'd like to connect and keep reading your perspective.",
+      "pt": "Ol\u00e1 [Name], vi seu post sobre programa\u00e7\u00e3o da produ\u00e7\u00e3o. \u00c9 exatamente o tema em que trabalhamos na Acme (acme.example.com): o plano que se desmonta e precisa ser refeito na m\u00e3o. Gostaria de conectar e acompanhar sua perspectiva."
+    },
+    "connection_note_liker": {
+      "es": "Hola [Name], coincidimos en un post sobre programaci\u00f3n de producci\u00f3n esta semana. En Acme (acme.example.com) trabajamos justo en ese problema: el plan que se rehace a mano cada vez que algo cambia. Me gustar\u00eda conectar.",
+      "en": "Hi [Name], we crossed paths on a post about production scheduling this week. At Acme (acme.example.com) we work on exactly that problem: the plan that gets rebuilt by hand every time something changes. I'd like to connect.",
+      "pt": "Ol\u00e1 [Name], cruzamos no mesmo post sobre programa\u00e7\u00e3o da produ\u00e7\u00e3o esta semana. Na Acme (acme.example.com) trabalhamos justamente nesse problema: o plano que \u00e9 refeito na m\u00e3o toda vez que algo muda. Gostaria de conectar."
+    }
   }
 }

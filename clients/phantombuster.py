@@ -16,6 +16,7 @@ See `clients/pb_envelope.py` for the SendOutcome envelope + advance
 gate predicate consumed by send-phantom callers.
 """
 
+import json
 import re
 import time
 from datetime import UTC, datetime
@@ -74,6 +75,27 @@ class PhantomBusterClient:
     def get_agent(self, agent_id: str) -> dict:
         """Get details for a specific phantom."""
         return self._request("GET", "/agents/fetch", params={"id": agent_id})
+
+    def save_agent_argument(self, agent_id: str, argument: dict) -> None:
+        """Persist a phantom's SAVED (console) argument via /agents/save.
+
+        Needed by phantoms of the orchestrator family (the post-engager
+        scraper workflow the pain-signal lane drives): they configure their
+        worker stages from the SAVED argument and treat per-launch
+        `arguments` overrides as a no-op. The argument is sent JSON-encoded,
+        the same shape `/agents/fetch` returns it in.
+
+        Only `id` + `argument` are posted — PB's save endpoint updates the
+        fields it receives, and posting more risks clobbering console-managed
+        settings (schedule, file storage, notifications). Callers that must
+        not launch against a stale query should re-fetch and verify the
+        argument landed before launching.
+        """
+        self._request(
+            "POST",
+            "/agents/save",
+            json={"id": agent_id, "argument": json.dumps(argument)},
+        )
 
     # Retry schedule for PB workspace-level concurrency cap (HTTP 429).
     # PB free/starter plans cap the number of phantoms running in parallel;

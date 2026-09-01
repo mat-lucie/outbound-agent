@@ -2454,33 +2454,66 @@ def _build_invite_send_data(
             )
             counts["language_mismatch"] += 1
             continue
-        # PR-16 (B-PD-005): wrap get_message in MissingMessageError catch.
-        try:
-            template = get_message(
-                persona, language, MessageStep.CONNECTION_NOTE,
-                record_id=str(attrs["record_id"]),
-            )
-        except MissingMessageError as exc:
-            escalate(
-                type="missing_copy",
-                idempotency_key=f"missing_copy|{attrs['record_id']}|connection_note",
-                payload={
-                    "record_id": str(attrs["record_id"]),
-                    "persona": exc.persona or "",
-                    "language": exc.language or "",
-                    "dm_step": exc.dm_step or "connection_note",
-                    "variant": exc.variant or "default",
-                    "error_msg": str(exc),
-                },
-                attio=attio,
-            )
-            click.echo(
-                f"  ⚠ Skipping {name or attrs['record_id']}: {exc} — "
-                f"missing_copy queue row opened.",
-                err=True,
-            )
-            counts["missing_copy"] += 1
-            continue
+        # Pain-signal lane (PR-280): entries the discovery workflow committed
+        # carry prospect_source="pain_signal" and get the post-referencing
+        # note, resolved FIRST so a missing persona template can never skip a
+        # pain entry whose pain copy exists. The persona note is the loud
+        # per-row fallback for anything the lane doesn't ship: a language with
+        # no pain copy, and a missing/unknown pain_source_type —
+        # get_pain_signal_note refuses to guess the poster/engager reference
+        # frame, because falsely telling a liker they WROTE the post is the
+        # dangerous direction; the persona note is the safe one. Deliberately
+        # NO counters here: `counts` is the skip-count contract summed by
+        # both the lane merge and the `first_can_yield_more` backfill
+        # predicate — a success-shaped counter in it would KeyError the
+        # merge or suppress the residual re-scan. The stderr echo is the
+        # operator surface.
+        template = None
+        if attrs.get("prospect_source") == "pain_signal":
+            from models.campaign import get_pain_signal_note
+            try:
+                template = get_pain_signal_note(
+                    language,
+                    source_type=str(attrs.get("pain_source_type") or ""),
+                    record_id=str(attrs["record_id"]),
+                )
+            except MissingMessageError:
+                click.echo(
+                    f"  ⚠ pain-signal note unavailable for "
+                    f"language={getattr(language, 'value', language)!r} "
+                    f"source_type={attrs.get('pain_source_type')!r} — "
+                    f"falling back to the {persona.value} persona note for "
+                    f"{name or attrs['record_id']}.",
+                    err=True,
+                )
+        if template is None:
+            # PR-16 (B-PD-005): wrap get_message in MissingMessageError catch.
+            try:
+                template = get_message(
+                    persona, language, MessageStep.CONNECTION_NOTE,
+                    record_id=str(attrs["record_id"]),
+                )
+            except MissingMessageError as exc:
+                escalate(
+                    type="missing_copy",
+                    idempotency_key=f"missing_copy|{attrs['record_id']}|connection_note",
+                    payload={
+                        "record_id": str(attrs["record_id"]),
+                        "persona": exc.persona or "",
+                        "language": exc.language or "",
+                        "dm_step": exc.dm_step or "connection_note",
+                        "variant": exc.variant or "default",
+                        "error_msg": str(exc),
+                    },
+                    attio=attio,
+                )
+                click.echo(
+                    f"  ⚠ Skipping {name or attrs['record_id']}: {exc} — "
+                    f"missing_copy queue row opened.",
+                    err=True,
+                )
+                counts["missing_copy"] += 1
+                continue
         # PR-14 fold-in: company may be None (RecordCache Unknown → None).
         note = personalize(
             template,
