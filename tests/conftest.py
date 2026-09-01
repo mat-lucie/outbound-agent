@@ -402,6 +402,45 @@ def _isolate_weekly_kpi_reports(monkeypatch, tmp_path):
     return kpi_dir
 
 
+@pytest.fixture(autouse=True)
+def _isolate_scrape_cursors(monkeypatch, tmp_path):
+    """Redirect the weekly ingest-cursor state file to a per-test temp path.
+
+    Same rationale as the ledger fixtures above. The weekly search loop
+    reads and advances ``exports/scrape_cursors.json`` on every search;
+    without isolation the integration tests both write fixture cursors into
+    the operator's real exports dir AND contaminate each other (a 1-row
+    fixture CSV consumed by one test makes the next test's identical CSV a
+    ZERO-DELTA no-op). Tests that assert cursor behavior pass an explicit
+    path or read through this same default.
+    """
+    from workflows import scrape_cursor
+
+    monkeypatch.setattr(
+        scrape_cursor, "DEFAULT_CURSOR_PATH", tmp_path / "scrape_cursors.json"
+    )
+
+
+def scrape_delta_from_csv(csv_text: str, *, csv_name: str = "wk-test-search"):
+    """Build the ``ScrapeDelta`` a stubbed ``_launch_and_download`` returns.
+
+    Tests that stub the harvest layer only care about the rows; this keeps
+    them from hand-rolling the parse (and from drifting when the delta's
+    shape changes). Mirrors the real function: parse once, drop DictReader's
+    ragged-row ``None`` key, report the file total.
+    """
+    import csv as _csv
+    import io as _io
+
+    from workflows.weekly_prospect import ScrapeDelta, ScrapeStatus
+
+    rows = list(_csv.DictReader(_io.StringIO(csv_text)))
+    for row in rows:
+        row.pop(None, None)
+    status = ScrapeStatus.OK if rows else ScrapeStatus.NO_DATA
+    return ScrapeDelta(status, rows, csv_name, len(rows))
+
+
 def transient_attio_500():
     """Build the transient Attio 500 used by retry-path tests.
 

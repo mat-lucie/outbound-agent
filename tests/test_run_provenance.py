@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.conftest import scrape_delta_from_csv
 from workflows import run_provenance
 from workflows.run_provenance import (
     StaleCheckoutError,
@@ -211,7 +212,8 @@ class TestStagedJsonlStamping:
              _patch.object(wp, "load_personas", return_value=personas), \
              _patch.object(wp, "_check_all_persona_target_lists_fresh"), \
              _patch.object(wp, "_load_in_list_canonical_urls", return_value=set()), \
-             _patch.object(wp, "_launch_and_download", return_value=csv_text):
+             _patch.object(wp, "_launch_and_download",
+                           return_value=scrape_delta_from_csv(csv_text)):
             # Wet run (dry_run skips the PB download entirely, so nothing
             # would stage); all clients are mocks — no real writes.
             wp.run_weekly_prospecting(
