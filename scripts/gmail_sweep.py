@@ -127,6 +127,20 @@ _ESP_DOMAINS = frozenset({
     "aweber.com", "getresponse.com",
 })
 
+# 4. Freemail providers — a domain here is a mailbox host, not a company, so
+#    it can never BE a counterparty: grouping by it welds unrelated people
+#    into one row (a live sweep rendered 25 threads from 25 different people
+#    as a single "gmail.com" counterparty). Addresses on these domains group
+#    per-address instead.
+_FREEMAIL_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com", "hotmail.com", "hotmail.es",
+    "hotmail.com.mx", "outlook.com", "outlook.es", "outlook.com.mx",
+    "yahoo.com", "yahoo.com.mx", "yahoo.es", "icloud.com", "me.com",
+    "live.com", "live.com.mx", "msn.com", "aol.com", "proton.me",
+    "protonmail.com", "gmx.com", "gmx.net", "prodigy.net.mx",
+    "terra.com.mx",
+})
+
 
 def _split_domains(raw: str) -> frozenset[str]:
     """Parse a comma-separated domain list from an env var."""
@@ -208,6 +222,50 @@ def is_automated(address: str) -> bool:
     return bool(_automated_domain_re(extra).match(domain))
 
 
+# ---------------------------------------------------------------------------
+# Auto-response messages — RSVPs and out-of-office replies
+#
+# These come FROM the counterparty's real address, so the sender filter above
+# can never catch them, and they must NOT be dropped from the sweep (the
+# thread is real). But they are not messages anyone answers, so they must not
+# set direction-of-ball: on a live run a calendar "Accepted:" arriving after
+# our real reply flipped a counterparty back to "we owe a reply", and
+# "Respuesta automática:" OOO replies did the same for another.
+#
+# Detection, in order of trust:
+#   1. Auto-Submitted header != no (RFC 3834) — Outlook OOO sets
+#      "auto-generated"; verified on live OOO messages.
+#   2. RSVP subject verbs — Outlook calendar responses carry NO structural
+#      marker at all (verified on live "Accepted:"/"Tentative:" messages),
+#      so the localized verb + colon prefix is the only signal. The list is
+#      EN/ES/PT calendar verbs only — over-matching here hides a real inbound
+#      reply from direction math, so no generic words.
+# ---------------------------------------------------------------------------
+_RSVP_SUBJECT = re.compile(
+    r"^\s*(?:accepted|declined|tentative|new time proposed|"
+    r"aceptada|aceptado|rechazada|rechazado|provisional|"
+    r"aceite|aceito|recusada|recusado|provis[oó]rio)\s*:",
+    re.I,
+)
+
+
+def is_auto_response(msg) -> bool:
+    """True for calendar RSVPs and auto-replies — real threads, but their
+    messages never set direction-of-ball (see block comment above)."""
+    auto_submitted = hdr(msg, "Auto-Submitted").strip().lower()
+    if auto_submitted and auto_submitted != "no":
+        return True
+    return bool(_RSVP_SUBJECT.match(hdr(msg, "Subject")))
+
+
+def counterparty_key(address: str) -> str:
+    """Grouping key for one external address: its domain (one company, one
+    row, however many people write) — except freemail, where the domain is
+    just a mailbox host and the address itself is the counterparty."""
+    domain = address.rsplit("@", 1)[1]
+    return address if domain in _FREEMAIL_DOMAINS else domain
+
+
 # 500 messages per page. Real 90-day volume is a few thousand; this is a
 # runaway guard, not a limit anyone should hit.
 MAX_PAGES = 100
@@ -260,7 +318,8 @@ def fetch_threads(svc, thread_ids):
         try:
             threads[tid] = svc.users().threads().get(
                 userId="me", id=tid, format="metadata",
-                metadataHeaders=["From", "To", "Cc", "Subject", "Date"]
+                metadataHeaders=["From", "To", "Cc", "Subject", "Date",
+                                 "Auto-Submitted"]
             ).execute()
         except Exception as exc:
             failed.append(tid)
@@ -289,6 +348,76 @@ def external_addresses(messages) -> set[str]:
     return ext
 
 
+def _last(messages):
+    """(ms, from_me, subject) of the newest message, or None if empty."""
+    if not messages:
+        return None
+    m = max(messages, key=lambda m: int(m.get("internalDate", 0)))
+    from_me = any(is_internal(a) for a in addrs(hdr(m, "From")))
+    return int(m.get("internalDate", 0)), from_me, hdr(m, "Subject")[:80]
+
+
+def group_counterparties(threads):
+    """Threads (id -> payload) -> one row per counterparty, unsorted.
+
+    Every thread contributes to the group of EVERY counterparty on it
+    (`counterparty_key` per external address), so one conversation can
+    never scatter across a domain key and an address key. Regression of
+    record: the old single-key-per-thread scheme keyed a live thread (which
+    CC'd a second company) by address and the same person's stale
+    calendar-invite thread by domain — the domain row then reported "we owe
+    a reply" for a counterparty we had already answered.
+
+    Direction-of-ball and recency come from the group's newest HUMAN
+    message: drafts and auto-responses (RSVPs, OOO — `is_auto_response`)
+    never set direction. Auto-responses are a group-level fallback so that
+    a counterparty whose only traffic is a bare calendar invite still
+    surfaces instead of vanishing.
+    """
+    def _slot():
+        return {"ms": 0, "from_me": None, "subject": ""}
+
+    groups = defaultdict(lambda: {"threads": [], "addresses": set(),
+                                  "human": _slot(), "fallback": _slot()})
+    for tid, t in threads.items():
+        msgs = t.get("messages", []) or []
+        # drafts have DRAFT label; exclude them from last-message math
+        real = [m for m in msgs if "DRAFT" not in (m.get("labelIds") or [])]
+        if not real:
+            continue
+        ext = external_addresses(real)
+        if not ext:
+            continue
+        human_last = _last([m for m in real if not is_auto_response(m)])
+        any_last = _last(real)
+
+        by_key = defaultdict(set)
+        for a in ext:
+            by_key[counterparty_key(a)].add(a)
+        for key, key_addrs in by_key.items():
+            g = groups[key]
+            g["threads"].append(tid)
+            g["addresses"] |= key_addrs
+            for slot, last in (("human", human_last), ("fallback", any_last)):
+                if last and last[0] > g[slot]["ms"]:
+                    g[slot] = {"ms": last[0], "from_me": last[1],
+                               "subject": last[2]}
+
+    out = []
+    for key, g in groups.items():
+        latest = g["human"] if g["human"]["ms"] else g["fallback"]
+        out.append({
+            "counterparty": key,
+            "addresses": sorted(g["addresses"])[:6],
+            "n_threads": len(g["threads"]),
+            "thread_ids": g["threads"][:8],
+            "latest_ms": latest["ms"],
+            "ball_mine": (not latest["from_me"]),
+            "latest_subject": latest["subject"],
+        })
+    return out
+
+
 def main():
     if not internal_domains():
         raise SystemExit(
@@ -312,44 +441,7 @@ def main():
 
     threads, failed_threads = fetch_threads(svc, thread_ids)
 
-    groups = defaultdict(lambda: {"threads": [], "latest_ms": 0,
-                                  "latest_from_me": None, "latest_subject": "",
-                                  "addresses": set()})
-    for tid, t in threads.items():
-        msgs = t.get("messages", []) or []
-        # drafts have DRAFT label; exclude them from last-message math
-        real = [m for m in msgs if "DRAFT" not in (m.get("labelIds") or [])]
-        if not real:
-            continue
-        ext = external_addresses(real)
-        if not ext:
-            continue
-        # key: single external domain if unique else first address
-        domains = {a.split("@")[1] for a in ext}
-        key = domains.pop() if len(domains) == 1 else sorted(ext)[0]
-        last = max(real, key=lambda m: int(m.get("internalDate", 0)))
-        last_from = addrs(hdr(last, "From"))
-        from_me = any(is_internal(a) for a in last_from)
-        g = groups[key]
-        g["threads"].append(tid)
-        g["addresses"] |= ext
-        ms = int(last.get("internalDate", 0))
-        if ms > g["latest_ms"]:
-            g["latest_ms"] = ms
-            g["latest_from_me"] = from_me
-            g["latest_subject"] = hdr(last, "Subject")[:80]
-
-    out = []
-    for key, g in groups.items():
-        out.append({
-            "counterparty": key,
-            "addresses": sorted(g["addresses"])[:6],
-            "n_threads": len(g["threads"]),
-            "thread_ids": g["threads"][:8],
-            "latest_ms": g["latest_ms"],
-            "ball_mine": (not g["latest_from_me"]),
-            "latest_subject": g["latest_subject"],
-        })
+    out = group_counterparties(threads)
     out.sort(key=lambda r: (-int(r["ball_mine"]), -r["latest_ms"]))
     print(json.dumps({
         "sent_msgs": len(sent_msgs), "sent_pages": sent_pages,

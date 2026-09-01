@@ -24,6 +24,7 @@ from scripts.gmail_sweep import (
     MAX_PAGES,
     external_addresses,
     fetch_threads,
+    group_counterparties,
     internal_domains,
     is_automated,
     is_internal,
@@ -168,6 +169,166 @@ def test_thread_with_a_brand_gtld_yields_an_external_counterparty():
 def test_thread_with_only_robots_yields_nothing():
     thread = [_msg("no-reply@calendar.google.com", f"dana@{OPERATOR_DOMAIN}")]
     assert external_addresses(thread) == set()
+
+
+# ---------------------------------------------------------------------------
+# Grouping + direction-of-ball
+#
+# Regression of record (a live run): six counterparties were reported as "we
+# owe a reply" (ball_mine=true) although the newest sent/received message on
+# the live thread was FROM us. Two mechanisms, both pinned below:
+#
+#   1. SPLIT KEYS: a thread keyed by its single external domain when unique,
+#      else by its alphabetically-first address. One person's live thread
+#      (which CC'd a second company) landed under an address key while their
+#      stale calendar-invite thread landed under the domain key — the domain
+#      row then reported "owed since <weeks ago>" for a fully-answered
+#      counterparty.
+#   2. AUTO-RESPONSES SET DIRECTION: a calendar RSVP ("Accepted: …") or an
+#      out-of-office reply arriving after our real reply flipped the group
+#      back to "we owe a reply". An RSVP is not a message anyone answers.
+# ---------------------------------------------------------------------------
+
+OPERATOR = f"Dana Ortiz <dana@{OPERATOR_DOMAIN}>"
+NOELIA = "Noelia Prado <noelia.prado@acmebeverage.com>"
+RAMIRO = "Ramiro Souza <ramiro@acmelabs.com>"
+TOMAS = "Tomas Solis <tomas.solis@acme-foods.com>"
+
+
+def _tmsg(from_addr, to_addr, *, ms, subject="Re: Acme", labels=("INBOX",),
+          auto_submitted=None):
+    headers = [
+        {"name": "From", "value": from_addr},
+        {"name": "To", "value": to_addr},
+        {"name": "Subject", "value": subject},
+    ]
+    if auto_submitted:
+        headers.append({"name": "Auto-Submitted", "value": auto_submitted})
+    return {"payload": {"headers": headers},
+            "labelIds": list(labels), "internalDate": str(ms)}
+
+
+def _thread(*messages):
+    return {"messages": list(messages)}
+
+
+def _rows_by_key(threads):
+    rows = group_counterparties(threads)
+    return {r["counterparty"]: r for r in rows}
+
+
+def test_answered_counterparty_is_not_split_into_an_owed_domain_row():
+    """The live thread CC'd a colleague at a second company, so it keyed by
+    address, while a stale single-message calendar-invite thread keyed by
+    domain — and the domain row reported us as owing a reply from weeks
+    back. All threads naming a counterparty must land in ONE group, and a
+    group whose newest human message is a SENT one is never "we owe"."""
+    threads = {
+        "invite": _thread(
+            _tmsg(NOELIA, OPERATOR, ms=100, subject="Catch-up Dana <> Noelia"),
+        ),
+        "live": _thread(
+            _tmsg(NOELIA, OPERATOR, ms=50),
+            _tmsg(OPERATOR, f"{NOELIA}, {RAMIRO}", ms=200, labels=("SENT",)),
+        ),
+    }
+    rows = _rows_by_key(threads)
+    beverage = rows["acmebeverage.com"]
+    assert beverage["ball_mine"] is False
+    assert beverage["n_threads"] == 2
+    assert beverage["latest_ms"] == 200
+    # No second row competing for the same person under an address key.
+    assert not any("acmebeverage" in k for k in rows if k != "acmebeverage.com")
+
+
+def test_calendar_rsvp_does_not_flip_the_ball_back_to_us():
+    """We replied last on the live thread at ms=200; the counterparty's
+    calendar acceptance ("Accepted: …" — no Sender or Auto-Submitted header,
+    only the subject marks it) arrived later in its own thread and flipped
+    the whole domain group to "we owe a reply"."""
+    threads = {
+        "live": _thread(
+            _tmsg(OPERATOR, TOMAS, ms=100, labels=("SENT",)),
+            _tmsg('"Rivas, Jose Ignacio" <Jose.Rivas@acme-foods.com>',
+                  OPERATOR, ms=150),
+            _tmsg(OPERATOR, TOMAS, ms=200, labels=("SENT",)),
+        ),
+        "rsvp": _thread(
+            _tmsg(TOMAS, OPERATOR, ms=300,
+                  subject="Accepted: Acme / Northwind - Presentation"),
+        ),
+    }
+    row = _rows_by_key(threads)["acme-foods.com"]
+    assert row["ball_mine"] is False
+    assert row["latest_ms"] == 200
+
+
+def test_out_of_office_reply_does_not_count_as_their_reply():
+    """An OOO (Auto-Submitted: auto-generated) after our send must leave
+    the thread as waiting-on-them, not as an inbound reply we owe."""
+    threads = {
+        "t": _thread(
+            _tmsg(OPERATOR, NOELIA, ms=100, labels=("SENT",)),
+            _tmsg(NOELIA, OPERATOR, ms=150,
+                  subject="Respuesta automática: Reconectando",
+                  auto_submitted="auto-generated"),
+        ),
+    }
+    row = _rows_by_key(threads)["acmebeverage.com"]
+    assert row["ball_mine"] is False
+    assert row["latest_ms"] == 100
+
+
+def test_group_with_only_auto_responses_still_surfaces_as_owed():
+    """A bare unanswered calendar invite is still worth a row — the
+    auto-response demotion is a fallback, not a silencer."""
+    threads = {
+        "invite": _thread(
+            _tmsg(NOELIA, OPERATOR, ms=100,
+                  subject="Accepted: Catch-up Dana <> Noelia"),
+        ),
+    }
+    row = _rows_by_key(threads)["acmebeverage.com"]
+    assert row["ball_mine"] is True
+    assert row["latest_ms"] == 100
+
+
+def test_freemail_senders_are_not_collapsed_into_one_domain_row():
+    """A live sweep rendered 25 threads from 25 unrelated people as a single
+    'gmail.com' counterparty."""
+    threads = {
+        "a": _thread(_tmsg("Ana <ana.consultant@gmail.com>", OPERATOR, ms=100)),
+        "b": _thread(_tmsg("Beto <beto.planta@gmail.com>", OPERATOR, ms=200)),
+    }
+    rows = _rows_by_key(threads)
+    assert "gmail.com" not in rows
+    assert rows["ana.consultant@gmail.com"]["ball_mine"] is True
+    assert rows["beto.planta@gmail.com"]["ball_mine"] is True
+
+
+def test_multi_company_thread_reaches_both_counterparties():
+    threads = {
+        "t": _thread(
+            _tmsg(TOMAS, f"{OPERATOR}, h.lara@acmedairy.com", ms=100),
+        ),
+    }
+    rows = _rows_by_key(threads)
+    assert rows["acme-foods.com"]["ball_mine"] is True
+    assert rows["acmedairy.com"]["ball_mine"] is True
+    assert rows["acme-foods.com"]["addresses"] == ["tomas.solis@acme-foods.com"]
+    assert rows["acmedairy.com"]["addresses"] == ["h.lara@acmedairy.com"]
+
+
+def test_drafts_still_do_not_set_direction():
+    threads = {
+        "t": _thread(
+            _tmsg(NOELIA, OPERATOR, ms=100),
+            _tmsg(OPERATOR, NOELIA, ms=200, labels=("DRAFT",)),
+        ),
+    }
+    row = _rows_by_key(threads)["acmebeverage.com"]
+    assert row["ball_mine"] is True
+    assert row["latest_ms"] == 100
 
 
 # ---------------------------------------------------------------------------
