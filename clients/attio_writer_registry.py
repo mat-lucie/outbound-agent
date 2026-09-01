@@ -344,6 +344,17 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
     ("companies", "last_migrated_by"):
         "workflows.migration_run_writer.MigrationRunWriter",
 
+    # ---- People: provenance pointer ----
+    # Third mirror of the linkedin_outreach pointer above. Person-targeted
+    # migrations (e.g. backfill_prospect_committed_at,
+    # backfill_per_step_timestamps) call mark_modified(object="people"); the
+    # attribute was missing on people, so every person back-pointer PATCH was
+    # rejected. The run still exited 0 (back-pointer failures never touch
+    # rows_failed), so the only symptom was a back-pointer WARNING on 100% of
+    # otherwise-successful runs — alarm fatigue that also hides a genuine gap.
+    ("people", "last_migrated_by"):
+        "workflows.migration_run_writer.MigrationRunWriter",
+
     # ---- Migration Run: cross-reference to Reclassification Run (PR-9b) ----
     # Backfill scripts that open both writers pass rec_run.run_id via the
     # MigrationRunWriter constructor; this attribute records that pointer
