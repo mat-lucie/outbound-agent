@@ -1986,6 +1986,16 @@ def weekly_finalize_cmd(batch: str, dry_run: bool):
     passed = 0
     failed = 0
     missing = 0
+    write_errors = 0
+    # Supply accounting (2026-07-16): `_commit_prospect` returns True for a
+    # record that was ALREADY in the pipeline (the re-stamp guard correctly
+    # skips the write), so "Passed: N (committed)" said nothing about net-new
+    # supply — a finalize run can print "309 committed" while the pipeline
+    # list grows by ~20. Thread the summary dict it already supports and
+    # split the counts per scoring lane so search exhaustion is visible in
+    # the run output itself.
+    summary: dict = {"net_new_created": 0, "restamped_existing": 0}
+    lane_stats: dict[str, dict[str, int]] = {}
 
     with _crm_provider() as crm:
         # PR-207: pre-fetch the pipeline list once so the truth-based
@@ -2043,6 +2053,12 @@ def weekly_finalize_cmd(batch: str, dry_run: bool):
                 "llm_rationale": rationale,
                 "icp_lane": verdict.get("icp_lane"),
             }
+            # Per-lane net-new accounting via before/after diff:
+            # _commit_prospect bumps exactly one summary counter per
+            # successful call (and none on a False return), so the delta
+            # attributes this entry to its lane without widening
+            # _commit_prospect's contract.
+            net_new_before = summary["net_new_created"]
             ok = _commit_prospect(
                 crm,
                 entry["prospect_data"],
@@ -2052,19 +2068,61 @@ def weekly_finalize_cmd(batch: str, dry_run: bool):
                 today,
                 anthropic_client=anthropic_client,
                 existing_entries=existing_entries,
+                summary=summary,
             )
             if ok:
                 passed += 1
-                click.echo(f"      → [AGENT PASS] {name} committed (icp_lane={verdict.get('icp_lane')})")
+                lane = entry.get("scoring_lane") or "unknown"
+                bucket = lane_stats.setdefault(
+                    lane, {"net_new": 0, "already_listed": 0}
+                )
+                if summary["net_new_created"] > net_new_before:
+                    bucket["net_new"] += 1
+                    click.echo(
+                        f"      → [AGENT PASS] {name} committed NET-NEW "
+                        f"(icp_lane={verdict.get('icp_lane')})"
+                    )
+                else:
+                    bucket["already_listed"] += 1
+                    click.echo(
+                        f"      → [AGENT PASS] {name} already in pipeline — "
+                        f"skipped (re-stamp guard, cadence preserved)"
+                    )
             else:
+                write_errors += 1
                 click.echo(f"      → [WRITE ERROR] {name} — failed to commit to Attio")
 
     click.echo("\n--- Weekly Finalize Summary ---")
     click.echo(f"Staged:    {len(staged)}")
     click.echo(f"Verdicts:  {len(verdicts_raw)}")
-    click.echo(f"Passed:    {passed}  (committed to Attio)")
+    click.echo(f"Passed:    {passed}  (agent-approved)")
+    if not dry_run:
+        net_new = summary["net_new_created"]
+        restamped = summary["restamped_existing"]
+        click.echo(f"  ├ net-new pipeline entries:                 {net_new}")
+        click.echo(f"  ├ already in pipeline (skipped, no write):  {restamped}")
+        click.echo(f"  └ write errors:                             {write_errors}")
+        for lane in sorted(lane_stats):
+            stats = lane_stats[lane]
+            click.echo(
+                f"     {lane}: {stats['net_new']} net-new / "
+                f"{stats['already_listed']} already-listed"
+            )
     click.echo(f"Failed:    {failed}  (rejected by agent)")
     click.echo(f"Missing:   {missing}  (staged but no verdict — skipped)")
+    # Recycling alarm (mirrors the bulk weekly's zero-net-new warning in
+    # workflows/weekly_prospect.py — see the run-summary supply block): when
+    # the majority of agent passes were already in the pipeline, the saved
+    # searches are re-serving the same population. Relative threshold, not a
+    # flat floor, so a small-but-fresh batch doesn't false-alarm.
+    if not dry_run and passed > 0 and summary["net_new_created"] * 2 < passed:
+        click.echo(
+            f"\n⚠️  SUPPLY WARNING: only {summary['net_new_created']} of "
+            f"{passed} agent-passed prospects were NET-NEW pipeline entries. "
+            "The saved searches are recycling people already in the "
+            "pipeline — refresh or expand the saved searches before the "
+            "next weekly run."
+        )
 
 
 @cli.command(name="weekly-brain")
