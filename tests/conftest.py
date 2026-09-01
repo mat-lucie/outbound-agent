@@ -358,3 +358,30 @@ def _isolate_weekly_kpi_reports(monkeypatch, tmp_path):
     kpi_dir = tmp_path / "weekly-kpi"
     monkeypatch.setattr(weekly_report, "REPORTS_DIR", kpi_dir)
     return kpi_dir
+
+
+def transient_attio_500():
+    """Build the transient Attio 500 used by retry-path tests.
+
+    Shared by test_escalation.py-style suites and
+    test_finalize_idempotency.py so the error shape can't drift per file
+    when the retry contract changes.
+    """
+    import httpx
+
+    request = httpx.Request("POST", "https://api.attio.com/v2/x")
+    response = httpx.Response(500, request=request)
+    return httpx.HTTPStatusError("500", request=request, response=response)
+
+
+@pytest.fixture
+def no_retry_sleep(monkeypatch):
+    """Neutralize request_with_retry's jittered backoff sleeps.
+
+    Opt-in (not autouse): only retry-path suites need it, and
+    test_attio_client.py::TestRequestWithRetry keeps its own
+    mock-returning patch for wait assertions.
+    """
+    import clients.attio as attio_mod
+
+    monkeypatch.setattr(attio_mod.time, "sleep", lambda _s: None)
