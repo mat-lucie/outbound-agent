@@ -27,6 +27,15 @@ For each dmN_sent_at that is NULL on a winner row, attempt in order:
      timestamp for the HIGHEST dm step reached. Earlier steps get None unless
      PB/notes supplied them. Confidence: LOW.
 
+     KNOWN LIMITATION (2026-07-15): this source keys off the row's CURRENT
+     stage/step, so rows that left the DM{N} Sent stages — responders,
+     Not Interested, Unreachable — receive nothing. A wet run resting on
+     this source alone inflates per-step denominators while structurally
+     censoring successes; main() refuses --apply without PB history unless
+     --accept-responder-censoring is passed. (Its dm_step branch also
+     predates the slug→number migration and never matches — rows resolve
+     via the stage-title fallback only.)
+
 If all three sources fail for a given dmN, the field stays NULL. This is
 NOT a bug — NULL is the correct output per §0 #9: "No silent fallbacks."
 
@@ -607,6 +616,15 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("ATTIO_LIST_ID", ""),
         help="LinkedIn Outreach list id (default: ATTIO_LIST_ID env).",
     )
+    parser.add_argument(
+        "--accept-responder-censoring",
+        action="store_true",
+        help=(
+            "Allow --apply when PB history is absent and inference would "
+            "rest on the last_contact_date source alone. DANGEROUS: read "
+            "the guard message below before passing this."
+        ),
+    )
     args = parser.parse_args(argv)
 
     # Default to dry-run if neither flag is set.
@@ -618,6 +636,38 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    # 2026-07-15 guard (measurement-integrity): a wet run whose ONLY live
+    # source is last_contact_date is statistically unsound. That source
+    # stamps the step implied by the row's CURRENT stage/step, so rows that
+    # left the DM{N} Sent stages — responders above all — receive nothing,
+    # while pass-through non-responders inflate denominators. Simulated on
+    # a historical cohort (252 DM'd, 47 responders): every responder got
+    # zero stamps → per-step rates of 0/20, 0/60, 2/118, all clearing
+    # SMALL_N_THRESHOLD — enough for a wet `learn` to strike a terminal
+    # verdict on structurally censored data. (The Attio-notes source is
+    # also dead in practice: no writer has ever created "DM N sent" notes.)
+    # PB history is the only source that records sends independently of
+    # current row state, so wet runs are gated on it PARSING non-empty —
+    # _load_pb_history() rather than a file-presence glob, so a directory
+    # holding only malformed/empty jsonl (the MED-5 schema-drift case) is
+    # refused too. A parseable-but-non-covering history still passes; the
+    # per-row confidence counters in the summary are the operator's signal
+    # for that residual case.
+    if not dry_run and not args.accept_responder_censoring:
+        if not _load_pb_history():
+            print(
+                "error: --apply refused — no usable PB history at "
+                f"{PB_HISTORY_DIR} and the remaining sources cannot stamp "
+                "responders (their stage is no longer DM{N} Sent), so this "
+                "run would inflate per-step denominators while structurally "
+                "censoring successes. learn.py could then strike a terminal "
+                "verdict on fabricated zeros. If you have verified the "
+                "cohort has no unstamped responders (or accept losing "
+                "them), re-run with --accept-responder-censoring.",
+                file=sys.stderr,
+            )
+            return 2
 
     try:
         attio = AttioClient()

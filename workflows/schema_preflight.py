@@ -20,10 +20,23 @@ if TYPE_CHECKING:
     from workflows.audit import AuditLogger
 
 # Attrs written by the DM path. Entry set must mirror
-# the attrs_to_update literal in run_dm_sequencing; company set must
-# mirror _write_company_throttle_tally (§3.15 registry, PR-13).
+# _confirmed_dm_advance_attrs' output (the single construction site for
+# DM-advance entry writes); company set must mirror
+# _write_company_throttle_tally (§3.15 registry, PR-13).
+# 2026-06-10: dm{N}_sent_at added — the live send path now stamps the
+# per-step send timestamp (learn.py excludes NULL-sent_at rows from
+# per-step denominators, so an undeployed timestamp attr would silently
+# starve experiment measurement on top of the week_starting desync class).
 DM_ENTRY_WRITER_ATTRS = frozenset(
-    {"dm_step", "stage", "last_contact_date", "next_eligible_send_date"}
+    {
+        "dm_step",
+        "stage",
+        "last_contact_date",
+        "next_eligible_send_date",
+        "dm1_sent_at",
+        "dm2_sent_at",
+        "dm3_sent_at",
+    }
 )
 DM_COMPANY_WRITER_ATTRS = frozenset(
     {

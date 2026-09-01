@@ -684,6 +684,10 @@ def evaluate_experiments(
       - rejected_defensive: defensive_rate > 2× BASELINE_DEFENSIVE_RATE
         (overrides every other verdict — a reactance-triggering variant
         is killed even if its raw response rate would look like a win)
+      - insufficient_data: step-routed experiment whose routed step has
+        n_observed < SMALL_N_THRESHOLD — NON-terminal; the experiment stays
+        running and is re-measured next cycle (2026-06-10 measurement-
+        starvation guard; see the verdict block comment)
       - won: posterior 95% CI lower bound > step_baseline_rate (pure superiority)
       - lost: posterior 95% CI upper bound < step_baseline_rate
       - inconclusive: CI straddles the baseline
@@ -750,6 +754,7 @@ def evaluate_experiments(
         # the verdict block below can compare them against the baseline.
         verdict_ci_low: float | None = None
         verdict_ci_high: float | None = None
+        step_n_observed: int | None = None
         if step is not None:
             rate_metric = f"{step}_response_rate"
             # Prefer the posterior mean from dm{N}_posterior when available;
@@ -759,6 +764,7 @@ def evaluate_experiments(
                 verdict_rate = cohort[posterior_key]["mean"]
                 verdict_ci_low = cohort[posterior_key].get("ci_low_95")
                 verdict_ci_high = cohort[posterior_key].get("ci_high_95")
+                step_n_observed = cohort[posterior_key].get("n_observed")
             else:
                 # silent-failure HIGH-4: don't default-to-0.0. A missing
                 # rate metric is a data gap, not a "lost" verdict. Surface
@@ -773,6 +779,7 @@ def evaluate_experiments(
                         file=sys.stderr,
                     )
                     continue
+                step_n_observed = cohort.get(f"{step}_received")
             verdict_baseline = get_baseline_step_rate(step, experiments_path)
         else:
             rate_metric = "dm_response_rate"
@@ -810,6 +817,42 @@ def evaluate_experiments(
         mean_verdict = _mean_based_verdict(verdict_rate, verdict_baseline)
         if defensive_rate > BASELINE_DEFENSIVE_RATE * 2:
             verdict = "rejected_defensive"
+        elif step is not None and (
+            step_n_observed is None or step_n_observed < SMALL_N_THRESHOLD
+        ):
+            # Measurement-starvation guard (2026-06-10 fix): when the ROUTED
+            # step's denominator is below SMALL_N_THRESHOLD, the posterior is
+            # the prior wearing a verdict costume — striking a TERMINAL
+            # verdict (apply_verdict never re-measures) from it would encode
+            # zero observations as a permanent experiment outcome. This is
+            # exactly what happened when dm{N}_sent_at was never stamped on
+            # live sends: every step denominator read 0 and a wet run would
+            # have struck REJECTED_NULL on prior-only numbers.
+            # "insufficient_data" is NON-terminal: to_experiment_verdict maps
+            # it to None, the wet path skips apply_verdict, the experiment
+            # stays running and is re-measured next learn run. A None
+            # step_n_observed (cohort carries neither posterior n_observed nor
+            # dm{N}_received) is treated the same way — unknown n must never
+            # license a terminal verdict. The defensive veto above fires
+            # first: it is computed from cohort-level classifications, not
+            # from sent_at-gated step denominators, so a reactance-triggering
+            # variant is still killed.
+            verdict = "insufficient_data"
+            print(
+                f"WARNING: insufficient per-step data for "
+                f"experiment_id={exp_id!r}: routed step {step!r} has "
+                f"n_observed={step_n_observed} (threshold "
+                f"{SMALL_N_THRESHOLD}). No terminal verdict will be struck. "
+                f"If the cohort HAS been DM'd, check {step}_sent_at "
+                "population (PR-9b NULL gate excludes unstamped rows); the "
+                "consistency sweep NULL-fills converged steps on the next "
+                "daily run. Do NOT reach for "
+                "scripts/backfill_per_step_timestamps.py: its "
+                "last_contact_date source cannot stamp responders (their "
+                "stage is no longer DM{N} Sent), so it inflates "
+                "denominators while structurally censoring successes.",
+                file=sys.stderr,
+            )
         elif verdict_ci_low is not None and verdict_ci_high is not None:
             # CI-based rule (pure superiority against the baseline).
             if verdict_ci_low > verdict_baseline:
@@ -932,10 +975,12 @@ def to_experiment_verdict(eval_verdict: str) -> ExperimentVerdict | None:
     """Convert ``evaluate_experiments`` lowercase verdict string to the
     typed ``ExperimentVerdict`` literal accepted by ``apply_verdict``.
 
-    Returns ``None`` for verdicts that are not terminal (currently only
-    "inconclusive" is renamed; other emitted values map directly).
-    Callers MUST handle ``None`` — silent skip is correct for unrecognized
-    states (§0 #9: missing data → None, not a default-value fabrication).
+    Returns ``None`` for non-terminal verdicts — notably
+    "insufficient_data" (the 2026-06-10 measurement-starvation guard),
+    which must NOT be persisted: the experiment stays running and is
+    re-measured next cycle. Callers MUST handle ``None`` — silent skip is
+    correct for unrecognized states (§0 #9: missing data → None, not a
+    default-value fabrication).
     """
     return _EVAL_VERDICT_TO_EXPERIMENT_VERDICT.get(eval_verdict)
 
@@ -1018,6 +1063,19 @@ def apply_verdict(
 
     Raises:
         ExperimentNotFoundError: no ``experiments.tsv`` row matches the id.
+
+    Measurement-starvation contract (2026-06-10): the authoritative gate
+    against persisting a terminal verdict on prior-only data is
+    ``evaluate_experiments`` — a step-routed cohort whose routed step has
+    n_observed < SMALL_N_THRESHOLD yields the NON-terminal
+    "insufficient_data" verdict, which ``to_experiment_verdict`` maps to
+    None so this function is never reached. ``apply_verdict`` itself does
+    NOT re-check starvation (a refusal here keyed on the all-step
+    prior_dominated flag would block legitimate verdicts whose routed step
+    is healthy, and could pin a live REJECTED_DEFENSIVE variant at
+    running). Any caller striking a terminal verdict manually — outside
+    ``cli.py learn`` — must verify the routed step's n_observed themselves
+    before calling.
     """
     del writer  # no longer used — status write goes to experiments.tsv
 

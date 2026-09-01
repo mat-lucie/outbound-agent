@@ -438,6 +438,57 @@ def _build_specs(list_id: str) -> list[tuple[str, str, dict]]:
                 "description": "ISO country code of the company HQ. Seeds the DM language (PR-240 fail-closed language guard re-derives expected language from it).",
             },
         ),
+        # PR-246 per-step attribution: the DM writer schema preflight
+        # (workflows.schema_preflight.DM_ENTRY_WRITER_ATTRS) is fail-closed on
+        # these three timestamps -- a wet `daily` / `send-dms` hard-aborts when
+        # the list lacks them. Provisioned in core so a fresh install passes
+        # the preflight without the standalone migrate_dmN_sent_at_schema.py
+        # script (kept for existing installs; both paths are idempotent).
+        (
+            "list",
+            list_id,
+            {
+                "title": "DM1 Sent At",
+                "api_slug": "dm1_sent_at",
+                "type": "datetime",
+                "is_required": False,
+                "is_unique": False,
+                "is_multiselect": False,
+                "default_value": None,
+                "config": {},
+                "description": "Timestamp of DM 1 send. Written by run_dm_sequencing at send time. NULL = not yet sent or send-time unknown.",
+            },
+        ),
+        (
+            "list",
+            list_id,
+            {
+                "title": "DM2 Sent At",
+                "api_slug": "dm2_sent_at",
+                "type": "datetime",
+                "is_required": False,
+                "is_unique": False,
+                "is_multiselect": False,
+                "default_value": None,
+                "config": {},
+                "description": "Timestamp of DM 2 send. See dm1_sent_at note.",
+            },
+        ),
+        (
+            "list",
+            list_id,
+            {
+                "title": "DM3 Sent At",
+                "api_slug": "dm3_sent_at",
+                "type": "datetime",
+                "is_required": False,
+                "is_unique": False,
+                "is_multiselect": False,
+                "default_value": None,
+                "config": {},
+                "description": "Timestamp of DM 3 send. See dm1_sent_at note.",
+            },
+        ),
     ]
 
 

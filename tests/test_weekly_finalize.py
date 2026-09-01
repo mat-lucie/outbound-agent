@@ -153,3 +153,137 @@ class TestWeeklyFinalize:
         assert result.exit_code == 0
         assert "Missing:   1" in result.output
         assert "Passed:    0" in result.output
+
+
+class TestWeeklyFinalizeNetNewAccounting:
+    """Net-new vs already-listed split in the finalize summary (PR-248).
+
+    `_commit_prospect` returns True for re-stamp-guard skips, so
+    "Passed: N (committed)" said nothing about net-new supply — a run can
+    print "309 committed" while the pipeline list grows by ~20. These tests
+    pin the summary split, the per-lane breakdown, and the recycling warning.
+    """
+
+    BATCH = "2026-04-19"
+
+    def _invoke_with_listed(
+        self,
+        tmp_path: Path,
+        staged: list[dict],
+        verdicts: list[dict],
+        listed_record_ids: set[str] | None = None,
+    ) -> tuple:
+        """Like _invoke_finalize, but per-URL record ids and a configurable
+        set of record ids the re-stamp guard reports as already in the list."""
+        import shutil
+
+        borderline_src = tmp_path / f"weekly_borderline_{self.BATCH}.jsonl"
+        verdicts_src = tmp_path / f"weekly_verdicts_{self.BATCH}.jsonl"
+        _write_jsonl(borderline_src, staged)
+        _write_jsonl(verdicts_src, verdicts)
+
+        listed = listed_record_ids or set()
+
+        runner = CliRunner()
+        mock_attio = MagicMock()
+        mock_attio.__enter__ = MagicMock(return_value=mock_attio)
+        mock_attio.__exit__ = MagicMock(return_value=False)
+        # Record id derived from the linkedin slug so each staged entry is
+        # distinguishable to the guard.
+        mock_attio.upsert_person.side_effect = lambda matching_attribute, attributes: {
+            "id": {"record_id": "rec-" + attributes["linkedin"].rsplit("/", 1)[-1]}
+        }
+        # The CLI pre-fetches this once and hands it to _commit_prospect as
+        # `existing_entries`; the fork's guard matches on Entry.record_id, so
+        # raw entries with a parent_record_id are all the normalizer needs.
+        mock_attio.query_list_entries.return_value = [
+            {
+                "id": {"entry_id": f"ent-{rid}"},
+                "parent_record_id": rid,
+                "entry_values": {},
+            }
+            for rid in sorted(listed)
+        ]
+
+        with (
+            patch("clients.attio.AttioClient", return_value=mock_attio),
+            patch("workflows.weekly_prospect.match_or_create_company", return_value="co-123"),
+            patch("workflows.weekly_prospect.extract_real_domain", return_value="bigmfg.com"),
+            runner.isolated_filesystem(),
+        ):
+            Path("exports").mkdir(exist_ok=True)
+            shutil.copy(str(borderline_src), f"exports/weekly_borderline_{self.BATCH}.jsonl")
+            shutil.copy(str(verdicts_src), f"exports/weekly_verdicts_{self.BATCH}.jsonl")
+            result = runner.invoke(
+                cli,
+                ["weekly-finalize", "--batch", self.BATCH],
+                catch_exceptions=False,
+                env={"ATTIO_LIST_ID": "list-123"},
+            )
+
+        return result, mock_attio
+
+    def test_already_listed_counts_as_restamped_not_net_new(self, tmp_path):
+        """One net-new + one already-listed → summary splits them; only the
+        net-new prospect gets a list entry."""
+        url_new = "https://www.linkedin.com/in/user-new"
+        url_listed = "https://www.linkedin.com/in/user-listed"
+        staged = [_make_staged_entry(url_new), _make_staged_entry(url_listed)]
+        verdicts = [_pass_verdict(url_new), _pass_verdict(url_listed)]
+
+        result, mock_attio = self._invoke_with_listed(
+            tmp_path, staged, verdicts, listed_record_ids={"rec-user-listed"}
+        )
+
+        assert result.exit_code == 0
+        assert "Passed:    2" in result.output
+        assert "net-new pipeline entries:                 1" in result.output
+        assert "already in pipeline (skipped, no write):  1" in result.output
+        # The already-listed prospect must not be re-stamped.
+        assert mock_attio.add_list_entry.call_count == 1
+
+    def test_per_lane_net_new_split(self, tmp_path):
+        """Lanes are tallied separately: one lane net-new, the other already
+        listed."""
+        url_a = "https://www.linkedin.com/in/user-a"
+        url_b = "https://www.linkedin.com/in/user-b"
+        entry_a = _make_staged_entry(url_a)
+        entry_a["scoring_lane"] = "target_company_mode"
+        entry_b = _make_staged_entry(url_b)
+        entry_b["scoring_lane"] = "enterprise_mode"
+
+        result, _ = self._invoke_with_listed(
+            tmp_path,
+            [entry_a, entry_b],
+            [_pass_verdict(url_a), _pass_verdict(url_b)],
+            listed_record_ids={"rec-user-b"},
+        )
+
+        assert result.exit_code == 0
+        assert "target_company_mode: 1 net-new / 0 already-listed" in result.output
+        assert "enterprise_mode: 0 net-new / 1 already-listed" in result.output
+
+    def test_supply_warning_fires_when_majority_already_listed(self, tmp_path):
+        """2 of 3 passes already listed → recycling warning printed."""
+        urls = [f"https://www.linkedin.com/in/user-{i}" for i in range(3)]
+        staged = [_make_staged_entry(u) for u in urls]
+        verdicts = [_pass_verdict(u) for u in urls]
+
+        result, _ = self._invoke_with_listed(
+            tmp_path, staged, verdicts,
+            listed_record_ids={"rec-user-1", "rec-user-2"},
+        )
+
+        assert result.exit_code == 0
+        assert "SUPPLY WARNING" in result.output
+
+    def test_no_supply_warning_when_mostly_net_new(self, tmp_path):
+        """All passes net-new → no recycling warning."""
+        urls = [f"https://www.linkedin.com/in/user-{i}" for i in range(3)]
+        staged = [_make_staged_entry(u) for u in urls]
+        verdicts = [_pass_verdict(u) for u in urls]
+
+        result, _ = self._invoke_with_listed(tmp_path, staged, verdicts)
+
+        assert result.exit_code == 0
+        assert "SUPPLY WARNING" not in result.output
