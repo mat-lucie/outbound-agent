@@ -61,6 +61,19 @@ os.environ["OUTBOUND_CONTENT_DIR"] = str(
 # their own scope, which monkeypatch restores afterward.
 os.environ["OUTBOUND_CONFIG_DIR"] = str(_REPO_ROOT / "examples" / "acme" / "config")
 
+# Refresh the mtimes of the bundled Acme target-company lists so the weekly
+# freshness gate (models/freshness.py, mtime-based, STALE at 60d) never trips
+# inside the suite. These are checked-in example fixtures: their CONTENT is
+# stable but their file mtime ages with the checkout, so integration tests that
+# drive the real `run_weekly_prospecting` path started failing ~60 days after
+# the files were last touched (a date-bomb, not a product defect). Touching
+# mtime only — git does not track it, and the gate's PRODUCTION behavior is
+# covered by dedicated freshness tests that construct their own aged files.
+for _target_list in (
+    _REPO_ROOT / "examples" / "acme" / "content"
+).glob("*-targets.json"):
+    os.utime(_target_list, None)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_run_provenance(monkeypatch):
