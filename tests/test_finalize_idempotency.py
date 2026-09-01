@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests.conftest import transient_attio_500
 from workflows.auto_finalize import (
     DEFAULT_EXPIRE,
     FinalizeRunFailed,
@@ -334,6 +335,96 @@ class TestResponseShape:
                 batch_date=date(2026, 5, 22),
                 finalize_fn=_noop_finalize,
             )
+
+
+class TestTransient500Retry:
+    """The two operator_review_queue reads survive transient Attio 5xx.
+
+    Same crash class upstream saw kill daily runs and a weekly finalize:
+    a single transient 500 on a queue query killed the run. Both
+    ``_find_operator_decision_run_id`` and ``_existing_finalize_row``
+    now flow through ``clients.attio.request_with_retry``.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self, no_retry_sleep):
+        pass
+
+    def test_survives_transient_500_on_decision_lookup(self, mock_attio):
+        real_request = mock_attio._request.side_effect
+        failures = [transient_attio_500()]
+
+        def _flaky(method, path, json=None, **kwargs):
+            if failures:
+                raise failures.pop(0)
+            return real_request(method, path, json=json, **kwargs)
+
+        mock_attio._request.side_effect = _flaky
+        out = auto_finalize_borderline_batch(
+            mock_attio,
+            batch_date=date(2026, 5, 22),
+            finalize_fn=_noop_finalize,
+        )
+        assert out["action"] == "finalized"
+
+    def test_survives_transient_500_on_existing_row_check(self, mock_attio):
+        real_request = mock_attio._request.side_effect
+        # Fail the SECOND query (the _existing_finalize_row check);
+        # the first (decision lookup) succeeds.
+        state = {"queries": 0}
+
+        def _flaky(method, path, json=None, **kwargs):
+            if path.endswith("/records/query"):
+                state["queries"] += 1
+                if state["queries"] == 2:
+                    raise transient_attio_500()
+            return real_request(method, path, json=json, **kwargs)
+
+        mock_attio._request.side_effect = _flaky
+        out = auto_finalize_borderline_batch(
+            mock_attio,
+            batch_date=date(2026, 5, 22),
+            finalize_fn=_noop_finalize,
+        )
+        assert out["action"] == "finalized"
+
+    def test_persistent_500_raises_after_bounded_attempts(self, mock_attio):
+        import httpx
+
+        calls = {"n": 0}
+
+        def _always_500(method, path, json=None, **kwargs):
+            calls["n"] += 1
+            raise transient_attio_500()
+
+        mock_attio._request.side_effect = _always_500
+        with pytest.raises(httpx.HTTPStatusError):
+            auto_finalize_borderline_batch(
+                mock_attio,
+                batch_date=date(2026, 5, 22),
+                finalize_fn=_noop_finalize,
+            )
+        assert calls["n"] == 5  # bounded — not infinite
+
+    def test_400_raises_immediately_without_retry(self, mock_attio):
+        import httpx
+
+        calls = {"n": 0}
+
+        def _always_400(method, path, json=None, **kwargs):
+            calls["n"] += 1
+            request = httpx.Request("POST", "https://api.attio.com/v2/x")
+            response = httpx.Response(400, request=request)
+            raise httpx.HTTPStatusError("400", request=request, response=response)
+
+        mock_attio._request.side_effect = _always_400
+        with pytest.raises(httpx.HTTPStatusError):
+            auto_finalize_borderline_batch(
+                mock_attio,
+                batch_date=date(2026, 5, 22),
+                finalize_fn=_noop_finalize,
+            )
+        assert calls["n"] == 1
 
 
 class TestNonDictResultRaises:

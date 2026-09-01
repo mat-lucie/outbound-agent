@@ -163,6 +163,27 @@ Requires Gmail email-response detection (above) for the conversation-ledger
 side; without it the radar still runs on CRM-resident signals and simply skips
 the email sweep.
 
+### (Optional) Migration provenance back-pointers
+
+**Off by default.** Only needed if you run the `scripts/migrate_*` or
+`scripts/backfill_*` scripts. Each of those opens a `MigrationRunWriter`, which
+stamps `last_migrated_by` on every record it modifies so you can trace a mutated
+row back to the run that touched it. Without the attribute the stamp PATCH is
+rejected: the migration itself still succeeds and exits 0, but every run prints
+a back-pointer WARNING — a warning that always fires is a warning operators stop
+reading, including the times it means a real forensics gap.
+
+On the bundled Attio adapter, run `python3 scripts/setup_attio_schema.py
+--feature provenance` (idempotent, safe to re-run; `--dry-run` previews). On a
+bring-your-own CRM, add the equivalent attributes by hand. Sole writer:
+`workflows.migration_run_writer.MigrationRunWriter`. Forward-only — records
+modified before you provision this stay un-stamped.
+
+| Object | Attribute | Type | Purpose |
+|--------|-----------|------|---------|
+| people | `last_migrated_by` | record reference → `migration_run` | Migration Run that last modified this person. |
+| companies | `last_migrated_by` | record reference → `migration_run` | Migration Run that last modified this company. |
+
 ---
 
 ## 3. Create the PhantomBuster phantoms

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
+from clients.attio import request_with_retry
 from workflows.escalation import escalate
 
 if TYPE_CHECKING:
@@ -100,7 +101,8 @@ def _find_operator_decision_run_id(
         },
         "limit": 1,
     }
-    data = attio._request(
+    data = request_with_retry(
+        attio,
         "POST",
         f"/objects/{OPERATOR_REVIEW_QUEUE_SLUG}/records/query",
         json=body,
@@ -228,7 +230,8 @@ def _existing_finalize_row(attio: AttioClient, key: str) -> dict | None:
         },
         "limit": 1,
     }
-    data = attio._request(
+    data = request_with_retry(
+        attio,
         "POST",
         f"/objects/{OPERATOR_REVIEW_QUEUE_SLUG}/records/query",
         json=body,

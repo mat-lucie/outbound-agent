@@ -12,7 +12,7 @@ F-PR-4 ships:
 
   * A typed exception hierarchy (`AttioError` and 7 subclasses)
   * Retry policy: 5 attempts, full jitter, retry on
-    429/502/503/504/timeout, overall deadline 300s
+    429/500/502/503/504/timeout, overall deadline 300s
   * DLQ: `~/.outbound-agent/dlq/attio-{date}.jsonl` + a typed
     `attio_write_failed` queue row via `escalate()`
   * Stage rank-monotonicity check via F-PR-1's `STAGE_RANK`
@@ -136,7 +136,16 @@ if TYPE_CHECKING:
     from clients.attio import AttioClient
 
 DLQ_DIR = Path.home() / ".outbound-agent" / "dlq"
-RETRY_STATUS_CODES = frozenset({429, 502, 503, 504})
+# 500 is in the retryable set: Attio 500s are transient in practice
+# (weekly-finalize crash loop; repeated daily-run crashes on escalation
+# writes) and every AttioWriter write is a same-values PATCH — idempotent,
+# so retrying is safe. 501/505 etc. stay permanent: they signal a contract
+# error, not a blip. Same rationale as the opt-in retry_500 in
+# clients.attio._request — but note only update_person opts in there, so on
+# the people dispatch path a 500 retries at BOTH layers (see the
+# retry-stacking note in _single_patch); companies and list entries retry
+# 500 in this outer loop only.
+RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 RETRY_BUDGET_SECONDS = 300
 MAX_ATTEMPTS = 5
 
@@ -151,7 +160,7 @@ class AttioError(Exception):
 
 
 class AttioTransientError(AttioError):
-    """Retryable Attio failure — 429/502/503/504/timeout."""
+    """Retryable Attio failure — 429/500/502/503/504/timeout."""
 
 
 class AttioRateLimitExhausted(AttioTransientError):
@@ -159,7 +168,8 @@ class AttioRateLimitExhausted(AttioTransientError):
 
 
 class AttioPermanentError(AttioError):
-    """Non-retryable Attio failure — 4xx other than 429."""
+    """Non-retryable Attio failure — 4xx other than 429, plus
+    non-transient 5xx (501, 505, ...)."""
 
 
 class AttioWriteFailed(AttioError):
@@ -433,7 +443,7 @@ class AttioWriter:
                     # Transient — sleep with full jitter and retry.
                     self._sleep_with_jitter(attempt)
                     continue
-                # Permanent 4xx — try compensating rollback if multi-attr.
+                # Permanent (4xx other than 429, or non-transient 5xx).
                 self._dlq_and_escalate(intent, f"permanent_http_{code}", exc)
                 raise AttioPermanentError(
                     f"non-retryable {code} on {intent.object}.{intent.record_id}: "
@@ -471,7 +481,10 @@ class AttioWriter:
 
         Retry-stacking trade-off (engineer-QA-build4 #1, revisited):
         AttioClient._request has its own 3-attempt retry loop with
-        5/10/20s backoff for (429, 502, 503). AttioWriter's
+        5/10/20s backoff for (429, 502, 503) — plus 500 on call sites
+        that pass retry_500=True (update_person does; update_company
+        and update_list_entry don't, so their 500s retry only in this
+        outer loop). AttioWriter's
         ``_patch_with_retry`` adds 5 outer attempts capped by
         ``RETRY_BUDGET_SECONDS=300``. The pre-Wave-2-B raw-PATCH path
         avoided this stacking; the Wave-2-B helper-dispatch path
@@ -517,6 +530,15 @@ class AttioWriter:
                 f"no typed write available for {intent.object!r}: the "
                 f"configured CRMProvider exposes no inner AttioClient."
             )
+
+        # None in updates means "unset" at the intent level, but Attio v2
+        # rejects a literal JSON null in values/entry_values with a 400
+        # validation error — its unset shape is an empty array. Translate
+        # here, once, so every dispatch path below gets the same wire form.
+        # intent.updates keeps the semantic None for the DLQ / queue-row
+        # forensic records.
+        values = {k: ([] if v is None else v) for k, v in intent.updates.items()}
+
         if intent.is_list_entry:
             if not intent.list_id:
                 raise AttioWriteFailed(
@@ -524,13 +546,13 @@ class AttioWriter:
                 )
             return self._crm.update_list_entry(
                 entry_id=intent.record_id,
-                entry_attributes=intent.updates,
+                entry_attributes=values,
                 list_id=intent.list_id,
             )
         if intent.object == "companies":
-            return self._crm.update_company(intent.record_id, intent.updates)
+            return self._crm.update_company(intent.record_id, values)
         if intent.object == "people":
-            return self._crm.update_person(intent.record_id, intent.updates)
+            return self._crm.update_person(intent.record_id, values)
 
         # Fallback for object types without a dedicated update helper
         # (daily_run, weekly_kpi_snapshot, weekly_strategy_brief,
@@ -550,7 +572,7 @@ class AttioWriter:
         # AttioClient handle comes from the AttioProvider this writer composes
         # (non-None is already guaranteed by the guard above).
         path = f"/objects/{intent.object}/records/{intent.record_id}"
-        body = {"data": {"values": intent.updates}}
+        body = {"data": {"values": values}}
         resp = self._attio_client._client.request("PATCH", path, json=body)
         resp.raise_for_status()
         data = resp.json() if resp.content else {}

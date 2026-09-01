@@ -292,6 +292,66 @@ class TestRetryAndDlq:
         line = json.loads(dlq_files[0].read_text().strip())
         assert line["kind"] == "max_attempts"
 
+    def test_transient_500_retried_then_succeeds(self, mock_attio, dlq_tmp, monkeypatch):
+        """Attio 500s are transient in practice (weekly-finalize crash loop;
+        repeated daily-run escalation-write crashes). AttioWriter PATCHes are
+        same-values idempotent, so a 500 must be retried like 429/502/503/504
+        — not DLQ'd as permanent on the first attempt."""
+        mock_attio._client.request.side_effect = [
+            _error_response(500, "internal server error"),
+            _success_response(),
+        ]
+        monkeypatch.setattr(
+            "clients.attio_writer.AttioWriter._sleep_with_jitter",
+            lambda self, attempt: None,
+        )
+        writer = AttioWriter(attio=mock_attio)
+        result = writer.apply(_make_intent())
+        assert mock_attio._client.request.call_count == 2
+        assert "values" in result
+        # No DLQ entry — the write succeeded.
+        assert list(dlq_tmp.glob("attio-*.jsonl")) == []
+
+    def test_sustained_500_exhausts_as_transient_not_permanent(
+        self, mock_attio, dlq_tmp, monkeypatch
+    ):
+        """A sustained 500 outage exhausts the retry budget and lands in
+        the DLQ as max_attempts (transient class), NOT permanent_http_500."""
+        mock_attio._client.request.return_value = _error_response(500)
+        monkeypatch.setattr(
+            "clients.attio_writer.AttioWriter._sleep_with_jitter",
+            lambda self, attempt: None,
+        )
+        monkeypatch.setattr(
+            "workflows.escalation.escalate",
+            lambda **kw: {},
+        )
+        writer = AttioWriter(attio=mock_attio)
+        with pytest.raises(AttioRateLimitExhausted):
+            writer.apply(_make_intent())
+        assert mock_attio._client.request.call_count == MAX_ATTEMPTS
+        dlq_files = list(dlq_tmp.glob("attio-*.jsonl"))
+        assert len(dlq_files) == 1
+        line = json.loads(dlq_files[0].read_text().strip())
+        assert line["kind"] == "max_attempts"
+
+    def test_501_stays_permanent(self, mock_attio, dlq_tmp, monkeypatch):
+        """Only 500 joins the retryable set — 501 (Not Implemented) is a
+        genuine contract error, not a transient blip. Pin the boundary."""
+        mock_attio._client.request.return_value = _error_response(501)
+        monkeypatch.setattr(
+            "workflows.escalation.escalate",
+            lambda **kw: {},
+        )
+        writer = AttioWriter(attio=mock_attio)
+        with pytest.raises(AttioPermanentError):
+            writer.apply(_make_intent())
+        assert mock_attio._client.request.call_count == 1
+        dlq_files = list(dlq_tmp.glob("attio-*.jsonl"))
+        assert len(dlq_files) == 1
+        line = json.loads(dlq_files[0].read_text().strip())
+        assert line["kind"] == "permanent_http_501"
+
     def test_timeout_is_retryable(self, mock_attio, monkeypatch):
         # Timeout exceptions are RAISED by _client.request itself (not
         # via raise_for_status). Use side_effect for those.
@@ -419,3 +479,93 @@ class TestRetryStopsAtDeadline:
         writer = AttioWriter(attio=mock_attio)
         with pytest.raises(AttioRateLimitExhausted, match="deadline"):
             writer.apply(_make_intent())
+
+
+class TestNoneUnsetSerialization:
+    """None in ``WriteIntent.updates`` means "unset this attribute" — but
+    Attio v2 rejects a literal JSON ``null`` in ``values``/``entry_values``
+    with a 400 ``validation_errors: [{"code": "invalid", ...}]``; its
+    documented unset shape is an empty array ``[]``. The writer owns that
+    wire translation so every clear path (``clear_awaiting_reply``,
+    ``clear_verified_touch``, future ones) stays a plain ``None`` at the
+    intent level.
+
+    Regression for the upstream live failure: ``followup-await --clear``
+    400'd because the raw-PATCH path sent nulls verbatim.
+    """
+
+    def test_raw_patch_path_serializes_none_as_empty_array(self, mock_attio):
+        """Deals go through the raw httpx fallback — the exact live-bug path."""
+        writer = AttioWriter(attio=mock_attio)
+        writer.apply(WriteIntent(
+            object="deals",
+            record_id="deal_1",
+            updates={
+                "awaiting_reply_since": None,
+                "awaiting_reply_thread_id": None,
+                "awaiting_reply_nudge_count": None,
+            },
+            prior_values={},
+            writer_module="workflows.followup_state",
+        ))
+        body = mock_attio._client.request.call_args[1]["json"]["data"]["values"]
+        assert body == {
+            "awaiting_reply_since": [],
+            "awaiting_reply_thread_id": [],
+            "awaiting_reply_nudge_count": [],
+        }
+
+    def test_raw_patch_path_leaves_real_values_untouched(self, mock_attio):
+        """Mixed set+unset in one intent: only the Nones become []."""
+        writer = AttioWriter(attio=mock_attio)
+        writer.apply(WriteIntent(
+            object="deals",
+            record_id="deal_1",
+            updates={"last_verified_touch": None, "referred_by": "a@b.co"},
+            prior_values={},
+            writer_module="workflows.followup_state",
+        ))
+        body = mock_attio._client.request.call_args[1]["json"]["data"]["values"]
+        assert body == {"last_verified_touch": [], "referred_by": "a@b.co"}
+
+    def test_list_entry_path_serializes_none_as_empty_array(self, mock_attio):
+        writer = AttioWriter(attio=mock_attio)
+        writer.apply(WriteIntent(
+            object="linkedin_outreach",
+            record_id="entry_1",
+            updates={"awaiting_reply_since": None, "awaiting_reply_nudge_count": None},
+            prior_values={},
+            writer_module="workflows.followup_state",
+            is_list_entry=True,
+            list_id="list_xyz",
+        ))
+        kwargs = mock_attio.update_list_entry.call_args.kwargs
+        assert kwargs["entry_attributes"] == {
+            "awaiting_reply_since": [],
+            "awaiting_reply_nudge_count": [],
+        }
+
+    def test_clear_awaiting_reply_end_to_end_sends_empty_arrays(self, mock_attio):
+        """The actual failing call chain from ``followup-await --clear``:
+        followup_state.clear_awaiting_reply → AttioWriter → raw PATCH."""
+        from workflows import followup_state
+
+        writer = AttioWriter(attio=mock_attio)
+        followup_state.clear_awaiting_reply(writer, object="deals", record_id="deal_1")
+        body = mock_attio._client.request.call_args[1]["json"]["data"]["values"]
+        assert body == {
+            "awaiting_reply_since": [],
+            "awaiting_reply_thread_id": [],
+            "awaiting_reply_nudge_count": [],
+        }
+        assert "awaiting_reply_note_id" not in body  # canonical note survives
+
+    def test_clear_verified_touch_end_to_end_sends_empty_array(self, mock_attio):
+        """Same latent bug in the other clear path — fixed by the same
+        serialization boundary."""
+        from workflows import followup_state
+
+        writer = AttioWriter(attio=mock_attio)
+        followup_state.clear_verified_touch(writer, deal_id="deal_1")
+        body = mock_attio._client.request.call_args[1]["json"]["data"]["values"]
+        assert body == {"last_verified_touch": []}

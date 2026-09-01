@@ -727,6 +727,27 @@ attributes:
       remain un-stamped (the attribute did not exist when they ran); a
       re-stamp backfill is an optional follow-up, not done here.
 
+  # ---------- People: provenance pointer ----------
+  - object: people
+    slug: last_migrated_by
+    type: record_reference
+    options: null
+    pr_id: F-PR-3.7
+    status: shipped
+    write_owner_module: workflows.migration_run_writer.MigrationRunWriter
+    note: |
+      Points to a Migration Run row. Third mirror of
+      linkedin_outreach.last_migrated_by, after companies. Person-targeted
+      migrations (backfill_prospect_committed_at, backfill_per_step_timestamps)
+      call mark_modified(object="people"), but the attribute was missing on
+      people, so MigrationRunWriter._stamp_back_pointers was rejected for every
+      person-targeted modification and printed the back-pointer WARNING on 100%
+      of otherwise-successful runs. Provisioned idempotently via
+      scripts/setup_attio_schema.py --feature provenance.
+      Forensics caveat: person writes that predate the attribute remain
+      un-stamped; forward-only by decision, matching the call made for
+      companies.
+
   # ---------- Migration Run: cross-reference to Reclassification Run (PR-9b) ----------
   - object: migration_run
     slug: reclassification_run_id

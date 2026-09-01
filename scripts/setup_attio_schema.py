@@ -20,12 +20,22 @@ replied to an outreach email. Also DISABLED by default: the detector
 no-ops without a Gmail token, and these writes 400 until provisioned. See
 GETTING_STARTED.md → Email Response Detection.
 
+The optional Migration Provenance feature (``--feature provenance``)
+creates the ``last_migrated_by`` back-pointer on the record objects
+``MigrationRunWriter`` stamps (``people`` and ``companies``). Without it
+every ``mark_modified()`` on those objects fails its back-pointer PATCH
+and the run prints a back-pointer WARNING while still exiting 0 — alarm
+fatigue that trains operators to skim a warning that sometimes means a
+real forensics gap. Only needed if you run the ``migrate_``/``backfill_``
+scripts; a fresh install that never migrates can skip it.
+
 Usage:
   python3 scripts/setup_attio_schema.py --dry-run
   python3 scripts/setup_attio_schema.py
-  python3 scripts/setup_attio_schema.py --feature radar    # add radar attrs
-  python3 scripts/setup_attio_schema.py --feature phase06  # add email-detection attrs
-  python3 scripts/setup_attio_schema.py --feature all      # core + radar + phase06
+  python3 scripts/setup_attio_schema.py --feature radar       # add radar attrs
+  python3 scripts/setup_attio_schema.py --feature phase06     # add email-detection attrs
+  python3 scripts/setup_attio_schema.py --feature provenance  # add last_migrated_by
+  python3 scripts/setup_attio_schema.py --feature all         # all of the above
 """
 from __future__ import annotations
 
@@ -221,6 +231,65 @@ def _provision_phase06(client: AttioClient, dry_run: bool) -> None:
     )
     if failed:
         raise click.ClickException(f"{failed} Phase 0.6 item(s) failed to provision.")
+
+
+# ── Migration provenance back-pointer (§3.13) ──────────────────────────────
+# `MigrationRunWriter._stamp_back_pointers` PATCHes
+# `/objects/{object}/records/{record_id}` with `last_migrated_by` -> the
+# Migration Run row for every `mark_modified(object=...)` call that is not a
+# `schema` / `list_entry` sentinel. Only these two object-level targets are
+# reachable that way, so only they need the attribute. Sole writer:
+# workflows.migration_run_writer.MigrationRunWriter (registered in
+# clients/attio_writer_registry.py and docs/attio_schema_deltas.yaml).
+_PROVENANCE_OBJECTS: list[str] = ["people", "companies"]
+
+_PROVENANCE_SLUG = "last_migrated_by"
+_PROVENANCE_REFERENCED_OBJECT = "migration_run"
+_PROVENANCE_DESCRIPTION = (
+    "Provenance pointer to the Migration Run that last modified this record "
+    "(plan section 3.13). Written only by MigrationRunWriter."
+)
+
+
+def _provision_provenance(client: AttioClient, dry_run: bool) -> None:
+    """Idempotently create `last_migrated_by` on the migration back-pointer
+    targets (§3.13).
+
+    Replaces the per-object one-off migrate scripts: `ensure_attribute` skips
+    an attribute that already exists, so re-running is free and a workspace
+    that already carries one of them is left alone.
+    """
+    click.echo("\nMigration provenance back-pointers (§3.13):")
+    created = skipped = failed = 0
+    for object_slug in _PROVENANCE_OBJECTS:
+        target = f"{object_slug}.{_PROVENANCE_SLUG}"
+        try:
+            action = ensure_attribute(
+                client, "object", object_slug, _PROVENANCE_SLUG, "record_reference",
+                description=_PROVENANCE_DESCRIPTION,
+                referenced_object=_PROVENANCE_REFERENCED_OBJECT,
+                dry_run=dry_run,
+            )
+        except Exception as exc:  # noqa: BLE001
+            click.echo(f"  ✗ {target}: FAILED — {exc}", err=True)
+            failed += 1
+            continue
+        if action in ("created", "would_create"):
+            tag = "[dry-run] would create" if dry_run else "created"
+            click.echo(f"  + {target} (record_reference → migration_run): {tag}")
+            created += 1
+        else:
+            click.echo(f"  ✓ {target}: exists ({action})")
+            skipped += 1
+
+    click.echo(
+        f"Provenance attributes: created={created}, skipped={skipped}, "
+        f"failed={failed}."
+    )
+    if failed:
+        raise click.ClickException(
+            f"{failed} provenance item(s) failed to provision."
+        )
 
 
 # Spec: each entry is (parent_kind, parent_id_or_slug, attribute body).
@@ -431,15 +500,17 @@ def _create_option(
 @click.option("--dry-run", is_flag=True, help="List actions without writing.")
 @click.option(
     "--feature",
-    type=click.Choice(["core", "radar", "phase06", "all"]),
+    type=click.Choice(["core", "radar", "phase06", "provenance", "all"]),
     default="core",
     show_default=True,
     help=(
         "Which attribute set to provision. 'core' (default) = scorer + "
         "persistence attrs only. 'radar' = Follow-up Radar attrs only. "
-        "'phase06' = email response detection attrs only (PR-243). 'all' = "
-        "all of them. Radar and phase06 are off by default; provision them "
-        "only when you want those features (see GETTING_STARTED.md)."
+        "'phase06' = email response detection attrs only (PR-243). "
+        "'provenance' = the §3.13 last_migrated_by back-pointers only. "
+        "'all' = all of them. Radar, phase06 and provenance are off by "
+        "default; provision them only when you want those features (see "
+        "GETTING_STARTED.md)."
     ),
 )
 def main(dry_run: bool, feature: str) -> int:
@@ -452,6 +523,9 @@ def main(dry_run: bool, feature: str) -> int:
             return 0
         if feature == "phase06":
             _provision_phase06(client, dry_run)
+            return 0
+        if feature == "provenance":
+            _provision_provenance(client, dry_run)
             return 0
         # Cache existing slugs per parent so we make one GET per parent
         cache: dict[tuple[str, str], set[str]] = {}
@@ -503,6 +577,7 @@ def main(dry_run: bool, feature: str) -> int:
         if feature == "all":
             _provision_radar(client, list_id, dry_run)
             _provision_phase06(client, dry_run)
+            _provision_provenance(client, dry_run)
     return 0
 
 
