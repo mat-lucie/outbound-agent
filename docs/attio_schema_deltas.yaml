@@ -41,7 +41,7 @@
 
 schema_version: 1
 plan_version: "1.7"
-last_updated: "2026-08-31"  # Optional Botdog transport: linkedin_outreach.send_channel (read-only delivery routing) added, status=planned.  # Wave-2-A holdback rethink: experiment + weekly_kpi_snapshot → descoped (filesystem); cohort_membership/person_merge_audit/weekly_strategy_brief/diagnostic_run deleted (unbuilt/dead; all 404 live).
+last_updated: "2026-08-31"  # Optional pain-signal lane: linkedin_outreach.prospect_source / pain_source_type / pain_snippet / source_post_url / source_post_at added, status=planned.  # Optional Botdog transport: linkedin_outreach.send_channel (read-only delivery routing) added, status=planned.  # Wave-2-A holdback rethink: experiment + weekly_kpi_snapshot → descoped (filesystem); cohort_membership/person_merge_audit/weekly_strategy_brief/diagnostic_run deleted (unbuilt/dead; all 404 live).
 
 # Wave-2-A deploy holdback per agent-4 rethink (2026-05-25):
 # These new_objects + every attribute targeting them are NOT to be
@@ -1718,3 +1718,86 @@ attributes:
       carry the stamp onto the surviving entry when it merges records.
       Provision it only with `scripts/setup_attio_schema.py --feature
       botdog`; a fresh install never needs the attribute at all.
+
+  # ---- LinkedIn Outreach: pain-signal discovery lane (OPTIONAL) ----
+  # Stamped ONCE at PROSPECT-commit by workflows/pain_signal.py, through
+  # `_commit_prospect(lane_entry_attrs=...)`. The daily invite builder only
+  # READS prospect_source / pain_source_type to pick the note frame; no send
+  # path writes any of them. The lane is off by default
+  # (OUTBOUND_PAIN_SIGNAL_ENABLED) so a fresh install carries none of these,
+  # and parse_entry reads them as None. Provision with
+  # `scripts/setup_attio_schema.py --feature pain_signal`.
+  - object: linkedin_outreach
+    slug: prospect_source
+    type: select
+    options: ["pain_signal"]
+    pr_id: PR-280
+    status: planned
+    write_owner_module:
+      - workflows.pain_signal.run_pain_signal_discovery
+    note: |
+      Which discovery lane sourced this prospect. NULL on every
+      weekly-search prospect. Read by daily_check._build_invite_send_data
+      to route the connection note to the pain-signal group instead of the
+      persona group.
+
+  - object: linkedin_outreach
+    slug: pain_source_type
+    type: select
+    options: ["poster", "commenter", "liker"]
+    pr_id: PR-280
+    status: planned
+    write_owner_module:
+      - workflows.pain_signal.run_pain_signal_discovery
+    note: |
+      The prospect's relationship to the matched post. Selects the invite
+      note's reference frame: only `poster` gets the authorship note;
+      `commenter` and `liker` share the engagement note, because telling a
+      non-author they wrote the post is the dangerous direction. An
+      absent/unknown value falls back to the persona note LOUDLY — the
+      builder never guesses. Options are seeded from
+      models.campaign.PAIN_SIGNAL_SOURCE_TYPES; a workspace provisioned
+      against an earlier revision (no `commenter`) is caught by the lane's
+      wet-run preflight before any write.
+
+  - object: linkedin_outreach
+    slug: pain_snippet
+    type: text
+    options: null
+    pr_id: PR-280
+    status: planned
+    write_owner_module:
+      - workflows.pain_signal.run_pain_signal_discovery
+    note: |
+      Whitespace-collapsed excerpt (<=280 chars by default,
+      `pain_snippet_max_chars` in the keyword registry) of the review
+      context: a commenter's OWN comment when there is one, else the
+      matched post's text. Operator-review context only — never rendered
+      into an outgoing message.
+
+  - object: linkedin_outreach
+    slug: source_post_url
+    type: text
+    options: null
+    pr_id: PR-280
+    status: planned
+    write_owner_module:
+      - workflows.pain_signal.run_pain_signal_discovery
+    note: |
+      URL of the LinkedIn post that surfaced this prospect. Lets an
+      operator verify the note's topic claim against the actual post.
+
+  - object: linkedin_outreach
+    slug: source_post_at
+    type: text
+    options: null
+    pr_id: PR-280
+    status: planned
+    write_owner_module:
+      - workflows.pain_signal.run_pain_signal_discovery
+    note: |
+      ISO-8601 UTC timestamp of the matched post, resolved at scrape time
+      (the export may carry an epoch or a locale-dependent relative label).
+      Measurement context for the lane's recency window; unset when the
+      export carried no parseable timestamp — though such posts are dropped
+      fail-closed before they can reach a commit.
