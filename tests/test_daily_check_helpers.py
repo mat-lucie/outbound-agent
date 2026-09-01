@@ -220,11 +220,20 @@ class _StubAttio:
         self._records = records
         self._info = info_by_record
         self.bulk_calls = 0
+        self.bulk_company_calls: list[set[str]] = []
         self.get_calls: list[str] = []
 
     def bulk_fetch_persons_by_record_ids(self, record_ids, max_workers=8, *, metrics=None):
         self.bulk_calls += 1
         return {rid: rec for rid, rec in self._records.items() if rid in record_ids}
+
+    def bulk_prime_company_caches(self, company_ids, max_workers=8, *, metrics=None):
+        # Without this method AttioProvider.prefetch_companies_for_persons
+        # would raise AttributeError into the preload's fail-open catch, and
+        # these tests would silently pin the serial-fallback path instead of
+        # the real wiring.
+        self.bulk_company_calls.append(set(company_ids))
+        return 0
 
     def extract_record_info(self, record):
         rid = record["id"]["record_id"]

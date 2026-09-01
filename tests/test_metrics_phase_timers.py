@@ -1,8 +1,9 @@
 """Phase timers — coarse latency evidence for the send-dms latency work.
 
 Covers: record_phase accumulation, render output, the None-safe helper,
-and that preload_pipeline_persons splits its two latency buckets
-(parallel person fetch vs serial company resolve).
+and that preload_pipeline_persons splits its latency buckets
+(parallel person fetch vs parallel company prefetch vs residual serial
+company resolve).
 """
 
 import os
@@ -75,6 +76,7 @@ class TestPreloadPhaseSplit:
         )
         assert primed == 1
         assert "preload_person_fetch_parallel" in m.phase_seconds
+        assert "preload_company_fetch_parallel" in m.phase_seconds
         assert "preload_company_resolve_serial" in m.phase_seconds
 
     def test_preload_none_metrics_still_works(self):

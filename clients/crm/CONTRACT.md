@@ -25,6 +25,7 @@ this file is the source of truth and the divergences are called out at the end.
 | `search_people(filter_, limit)` | `search_people` | 4 call sites in workflows/cli; people discovery + filtered lookups. |
 | `get_person(record_id)` | `get_person` | 13 call sites repo-wide; single-record resolve, 404 → `None`. |
 | `bulk_fetch_persons(ids, *, metrics)` | `bulk_fetch_persons_by_record_ids` | RecordCache batch hydrate; per-record isolation + metrics. Renamed to drop the Attio-ish `_by_record_ids` suffix; `max_workers` is an Attio-internal tuning knob, dropped from the contract. |
+| `prefetch_companies_for_persons(records, *, metrics)` | `bulk_prime_company_caches` | **Optional, non-abstract, default no-op.** Read-path optimization only: warms the adapter's employer-lookup cache so `extract_person_info` stops doing one blocking company GET per first-seen company. No engine behavior may depend on it having run; adapters without a per-person company reference inherit the no-op. |
 | `search_person_by_linkedin(url)` | `search_person_by_linkedin` | Dedupe-by-LinkedIn before create. URL-variant matching is an adapter quirk. |
 | `create_person(attrs)` | `create_person` | Person creation in prospecting. |
 | `update_person(record_id, attrs)` | `update_person` | 8 call sites; the people branch of `AttioWriter._single_patch`. |

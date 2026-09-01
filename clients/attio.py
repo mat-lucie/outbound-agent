@@ -1,5 +1,6 @@
 """Attio CRM API v2 client."""
 
+import json
 import logging
 import os
 import random
@@ -510,6 +511,41 @@ class AttioClient:
                 return None
             raise
 
+    def _bulk_fetch_fail_open(
+        self, ids: list[str], fetch_one, on_error, max_workers: int = 8,
+    ):
+        """Yield ``(id, record)`` from a bounded-pool fan-out of `fetch_one`.
+
+        Shared skeleton of the person/company bulk paths. Per-id failures
+        of the fail-open classes — transport, missing-key, malformed
+        response shape, undecodable JSON body — are routed to
+        ``on_error(id, exc)`` and the id is skipped; other exception
+        types propagate so refactor bugs surface immediately instead of
+        silently dropping every id. ``record`` may be None (404) —
+        callers decide what that means. Records are yielded on the
+        calling thread; pool workers only fetch.
+
+        retry_500=False lives in the callers' `fetch_one`: these paths
+        are fail-open per record, so under a systemic 500 outage
+        retrying would burn the full backoff budget per record (hours
+        across a sweep) and still end in the same degraded result —
+        fail fast and let the metrics surface it.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_id = {pool.submit(fetch_one, i): i for i in ids}
+            for future in as_completed(future_to_id):
+                i = future_to_id[future]
+                try:
+                    record = future.result()
+                except (
+                    httpx.HTTPError, KeyError, TypeError, json.JSONDecodeError,
+                ) as exc:
+                    on_error(i, exc)
+                    continue
+                yield i, record
+
     def bulk_fetch_persons_by_record_ids(
         self, record_ids: set[str], max_workers: int = 8,
         *, metrics: Any = None,
@@ -528,48 +564,33 @@ class AttioClient:
         """
         if not record_ids:
             return {}
-        import sys
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         ids = list(record_ids)
         if metrics is not None:
             metrics.bulk_fetch_records_requested += len(ids)
+
+        def on_error(rid: str, exc: Exception) -> None:
+            if metrics is not None:
+                metrics.bulk_fetch_records_failed += 1
+                metrics.warn(
+                    f"bulk_fetch get_person({rid}) failed: "
+                    f"{type(exc).__name__}"
+                )
+            print(
+                f"WARNING: bulk_fetch_persons_by_record_ids: "
+                f"get_person({rid}) failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
         result: dict[str, dict] = {}
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            # retry_500=False: this path is fail-open per record, so under a
-            # systemic 500 outage retrying would burn the full backoff budget
-            # per record (hours across a weekly sweep) and still end in the
-            # same degraded result — fail fast and let the metrics surface it.
-            future_to_id = {
-                pool.submit(self.get_person, rid, retry_500=False): rid for rid in ids
-            }
-            for future in as_completed(future_to_id):
-                rid = future_to_id[future]
-                try:
-                    record = future.result()
-                except (httpx.HTTPError, KeyError, TypeError) as exc:
-                    # Narrowed catch: transport, missing-key, malformed
-                    # response shape. Bugs outside this set (AssertionError,
-                    # ValueError from a refactor) still propagate so they
-                    # surface immediately instead of silently dropping
-                    # every record.
-                    if metrics is not None:
-                        metrics.bulk_fetch_records_failed += 1
-                        metrics.warn(
-                            f"bulk_fetch get_person({rid}) failed: "
-                            f"{type(exc).__name__}"
-                        )
-                    print(
-                        f"WARNING: bulk_fetch_persons_by_record_ids: "
-                        f"get_person({rid}) failed: "
-                        f"{type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
-                    continue
-                if record is not None:
-                    result[rid] = record
-                    if metrics is not None:
-                        metrics.bulk_fetch_records_returned += 1
+        for rid, record in self._bulk_fetch_fail_open(
+            ids, lambda r: self.get_person(r, retry_500=False),
+            on_error, max_workers,
+        ):
+            if record is not None:
+                result[rid] = record
+                if metrics is not None:
+                    metrics.bulk_fetch_records_returned += 1
         return result
 
     def search_person_by_linkedin(self, linkedin_url: str) -> dict | None:
@@ -679,10 +700,16 @@ class AttioClient:
         data = self._request("POST", "/objects/companies/records", json={"data": {"values": attributes}})
         return data.get("data", {})
 
-    def get_company(self, record_id: str) -> dict | None:
-        """Get a company record by its record ID. Returns None if not found."""
+    def get_company(self, record_id: str, *, retry_500: bool = True) -> dict | None:
+        """Get a company record by its record ID. Returns None if not found.
+
+        `retry_500=False` opts back out of transient-500 retry — the
+        fail-open bulk company prefetch uses it so a systemic Attio
+        outage fails fast per record instead of blocking in backoff
+        sleeps (mirrors get_person).
+        """
         try:
-            data = self._request("GET", f"/objects/companies/records/{record_id}", retry_500=True)
+            data = self._request("GET", f"/objects/companies/records/{record_id}", retry_500=retry_500)
             return data.get("data", data)
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
@@ -1296,6 +1323,124 @@ class AttioClient:
             return item.get("value", item)
         return None
 
+    @staticmethod
+    def person_company_ref_id(record: dict) -> str | None:
+        """Return the linked company record id from a person record, or None.
+
+        Pure parse — no API call, total over malformed shapes. None when
+        the person has no company field, the field holds a plain value
+        rather than a record reference (extract_record_info renders
+        those verbatim), or the record is off-shape. Totality matters:
+        the preload harvests ids from every fetched person in one
+        comprehension, and one raising record would abort the whole
+        prefetch instead of costing one person.
+        """
+        if not isinstance(record, dict):
+            return None
+        values = record.get("values", {})
+        if not isinstance(values, dict):
+            return None
+        company_data = values.get("company", values.get("primary_company", []))
+        if company_data and isinstance(company_data, list):
+            ref = company_data[0]
+            if isinstance(ref, dict) and ref.get("target_record_id"):
+                return ref["target_record_id"]
+        return None
+
+    def _prime_company(self, cid: str, cr_values: dict) -> tuple[str, str]:
+        """Parse a fetched company's values and populate the per-run caches.
+
+        Shared by extract_record_info's lazy fetch and the bulk prefetch
+        so both paths cache identically. `cr_values` is `{}` when the
+        record was missing or the fetch failed — that primes the same
+        empty-string sentinel the lazy path always cached. Off-shape
+        `name` entries (non-dict — the same shape
+        is_linkedin_clearbit_corrupted already guards against) degrade
+        to the empty sentinel instead of raising.
+        """
+        if not isinstance(cr_values, dict):
+            cr_values = {}
+        # COMPANY name stays the LITERAL "name" — no documented
+        # field_mapping key for company name (full_name is the PERSON
+        # name), so routing it would invent a mapping.
+        company = ""
+        cr_name = cr_values.get("name", [])
+        if isinstance(cr_name, list) and cr_name and isinstance(cr_name[0], dict):
+            company = cr_name[0].get("value", "")
+        industry = first_option_title(cr_values.get("industry_vertical"))
+        self._company_cache[cid] = company
+        self._industry_cache[cid] = industry
+        self._company_corruption_cache[cid] = (
+            is_linkedin_clearbit_corrupted({"values": cr_values}, self._field_slug)
+        )
+        return company, industry
+
+    def bulk_prime_company_caches(
+        self, company_ids: set[str], max_workers: int = 8,
+        *, metrics: Any = None,
+    ) -> int:
+        """Parallel-fetch companies and prime the per-run company caches.
+
+        ``extract_record_info`` otherwise does one blocking company GET
+        per first-seen company, serially, inside the preload prime loop.
+        Pre-fetching the distinct company ids through a bounded pool
+        turns that loop into cache hits.
+
+        Fail-open per company: a fetch or parse failure is logged +
+        counted and the id is left unprimed, so extract_record_info's
+        existing lazy serial fetch covers it. A 404 primes the same
+        empty-string sentinel the lazy path caches, but does NOT count
+        as `bulk_fetch_companies_returned` — mirroring the persons
+        contract, so dangling company refs stay visible as
+        requested != returned + failed. No send-time guard reads these
+        caches (name/industry/corruption only — hq_country_code is
+        deliberately NOT primed here; the language guard resolves it
+        live at queue-build time).
+
+        Returns the number of companies primed (404 sentinels included).
+        """
+        todo = [
+            cid for cid in company_ids
+            if cid and cid not in self._company_cache
+        ]
+        if not todo:
+            return 0
+        if metrics is not None:
+            metrics.bulk_fetch_companies_requested += len(todo)
+
+        def on_error(cid: str, exc: Exception) -> None:
+            if metrics is not None:
+                metrics.bulk_fetch_companies_failed += 1
+                metrics.warn(
+                    f"bulk company prefetch get_company({cid}) "
+                    f"failed: {type(exc).__name__}"
+                )
+            print(
+                f"WARNING: bulk_prime_company_caches: "
+                f"get_company({cid}) failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+        primed = 0
+        for cid, record in self._bulk_fetch_fail_open(
+            todo, lambda c: self.get_company(c, retry_500=False),
+            on_error, max_workers,
+        ):
+            # Primes on the calling thread — pool workers only fetch.
+            # Per-company isolation: a malformed record shape skips that
+            # one company (lazy path covers it) instead of aborting the
+            # rest of the batch.
+            try:
+                self._prime_company(cid, (record or {}).get("values", {}))
+            except (KeyError, TypeError, AttributeError, IndexError) as exc:
+                on_error(cid, exc)
+                continue
+            primed += 1
+            if record is not None and metrics is not None:
+                metrics.bulk_fetch_companies_returned += 1
+        return primed
+
     def extract_record_info(
         self, record: dict,
     ) -> tuple[str | None, str | None, str, str | None, str]:
@@ -1327,8 +1472,11 @@ class AttioClient:
         company_data = values.get("company", values.get("primary_company", []))
         if company_data and isinstance(company_data, list) and company_data:
             ref = company_data[0]
-            if isinstance(ref, dict) and ref.get("target_record_id"):
-                cid = ref["target_record_id"]
+            # Same parse as the bulk prefetch's id harvest — keeping the
+            # two definitionally identical so the prefetch always covers
+            # exactly the companies this lazy path would fetch.
+            cid = self.person_company_ref_id(record)
+            if cid:
                 if person_record_id:
                     self._person_to_company[person_record_id] = cid
                 if cid in self._company_cache:
@@ -1340,24 +1488,9 @@ class AttioClient:
                         cr = self._request("GET", f"/objects/companies/records/{cid}")
                         cr_data = cr.get("data", cr)
                         cr_values = cr_data.get("values", {})
-                        # COMPANY name stays the LITERAL "name" — no documented
-                        # field_mapping key for company name (full_name is the
-                        # PERSON name), so routing it would invent a mapping.
-                        cr_name = cr_values.get("name", [])
-                        if cr_name:
-                            company = cr_name[0].get("value", "")
-                        iv = cr_values.get("industry_vertical", [])
-                        if iv and isinstance(iv[0], dict):
-                            industry = iv[0].get("option", {}).get("title", "")
                     except httpx.HTTPStatusError:
                         pass
-                    self._company_cache[cid] = company
-                    self._industry_cache[cid] = industry
-                    self._company_corruption_cache[cid] = (
-                        is_linkedin_clearbit_corrupted(
-                            {"values": cr_values}, self._field_slug
-                        )
-                    )
+                    company, industry = self._prime_company(cid, cr_values)
             else:
                 company = str(ref.get("value", ref))
 

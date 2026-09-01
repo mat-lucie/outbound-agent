@@ -123,11 +123,34 @@ def preload_pipeline_persons(
         return 0
     finally:
         record_phase_or_skip(metrics, "preload_person_fetch_parallel", _t)
+    # Pre-warm the linked companies through the provider's bounded pool, so
+    # the per-person resolve loop below reads them from cache instead of one
+    # blocking company GET per first-seen company (the dominant cost of a
+    # large preload). Optional optimization: providers without a company
+    # lookup no-op, and any company left unwarmed resolves lazily as before.
+    _t = phase_timer()
+    try:
+        crm.prefetch_companies_for_persons(records.values(), metrics=metrics)
+    except Exception as e:
+        # Fail-open (the prefetch is an optimization; the resolve loop
+        # still resolves every company) — but LOUD in metrics: a total
+        # prefetch collapse means the run silently regresses to the slow
+        # serial path, so it must reach the end-of-run summary, not just
+        # scrollback.
+        msg = (
+            f"bulk company prefetch failed "
+            f"({type(e).__name__}: {e}); "
+            f"falling back to serial company fetches"
+        )
+        if metrics is not None:
+            metrics.warn(msg)
+        click.echo(f"  Warning: {msg}.")
+    finally:
+        record_phase_or_skip(metrics, "preload_company_fetch_parallel", _t)
     primed = 0
     failures = 0
-    # Timed separately from the pool fetch above: extract_person_info does a
-    # blocking company GET per first-seen company, serially on this thread —
-    # a distinct latency bucket with a different remedy.
+    # Residual serial bucket: cache hits after the prefetch above, plus a
+    # lazy blocking GET for any company the prefetch failed to warm.
     _t = phase_timer()
     for rid, record in records.items():
         try:

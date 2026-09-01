@@ -47,16 +47,19 @@ class DailyRunMetrics:
     bulk_fetch_records_requested: int = 0
     bulk_fetch_records_returned: int = 0
     bulk_fetch_records_failed: int = 0
+    bulk_fetch_companies_requested: int = 0
+    bulk_fetch_companies_returned: int = 0
+    bulk_fetch_companies_failed: int = 0
     quarantine_skipped: int = 0
     starvation_triggers_fired: int = 0
     escalations_fired: int = 0
     escalations_by_type: dict[str, int] = field(default_factory=dict)
     runtime_warnings: list[str] = field(default_factory=list)
     # Coarse wall-clock per phase (seconds), insertion-ordered. Populated
-    # via record_phase at the six seams of the send-dms latency work:
-    # list scan, parallel person fetch, serial company resolve, dedup
-    # index, queue build, PB send. Repeat phases (e.g. per-step send
-    # loops) accumulate.
+    # via record_phase at the seams of the send-dms latency work: list
+    # scan, parallel person fetch, parallel company prefetch, residual
+    # serial company resolve, dedup index, queue build, PB send. Repeat
+    # phases (e.g. per-step send loops) accumulate.
     phase_seconds: dict[str, float] = field(default_factory=dict)
 
     def warn(self, message: str) -> None:
