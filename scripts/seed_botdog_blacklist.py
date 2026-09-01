@@ -45,14 +45,21 @@ endpoint). Batches are capped at ``MAX_LEADS_PER_BATCH`` (the client's
 guard) and each batch's failure is recorded and surfaced — a partial
 failure is LOUD and exits non-zero, never a silent partial seed.
 
-Two fail-closed guards:
+Three fail-closed guards:
 
   * ``unresolved_identity`` — a row whose company AND person name are both
     empty was cleared past the denylist check on no evidence. Dry-run
     prints the bucket prominently; ``--apply`` REFUSES to run (exit 2)
-    until it is empty. See ``UNRESOLVED_BUCKET``. Skipped entirely when
-    the operator configured no denylist — with nothing to match, a blank
-    identity clears nothing.
+    until it is empty. See ``UNRESOLVED_BUCKET``. ALWAYS ARMED — a
+    denylist that is empty TODAY is one config edit away from being
+    populated, and the rows this bucket names are unidentifiable either
+    way; an operator must never learn the guard was dormant by
+    discovering a hard-blocked company in a campaign.
+  * ``skipped_no_url_denylist`` — a DENYLISTED row with no resolvable
+    LinkedIn URL cannot be blacklisted at all (the blacklist keys on
+    URL), so the hard block would be silently ABSENT from the seed.
+    Counted separately from the benign ``skipped_no_url`` and refuses
+    ``--apply`` (exit 2). See ``DENYLIST_NO_URL_BUCKET``.
   * duplicate-collection assertion — after a create, the collection must
     re-fetch to EXACTLY ONE match, else ``BlacklistResolutionError``
     (exit 2). A DTO shape-miss must not quietly mint a second collection
@@ -123,7 +130,21 @@ CATEGORIES = ("denylist", "merged", "suppressed", "declined", "contacted")
 # refuses to run while this bucket is non-empty, so the operator triages
 # the rows (fix the CRM record, or confirm the person) instead of seeding
 # a set that silently omits a hard-blocked company.
+#
+# ALWAYS ARMED — never gated on whether a denylist is configured. Gating
+# it means the default install (no `denylist_companies`) runs the guard
+# dormant forever and `--apply` never refuses, so the first operator to
+# add a denylist entry inherits a seed built while the check was off.
+# An unidentifiable row is unidentifiable regardless of config.
 UNRESOLVED_BUCKET = "unresolved_identity"
+
+# Second fail-closed bucket: a row classified `denylist` whose LinkedIn
+# URL is unresolvable. The Botdog blacklist keys on URL ONLY, so this row
+# CANNOT be blacklisted — the operator's hard block would be silently
+# missing from the seed while the run reported success. Kept out of the
+# generic `skipped_no_url` counter (which is benign: those rows are merely
+# already-contacted) so a hard block never hides inside a routine number.
+DENYLIST_NO_URL_BUCKET = "skipped_no_url_denylist"
 
 # Cap on the sample of unresolved record ids printed for triage.
 UNRESOLVED_SAMPLE_LIMIT = 10
@@ -216,20 +237,22 @@ def collect_seed_leads(
     ``record_info_by_id`` maps record_id → (name, company, linkedin_url).
     Rows with no resolvable LinkedIn URL are counted under
     ``breakdown["skipped_no_url"]`` (they cannot be blacklisted by URL —
-    surfaced, never silently dropped). Dedup is by canonical URL; the
-    first-seen category wins.
+    surfaced, never silently dropped), EXCEPT denylisted ones, which get
+    their own ``breakdown[DENYLIST_NO_URL_BUCKET]``: an unblacklistable
+    hard block is a refusal, not a routine skip. Dedup is by canonical
+    URL; the first-seen category wins.
 
     Third return value = record ids of rows this function decided NOT to
     seed while BOTH their company and name were empty (see
     ``UNRESOLVED_BUCKET``). Scoped to the not-seeded rows on purpose: a row
     that IS seeded lands on the blacklist whatever its identity, so its
     blank company changes no outcome — but a not-seeded row with no
-    identity was cleared past the denylist check on no evidence. With no
-    denylist configured there is nothing to clear, so the bucket stays
-    empty.
+    identity was cleared past the denylist check on no evidence. Armed
+    unconditionally, `tokens` or not (see ``UNRESOLVED_BUCKET``).
     """
     breakdown: dict[str, int] = {c: 0 for c in CATEGORIES}
     breakdown["skipped_no_url"] = 0
+    breakdown[DENYLIST_NO_URL_BUCKET] = 0
     seen: set[str] = set()
     leads: list[SeedLead] = []
     unresolved: list[str] = []
@@ -240,11 +263,7 @@ def collect_seed_leads(
         )
         category = classify_seed_category(attrs, company, name, tokens)
         if category is None:
-            if (
-                tokens
-                and not (company or "").strip()
-                and not (name or "").strip()
-            ):
+            if not (company or "").strip() and not (name or "").strip():
                 # Fall back to the entry id when the row carries no
                 # record_id: an empty string in the triage sample gives the
                 # operator nothing to look up, which makes the fail-closed
@@ -257,7 +276,15 @@ def collect_seed_leads(
             continue
         url = _row_url(attrs, linkedin_url)
         if not url:
-            breakdown["skipped_no_url"] += 1
+            # A denylisted row without a URL is UNBLACKLISTABLE — the hard
+            # block simply would not exist in the seed. Its own counter,
+            # its own refusal (see DENYLIST_NO_URL_BUCKET).
+            bucket = (
+                DENYLIST_NO_URL_BUCKET
+                if category == "denylist"
+                else "skipped_no_url"
+            )
+            breakdown[bucket] += 1
             continue
         if url in seen:
             continue
@@ -472,6 +499,16 @@ def _print_preview(leads: list[SeedLead], breakdown: dict[str, int]) -> None:
         print(f"  - [{lead.category}] {lead.canonical_url}")
     if len(leads) > 10:
         print(f"  ... and {len(leads) - 10} more")
+    if breakdown.get(DENYLIST_NO_URL_BUCKET):
+        # Rendered on its own line, in stderr, never folded into the
+        # counters dict above: this one is a refusal, not a statistic.
+        print(
+            f"  ⚠ {breakdown[DENYLIST_NO_URL_BUCKET]} DENYLISTED row(s) "
+            f"had no resolvable LinkedIn URL — they CANNOT be blacklisted "
+            f"(the Botdog blacklist keys on URL), so the operator's hard "
+            f"block would be MISSING from this seed.",
+            file=sys.stderr,
+        )
 
 
 def _print_unresolved(unresolved: list[str]) -> None:
@@ -534,26 +571,37 @@ def seed(
         "seed_size": len(leads),
         "breakdown": {k: v for k, v in breakdown.items() if v},
     }
+    # Fail-closed buckets: each one means the seed WOULD be incomplete in a
+    # way the operator cannot see from a success message. Both are reported
+    # under dry-run and both refuse `--apply`.
+    refusals: list[str] = []
     if unresolved:
         _print_unresolved(unresolved)
         report[UNRESOLVED_BUCKET] = {
             "count": len(unresolved),
             "sample_record_ids": unresolved[:UNRESOLVED_SAMPLE_LIMIT],
         }
-        if not dry_run:
-            # Fail closed: an unresolvable row could be denylisted, so the
-            # operator triages before anything is written to Botdog.
-            print(
-                f"\n❌ REFUSING to --apply: {len(unresolved)} row(s) in the "
-                f"{UNRESOLVED_BUCKET} bucket. Triage them first (above), "
-                f"then re-run. NOTHING was written to Botdog.",
-                file=sys.stderr,
-            )
-            report["refused"] = UNRESOLVED_BUCKET
-            report["added"] = 0
-            report["skipped_already_present"] = 0
-            report["failures"] = []
-            return report
+        refusals.append(UNRESOLVED_BUCKET)
+    denylist_no_url = breakdown.get(DENYLIST_NO_URL_BUCKET, 0)
+    if denylist_no_url:
+        report[DENYLIST_NO_URL_BUCKET] = denylist_no_url
+        refusals.append(DENYLIST_NO_URL_BUCKET)
+
+    if refusals and not dry_run:
+        # An unresolvable row could be denylisted; an unblacklistable
+        # denylisted row IS one. Either way the operator triages before
+        # anything is written to Botdog.
+        print(
+            f"\n❌ REFUSING to --apply: fail-closed bucket(s) "
+            f"{', '.join(refusals)} are non-empty. Triage them first "
+            f"(above), then re-run. NOTHING was written to Botdog.",
+            file=sys.stderr,
+        )
+        report["refused"] = ", ".join(refusals)
+        report["added"] = 0
+        report["skipped_already_present"] = 0
+        report["failures"] = []
+        return report
 
     if dry_run or botdog is None:
         print(

@@ -23,6 +23,7 @@ import pytest
 from clients.botdog import MAX_LEADS_PER_BATCH, BotdogError, blacklist_name
 from models.pipeline import PipelineStage
 from scripts.seed_botdog_blacklist import (
+    DENYLIST_NO_URL_BUCKET,
     UNRESOLVED_BUCKET,
     BlacklistResolutionError,
     SeedLead,
@@ -210,6 +211,118 @@ class TestCollectSeedLeads:
         leads, breakdown, _unresolved = collect_seed_leads(entries, info, TOKENS)
         assert leads == []
         assert breakdown["skipped_no_url"] == 1
+        assert breakdown[DENYLIST_NO_URL_BUCKET] == 0
+
+
+# ---------------------------------------------------------------------------
+# skipped_no_url_denylist — an unblacklistable hard block
+# ---------------------------------------------------------------------------
+
+
+class TestDenylistRowWithNoUrl:
+    """A DENYLISTED row with no resolvable URL cannot be blacklisted at
+    all (the Botdog blacklist keys on URL). Folding it into the benign
+    `skipped_no_url` counter hides the operator's hard block inside a
+    routine number while the run reports success."""
+
+    def test_denylisted_row_with_no_url_gets_its_own_counter(self):
+        entries = [
+            _entry("r1", PipelineStage.PROSPECT.value),
+            _entry("r2", PipelineStage.DM1_SENT.value),
+        ]
+        info = {
+            "r1": ("Dana", "Contoso Holdings", ""),  # denylisted, no url
+            "r2": ("Alice", "Acme Foods", ""),       # benign, no url
+        }
+        leads, breakdown, _unresolved = collect_seed_leads(
+            entries, info, TOKENS
+        )
+        assert leads == []
+        assert breakdown[DENYLIST_NO_URL_BUCKET] == 1
+        assert breakdown["skipped_no_url"] == 1
+
+    def test_denylisted_row_with_a_url_is_seeded_normally(self):
+        entries = [_entry("r1", PipelineStage.PROSPECT.value)]
+        info = {"r1": ("Dana", "Contoso Holdings",
+                       "https://linkedin.com/in/acme-dana")}
+        leads, breakdown, _unresolved = collect_seed_leads(
+            entries, info, TOKENS
+        )
+        assert [lead.category for lead in leads] == ["denylist"]
+        assert breakdown[DENYLIST_NO_URL_BUCKET] == 0
+
+
+class TestDenylistNoUrlRefusesApply:
+    def _attio(self, monkeypatch, info):
+        attio = MagicMock()
+        attio.query_list_entries.return_value = ["raw1", "raw2"]
+        monkeypatch.setattr(
+            "scripts.seed_botdog_blacklist.AttioClient.parse_entry",
+            lambda entry: {
+                "raw1": _entry("r1", PipelineStage.DM1_SENT.value),
+                "raw2": _entry("r2", PipelineStage.PROSPECT.value),
+            }[entry],
+        )
+        monkeypatch.setattr(
+            "scripts.seed_botdog_blacklist.resolve_record_info",
+            lambda a, ids: info,
+        )
+        return attio
+
+    # r2 is denylisted (the reference operator's token) with NO url.
+    _INFO = {
+        "r1": ("Alice", "Acme Foods", "https://linkedin.com/in/acme-alice"),
+        "r2": ("Dana", "Contoso Holdings", ""),
+    }
+
+    def test_dry_run_renders_it_distinctly(self, monkeypatch, capsys):
+        attio = self._attio(monkeypatch, self._INFO)
+        report = seed(attio, MagicMock(), dry_run=True)
+        assert report[DENYLIST_NO_URL_BUCKET] == 1
+        err = capsys.readouterr().err
+        assert "DENYLISTED row(s) had no resolvable LinkedIn URL" in err
+        assert "CANNOT be blacklisted" in err
+
+    def test_apply_refuses_and_writes_nothing(self, monkeypatch, capsys):
+        attio = self._attio(monkeypatch, self._INFO)
+        botdog = MagicMock()
+        report = seed(attio, botdog, dry_run=False)
+        assert report["refused"] == DENYLIST_NO_URL_BUCKET
+        assert report["added"] == 0
+        botdog.add_to_blacklist.assert_not_called()
+        assert "REFUSING to --apply" in capsys.readouterr().err
+
+    def test_both_buckets_are_named_in_one_refusal(self, monkeypatch, capsys):
+        attio = self._attio(monkeypatch, {
+            # r1 (seeded, contacted) is denylisted with no url; r2 is an
+            # unseeded prospect with no identity at all.
+            "r1": ("Dana", "Contoso Holdings", ""),
+            "r2": (None, None, "https://linkedin.com/in/acme-bob"),
+        })
+        botdog = MagicMock()
+        report = seed(attio, botdog, dry_run=False)
+        assert report["refused"] == (
+            f"{UNRESOLVED_BUCKET}, {DENYLIST_NO_URL_BUCKET}"
+        )
+        botdog.add_to_blacklist.assert_not_called()
+
+    def test_no_refusal_when_every_denylisted_row_has_a_url(
+        self, monkeypatch
+    ):
+        attio = self._attio(monkeypatch, {
+            "r1": ("Alice", "Acme Foods",
+                   "https://linkedin.com/in/acme-alice"),
+            "r2": ("Dana", "Contoso Holdings",
+                   "https://linkedin.com/in/acme-dana"),
+        })
+        botdog = MagicMock()
+        botdog.get_blacklists.return_value = [
+            {"id": "bl_1", "name": _name(), "leads": []},
+        ]
+        report = seed(attio, botdog, dry_run=False)
+        assert "refused" not in report
+        assert DENYLIST_NO_URL_BUCKET not in report
+        assert report["added"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -467,15 +580,16 @@ class TestUnresolvedIdentityBucket:
         assert unresolved == []
         assert [lead.record_id for lead in leads] == ["r1"]
 
-    def test_no_denylist_configured_leaves_the_bucket_empty(self):
-        """The bucket exists only to protect the denylist check. With no
-        denylist configured there is nothing a blank identity could have
-        cleared, so bucketing every identity-less prospect would refuse
-        `--apply` for an operator who never asked for a hard block."""
+    def test_bucket_is_armed_even_with_no_denylist_configured(self):
+        """ALWAYS ARMED. Gating the guard on a configured denylist leaves
+        the DEFAULT install (empty `denylist_companies`) running it dormant
+        forever — `--apply` never refuses, and the first operator to add a
+        denylist entry inherits a seed built while the check was off. An
+        unidentifiable row is unidentifiable regardless of config."""
         entries = [_entry("r1", PipelineStage.PROSPECT.value)]
         info = {"r1": (None, None, "https://linkedin.com/in/acme-alice")}
         leads, _bd, unresolved = collect_seed_leads(entries, info, ())
-        assert unresolved == []
+        assert unresolved == ["r1"]
         assert leads == []
 
 
@@ -516,6 +630,7 @@ class TestUnresolvedIdentityRefusesApply:
         botdog = MagicMock()
         report = seed(attio, botdog, dry_run=False)
         assert report["refused"] == UNRESOLVED_BUCKET
+        assert report[UNRESOLVED_BUCKET]["count"] == 1
         assert report["added"] == 0
         botdog.get_blacklists.assert_not_called()
         botdog.create_blacklist.assert_not_called()
@@ -537,12 +652,13 @@ class TestUnresolvedIdentityRefusesApply:
         assert report["added"] == 1
         botdog.add_to_blacklist.assert_called_once()
 
-    def test_apply_proceeds_with_no_denylist_despite_blank_identity(
+    def test_apply_still_refuses_with_no_denylist_configured(
         self, monkeypatch
     ):
-        """The other half of the fail-closed branch, at orchestration
-        level: an operator with no configured denylist is never blocked by
-        a row whose identity the CRM cannot resolve."""
+        """The DEFAULT install (empty `denylist_companies`) must arm the
+        guard too — otherwise the fail-closed refusal only ever exists for
+        operators who already configured a denylist, and every default
+        deployment seeds unidentifiable rows with the check dormant."""
         import scripts.seed_botdog_blacklist as sbb
 
         monkeypatch.setattr(sbb, "denylist_tokens", lambda: ())
@@ -552,10 +668,10 @@ class TestUnresolvedIdentityRefusesApply:
             {"id": "bl_1", "name": _name(), "leads": []},
         ]
         report = seed(attio, botdog, dry_run=False)
-        assert UNRESOLVED_BUCKET not in report
-        assert "refused" not in report
-        assert report["added"] == 1
-        botdog.add_to_blacklist.assert_called_once()
+        assert report[UNRESOLVED_BUCKET]["count"] == 1
+        assert report["refused"] == UNRESOLVED_BUCKET
+        assert report["added"] == 0
+        botdog.add_to_blacklist.assert_not_called()
 
 
 class TestBlacklistIdBypass:
