@@ -83,6 +83,12 @@ from typing import TYPE_CHECKING
 import click
 import httpx
 
+from clients.attio import (
+    AttioClient,
+    linkedin_identity_key,
+    linkedin_identity_map,
+    resolve_identity_match,
+)
 from clients.attio_writer import (
     AttioError,
     AttioWriter,
@@ -103,7 +109,6 @@ from workflows.daily_check_helpers import (
 from workflows.escalation import escalate
 
 if TYPE_CHECKING:
-    from clients.attio import AttioClient
     from clients.phantombuster import PhantomBusterClient
     from workflows.audit import AuditLogger
 
@@ -427,6 +432,13 @@ def _launch_sales_nav_scrape(
         return container_id, {}, {}
 
     our_urls = {_normalize_linkedin_url(u) for u in urls}
+    # Slug-variant bridge: `linkedinProfileUrl` carries the profile's CURRENT
+    # slug, which can differ from the slug we queried (the person renamed
+    # their vanity URL). On an exact miss, re-key the row to OUR url form via
+    # the numeric profile-id so callers' lookups (keyed on our form) still
+    # hit — otherwise the row reads as scrape-missing and re-queues/escalates
+    # forever (cadence-leak family).
+    our_urls_by_id = linkedin_identity_map(our_urls)
     degree_lookup: dict[str, str] = {}
     extras: dict[str, dict] = {}
     for row in csv.DictReader(io.StringIO(csv_text)):
@@ -439,8 +451,10 @@ def _launch_sales_nav_scrape(
         )
         if not url:
             continue
-        norm = _normalize_linkedin_url(url)
-        if norm not in our_urls:
+        norm = resolve_identity_match(
+            _normalize_linkedin_url(url), our_urls, our_urls_by_id
+        )
+        if not norm:
             continue
         degree = (row.get(SALES_NAV_DEGREE_COL) or "").strip()
         if degree:
@@ -504,6 +518,97 @@ def _emit_degree_unknown(
 # ---------------------------------------------------------------------------
 # Pre-invite degree check
 # ---------------------------------------------------------------------------
+
+def _prior_cadence_entries_for_url(
+    attio: AttioClient,
+    list_id: str,
+    linkedin_url: str,
+    own_entry_id: str,
+    cache: dict,
+) -> tuple[list[dict], str]:
+    """Existing pipeline entries whose URL shares `linkedin_url`'s identity key.
+
+    Slug-variant cadence-leak fix: when the Pattern-A quarantine flags a
+    suspected URL-variant duplicate, the operator previously had NO tooling to
+    check whether a slug variant of the same person was already in the
+    pipeline — upstream's quarantine row was correctly flagged but misjudged
+    as a real accept because the prior DM3-complete entry (under the long
+    slug) was invisible. This surfaces those siblings in the escalation
+    payload so the prior cadence is in front of the operator at judgment time.
+
+    Matching uses `linkedin_identity_key`: the numeric profile-id suffix when
+    the slug carries one (bridges slug variants), else the canonical URL
+    (still surfaces exact-URL duplicate entries).
+
+    The pipeline-list fetch happens at most ONCE per run — `cache` (caller-
+    owned dict) memoizes the built index or the fetch error. Quarantine hits
+    are rare, so the fetch is lazy: no cost on runs without a quarantine. A
+    fetch/parse failure degrades to an empty match list plus an error string
+    the caller records in the payload — never raises.
+
+    Merged-away entries (`merged_into` set — §3.11 soft-deleted losers) are
+    excluded: their winner inherited the cadence, so listing the loser would
+    show the operator a stale duplicated view. Entries whose entry-level
+    `canonical_linkedin_url` is unset (the backfill skews to later stages, so
+    PROSPECT rows often lack it) fall back to the parent person record's
+    LinkedIn URL in one bulk read — without this, exactly the sibling the
+    operator needs could be invisible and an empty list would read as "no
+    prior cadence".
+    """
+    if "index" not in cache and "error" not in cache:
+        try:
+            index: dict[str, list[dict]] = {}
+            pending: dict[str, list[dict]] = {}  # record_id -> summaries sans URL
+            for raw in attio.query_list_entries(list_id=list_id):
+                parsed = AttioClient.parse_entry(raw)
+                if parsed.get("merged_into"):
+                    continue
+                summary = {
+                    "entry_id": parsed.get("entry_id") or "",
+                    "record_id": parsed.get("record_id") or "",
+                    "linkedin_url": parsed.get("canonical_linkedin_url") or "",
+                    "stage": parsed.get("stage") or "",
+                    "dm_step": str(parsed.get("dm_step") or ""),
+                    "dm1_sent_at": str(parsed.get("dm1_sent_at") or ""),
+                    "dm2_sent_at": str(parsed.get("dm2_sent_at") or ""),
+                    "dm3_sent_at": str(parsed.get("dm3_sent_at") or ""),
+                    "last_contact_date": str(parsed.get("last_contact_date") or ""),
+                }
+                if summary["linkedin_url"]:
+                    index.setdefault(
+                        linkedin_identity_key(summary["linkedin_url"]), []
+                    ).append(summary)
+                elif summary["record_id"]:
+                    pending.setdefault(summary["record_id"], []).append(summary)
+            if pending:
+                persons = attio.bulk_fetch_persons_by_record_ids(set(pending))
+                for rid, person in persons.items():
+                    items = ((person or {}).get("values") or {}).get("linkedin") or []
+                    first = items[0] if items else ""
+                    url = str(
+                        first.get("value", "") if isinstance(first, dict) else first
+                    )
+                    if not url:
+                        continue
+                    for summary in pending.get(rid, []):
+                        summary["linkedin_url"] = url
+                        index.setdefault(
+                            linkedin_identity_key(url), []
+                        ).append(summary)
+            cache["index"] = index
+        except Exception as exc:  # noqa: BLE001 — degrade to empty, but LOUD
+            cache["error"] = f"{type(exc).__name__}: {exc}"
+            click.echo(
+                f"  ⚠ prior-cadence lookup for the Pattern-A quarantine payload "
+                f"failed ({cache['error']}) — escalation rows this run carry no "
+                f"sibling-entry context.",
+                err=True,
+            )
+    if "error" in cache:
+        return [], cache["error"]
+    matches = cache["index"].get(linkedin_identity_key(linkedin_url), [])
+    return [m for m in matches if m["entry_id"] != own_entry_id], ""
+
 
 def _pre_invite_degree_check(
     to_send_data: list[dict],
@@ -816,6 +921,7 @@ def _pre_invite_degree_check(
                 return [], []
 
             scraped_lookup = {}
+            our_urls_by_id = linkedin_identity_map(our_urls)
             for row in csv.DictReader(io.StringIO(result_csv)):
                 url = (
                     row.get("linkedin_url", "")
@@ -826,8 +932,12 @@ def _pre_invite_degree_check(
                 degree = (row.get("connectionDegree") or "").strip()
                 if not url or not degree:
                     continue
-                norm = _normalize_linkedin_url(url)
-                if norm in our_urls:
+                # Exact match primary; slug-variant echo bridges to OUR url
+                # form via the profile-id (see _launch_sales_nav_scrape).
+                norm = resolve_identity_match(
+                    _normalize_linkedin_url(url), our_urls, our_urls_by_id
+                )
+                if norm:
                     scraped_lookup[norm] = degree
         degree_lookup.update(scraped_lookup)
 
@@ -892,6 +1002,10 @@ def _pre_invite_degree_check(
     # because they only became prospects within PATTERN_A_QUARANTINE_DAYS
     # (suspected URL-variant duplicates). Surfaced in the summary.
     pattern_a_quarantined: list[dict] = []
+    # Memo for `_prior_cadence_entries_for_url` — the pipeline-entry index is
+    # built lazily on the first quarantine hit and reused for the rest of the
+    # run (slug-variant cadence-leak fix).
+    prior_cadence_cache: dict = {}
     # Wave-1.6.2 FIX-B (adversarial EXT-SB-3 IMPORTANT): tally failed
     # `experiment_id_immutability_violation` escalate() calls so the
     # end-of-function summary surfaces them. Mirrors FIX-A at
@@ -936,21 +1050,44 @@ def _pre_invite_degree_check(
                     err=True,
                 )
                 if row.get("record_id"):
+                    # Slug-variant cadence-leak fix: surface pipeline entries
+                    # whose URL shares the profile-id suffix so the operator
+                    # sees any prior cadence (e.g. "DM3 Sent since 06-01")
+                    # BEFORE judging the quarantine a real accept.
+                    prior_entries, prior_err = _prior_cadence_entries_for_url(
+                        attio, list_id, row["linkedInUrl"],
+                        str(row.get("entry_id") or ""), prior_cadence_cache,
+                    )
+                    quarantine_payload: dict = {
+                        "record_id": str(row["record_id"]),
+                        "entry_id": str(row.get("entry_id") or ""),
+                        "linkedin_url": row["linkedInUrl"],
+                        "name": str(row.get("name") or ""),
+                        "company": str(row.get("company") or ""),
+                        "prospect_committed_at": str(
+                            row.get("prospect_committed_at") or ""
+                        ),
+                        "degree": "1st",
+                        "prior_cadence_entries": prior_entries,
+                    }
+                    if prior_err:
+                        quarantine_payload["prior_cadence_lookup_error"] = prior_err
+                    if prior_entries:
+                        click.echo(
+                            f"      ↳ {len(prior_entries)} existing pipeline "
+                            f"entr{'y' if len(prior_entries) == 1 else 'ies'} "
+                            f"share this profile-id: "
+                            + "; ".join(
+                                f"{m['linkedin_url']} at {m['stage'] or '?'}"
+                                for m in prior_entries[:3]
+                            ),
+                            err=True,
+                        )
                     try:
                         escalate(
                             type="pattern_a_suspected_duplicate",
                             idempotency_key=str(row["record_id"]),
-                            payload={
-                                "record_id": str(row["record_id"]),
-                                "entry_id": str(row.get("entry_id") or ""),
-                                "linkedin_url": row["linkedInUrl"],
-                                "name": str(row.get("name") or ""),
-                                "company": str(row.get("company") or ""),
-                                "prospect_committed_at": str(
-                                    row.get("prospect_committed_at") or ""
-                                ),
-                                "degree": "1st",
-                            },
+                            payload=quarantine_payload,
                             attio=attio,
                         )
                     except Exception as esc_exc:  # noqa: BLE001 — never block the batch

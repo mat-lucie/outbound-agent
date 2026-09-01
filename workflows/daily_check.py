@@ -8,7 +8,12 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 import click
 import httpx
 
-from clients.attio import AttioClient
+from clients.attio import (
+    AttioClient,
+    linkedin_identity_key,
+    linkedin_identity_map,
+    resolve_identity_match,
+)
 
 if TYPE_CHECKING:
     from clients.crm.base import CRMProvider
@@ -1709,8 +1714,12 @@ def detect_accepted_connections(
         # phantom (rollback requires a NEW agent id).
         preflight_legacy_profile_scraper(pb, profile_scraper_id)
 
-    # Build URL set for matching results back to our batch
+    # Build URL set for matching results back to our batch. The identity map
+    # bridges slug-variant echoes: the scraper can report a profile under its
+    # CURRENT slug rather than the queried one, and an exact-string miss here
+    # would leave an accepted connection undetected (cadence-leak family).
     our_urls = {_normalize_linkedin_url(p["linkedin_url"]) for p in scrape_batch}
+    our_urls_by_id = linkedin_identity_map(our_urls)
 
     # Write to Google Sheet and launch Profile Scraper (expects 'profileUrl' column)
     sheet_rows = [{"profileUrl": p["linkedin_url"]} for p in scrape_batch]
@@ -1908,8 +1917,13 @@ def detect_accepted_connections(
         )
         degree = row.get("connectionDegree", "")
         if url and degree:
-            norm = _normalize_linkedin_url(url)
-            if norm in our_urls:
+            # Exact match primary; on a miss bridge a slug-variant echo back
+            # to OUR url form via the profile-id, so the degree_lookup /
+            # pending_lookup reads below (keyed on our form) still hit.
+            norm = resolve_identity_match(
+                _normalize_linkedin_url(url), our_urls, our_urls_by_id
+            )
+            if norm:
                 degree_lookup[norm] = degree
                 pending_lookup[norm] = (
                     row.get(SALES_NAV_HAS_PENDING_INVITATION_COL) or ""
@@ -3453,7 +3467,9 @@ def run_dm_sequencing(
     # at divergent stages don't each queue their own DM for the same LinkedIn
     # URL. If any sibling entry is already at or past the next-stage we would
     # advance to, skip. Terminal stages (RESPONDED, NOT_INTERESTED, etc.) also
-    # block further DMs.
+    # block further DMs. Keyed on `linkedin_identity_key` (slug-variant
+    # cadence-leak fix) so duplicate records under slug VARIANTS — same
+    # numeric profile-id suffix, different name portion — share one rank.
     unique_record_ids = {a["record_id"] for a in all_parsed if a.get("record_id")}
     click.echo(
         f"  Building duplicate-URL stage-rank index "
@@ -3461,7 +3477,11 @@ def run_dm_sequencing(
     )
     _t_phase = phase_timer()
     url_to_max_rank: dict[str, int] = {}
-    url_to_stages: dict[str, list[tuple[str, str]]] = {}  # url -> [(stage, entry_id), ...]
+    url_to_stages: dict[str, list[tuple[str, str]]] = {}  # key -> [(stage, entry_id), ...]
+    # Identity keys for profile-id URLs are `li-id:<digits>` — unusable in the
+    # operator-facing divergence report. Remember the first URL seen per key
+    # so the report stays clickable.
+    key_to_display_url: dict[str, str] = {}
     for attrs in all_parsed:
         try:
             s = PipelineStage(attrs["stage"])
@@ -3470,7 +3490,8 @@ def run_dm_sequencing(
         _, _, url, _, _ = cache.get(attrs["record_id"])
         if not url:
             continue
-        key = _normalize_linkedin_url(url)
+        key = linkedin_identity_key(url)
+        key_to_display_url.setdefault(key, url)
         rank = STAGE_RANK.get(s, 0)
         if rank > url_to_max_rank.get(key, -1):
             url_to_max_rank[key] = rank
@@ -3484,8 +3505,8 @@ def run_dm_sequencing(
     # common source of repeat-DM bugs. Print before queueing so dry-run reveals
     # the mess even when no DMs fire.
     divergent: list[tuple[str, list[tuple[str, str]]]] = [
-        (url, sorted(set(stages)))
-        for url, stages in url_to_stages.items()
+        (key_to_display_url.get(key, key), sorted(set(stages)))
+        for key, stages in url_to_stages.items()
         if len({s for s, _ in stages}) > 1
     ]
     if divergent:
@@ -3568,7 +3589,7 @@ def run_dm_sequencing(
         # at or past the stage we're about to advance to. Skip if so.
         _, _, url, _, _ = cache.get(attrs["record_id"])
         if url:
-            key = _normalize_linkedin_url(url)
+            key = linkedin_identity_key(url)
             next_rank = STAGE_RANK[NEXT_STAGE[pending_dm]]
             if url_to_max_rank.get(key, -1) >= next_rank:
                 click.echo(

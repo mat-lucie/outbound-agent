@@ -17,7 +17,12 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict
 import click
 import httpx
 
-from clients.attio import AttioClient, _canonical_linkedin_url, first_option_title
+from clients.attio import (
+    AttioClient,
+    _canonical_linkedin_url,
+    first_option_title,
+    linkedin_identity_key,
+)
 from clients.pb_config import (
     li_session_cookie,
     li_user_agent_raw,
@@ -731,9 +736,13 @@ def _load_recent_outreach_map(
             continue
         if lc_date < cutoff_date:
             continue
-        # Keep the most-recent date per URL.
-        if canonical not in out or lc_date > out[canonical]:
-            out[canonical] = lc_date
+        # Keep the most-recent date per URL. Also key by the profile-id
+        # identity key (slug-variant cadence-leak fix) so a slug VARIANT of a
+        # recently-contacted person is caught by the 14-day guard too.
+        keys = {canonical, linkedin_identity_key(url)}
+        for key in keys:
+            if key not in out or lc_date > out[key]:
+                out[key] = lc_date
     # Observability: distinguish the SILENT-BUG fingerprint from a benign quiet
     # window. The bug this fix closed was NULL `canonical_linkedin_url` on every
     # entry → the map keyed on a dead field → always `{}`. The TELL is
@@ -921,13 +930,21 @@ def weekly_finalize_idempotent(
                 prospect_data,
             )
             continue
-        if canonical in recent_map:
+        # Match on the canonical URL or (slug-variant cadence-leak fix) the
+        # profile-id identity key, which bridges slug variants of one person.
+        recent_key = canonical if canonical in recent_map else None
+        if recent_key is None:
+            identity = linkedin_identity_key(prospect_data.get("linkedin_url") or "")
+            if identity != canonical and identity in recent_map:
+                recent_key = identity
+        if recent_key is not None:
             summary["idempotent_skipped"] += 1
             summary["skipped_urls"].append(canonical)
             logger.info(
-                "weekly_finalize_idempotent: skipped %s (last_contact_date=%s "
-                "within %d-day window)",
-                canonical, recent_map[canonical], _RECENT_OUTREACH_WINDOW_DAYS,
+                "weekly_finalize_idempotent: skipped %s (matched %s, "
+                "last_contact_date=%s within %d-day window)",
+                canonical, recent_key, recent_map[recent_key],
+                _RECENT_OUTREACH_WINDOW_DAYS,
             )
             continue
 
@@ -1828,25 +1845,37 @@ def _load_in_list_canonical_urls(
     vendor-neutral `CRMProvider` contract (`bulk_fetch_persons` →
     `{record_id: Record}`, `extract_person_info` → `RecordInfo.linkedin_url`)
     so this stays adapter-agnostic.
+
+    Each URL contributes its canonical form AND (slug-variant cadence-leak
+    fix) its `linkedin_identity_key` — the `li-id:<profile-id>` key when the
+    slug carries a numeric member-id suffix. Slug VARIANTS of the same profile
+    keep that suffix while the name portion drifts, so exact-string dedup
+    alone missed them (a person listed as `dana-quiroga-ramos-mba-70481235`
+    got re-prospected under `dana-q-70481235`).
     """
+    def _add_url(urls: set[str], raw_url: str) -> bool:
+        """Add the canonical form + identity key for one URL; True if usable."""
+        canonical = _canonical_linkedin_url(raw_url) if raw_url else ""
+        if not canonical:
+            return False
+        urls.add(canonical)
+        identity = linkedin_identity_key(raw_url)
+        if identity != canonical:
+            urls.add(identity)
+        return True
+
     urls: set[str] = set()
     need_lookup: set[str] = set()
     for entry in existing_entries:
         entry_url = entry.attributes.get("canonical_linkedin_url") or ""
-        canonical = _canonical_linkedin_url(entry_url) if entry_url else ""
-        if canonical:
-            urls.add(canonical)
-        elif entry.record_id:
+        if not _add_url(urls, entry_url) and entry.record_id:
             need_lookup.add(entry.record_id)
 
     if need_lookup:
         persons = crm.bulk_fetch_persons(need_lookup)
         resolved = 0
         for person in persons.values():
-            url = crm.extract_person_info(person).linkedin_url
-            canonical = _canonical_linkedin_url(url) if url else ""
-            if canonical:
-                urls.add(canonical)
+            if _add_url(urls, crm.extract_person_info(person).linkedin_url):
                 resolved += 1
         # Surface partial under-coverage loudly: a bulk-fetch outage or
         # missing `linkedin` fields silently shrinks the dedup set, letting
@@ -2089,6 +2118,10 @@ def _process_prospects(
         # caused by URL-form drift across percent-encoded accented chars.
         url = _canonical_linkedin_url(prospect_data["linkedin_url"])
         prospect_data["linkedin_url"] = url
+        # Slug-variant cadence-leak fix: the identity key (profile-id when the
+        # slug has one, else the canonical URL) rides along in `seen_urls` so
+        # a slug VARIANT of an already-seen person dedups within the run too.
+        url_identity = linkedin_identity_key(url)
 
         # In-run dedup (PB CSV accumulates across launches).
         #
@@ -2099,12 +2132,13 @@ def _process_prospects(
         # specific than enterprise broad-keyword matches. Tracked via
         # `seen_urls_midmarket` (None when caller hasn't opted in, in which
         # case we preserve the legacy behavior).
-        if url in seen_urls:
+        if url in seen_urls or url_identity in seen_urls:
             summary["duplicates"] += 1
             if (
                 is_midmarket
                 and seen_urls_midmarket is not None
                 and url not in seen_urls_midmarket
+                and url_identity not in seen_urls_midmarket
                 and borderline_stage is not None
             ):
                 if _attio is not None:
@@ -2118,7 +2152,11 @@ def _process_prospects(
                 )
                 if new_result.get("needs_agent_qualification"):
                     for entry in borderline_stage:
-                        if entry["linkedin_url"] == url:
+                        # Identity-key match so a slug VARIANT of the staged
+                        # entry still finds it (slug-variant cadence-leak
+                        # fix) — equal URLs always share an identity key, so
+                        # this subsumes the old exact-URL comparison.
+                        if linkedin_identity_key(entry["linkedin_url"]) == url_identity:
                             entry["persona"] = new_result["persona"]
                             entry["language"] = new_result["language"]
                             entry["score"] = new_result["score"]
@@ -2126,6 +2164,8 @@ def _process_prospects(
                             entry["score_breakdown"] = new_result.get("score_breakdown")
                             entry["scoring_lane"] = new_result.get("scoring_lane")
                             seen_urls_midmarket.add(url)
+                            if url_identity != url:
+                                seen_urls_midmarket.add(url_identity)
                             summary.setdefault("persona_upgraded_to_midmarket", 0)
                             summary["persona_upgraded_to_midmarket"] += 1
                             click.echo(
@@ -2135,8 +2175,12 @@ def _process_prospects(
                             break
             continue
         seen_urls.add(url)
+        if url_identity != url:
+            seen_urls.add(url_identity)
         if is_midmarket and seen_urls_midmarket is not None:
             seen_urls_midmarket.add(url)
+            if url_identity != url:
+                seen_urls_midmarket.add(url_identity)
 
         # PR-25 follow-up: resolve the parent company's industry (CRM lookup,
         # classify-at-ingest when missing) before scoring so the industry
@@ -2239,6 +2283,23 @@ def _process_prospects(
         canonical = _canonical_linkedin_url(prospect_data["linkedin_url"])
         if in_list_canonical_urls and canonical and canonical in in_list_canonical_urls:
             click.echo("      → Already in pipeline (canonical-URL match) — skipping")
+            summary["duplicates"] += 1
+            continue
+        # Slug-variant cadence-leak fix: LinkedIn slug VARIANTS keep the
+        # numeric profile-id suffix while the name portion drifts, so
+        # exact-URL dedup alone missed them (a duplicate DM1 went to a
+        # DM3-complete prospect). `_load_in_list_canonical_urls` seeds
+        # `li-id:` keys; match on them too. `url_identity` was computed at the
+        # loop top and linkedin_url is not reassigned in between.
+        if (
+            in_list_canonical_urls
+            and url_identity != canonical
+            and url_identity in in_list_canonical_urls
+        ):
+            click.echo(
+                "      → Already in pipeline (profile-id match — URL-variant "
+                "slug of an existing entry) — skipping"
+            )
             summary["duplicates"] += 1
             continue
 
@@ -2653,7 +2714,12 @@ def run_weekly_prospecting(
     # (built once from the list itself, resolving URLs the entry doesn't carry
     # via one bulk read) lets _process_prospects skip them deterministically.
     in_list_canonical_urls = _load_in_list_canonical_urls(crm, existing_entries)
-    click.echo(f"  {len(in_list_canonical_urls)} canonical URLs resolved for dedup.\n")
+    # The set holds canonical URLs plus `li-id:` identity keys — say so, or
+    # the count reads as up to 2x the entry count and breaks reconciliation.
+    click.echo(
+        f"  {len(in_list_canonical_urls)} dedup keys "
+        f"(canonical URLs + profile-ids) resolved.\n"
+    )
 
     # Run-start name index for the name+company duplicate gate (PR-241 René
     # RCA). Built ONCE from the pipeline's person records so the per-candidate

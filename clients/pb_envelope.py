@@ -44,6 +44,8 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import unquote
 
+from clients.attio import linkedin_identity_map, resolve_identity_match
+
 if TYPE_CHECKING:
     from datetime import datetime
 
@@ -293,6 +295,16 @@ def parse_send_outcome(
         csv_status: Literal["Message sent", "Skipped", "Error", "Empty"] = "Empty"
         drift_skipped_reason = "pb_returned_no_csv"
     else:
+        # Slug-variant bridge (cadence-leak family). The sender can echo a
+        # profile under its CURRENT slug (`linkedinProfileUrl`) instead of the
+        # slug we queried; an exact-key miss on a delivered DM classes the row
+        # unreported → stage not advanced → the SAME DM re-sends tomorrow
+        # (§3.1 violation). `resolve_identity_match` re-keys such a row to the
+        # requested form via the numeric profile-id — same member id means
+        # same person, so this can never advance a stage for someone else.
+        # (Built here, not before the no-CSV early return, so empty/dry-skip
+        # batches don't pay for a map they never read.)
+        requested_by_id = linkedin_identity_map(requested_urls)
         try:
             reader = csv.DictReader(io.StringIO(csv_text))
             rows_seen = 0
@@ -308,7 +320,10 @@ def parse_send_outcome(
                 if not url:
                     continue
                 status = (row.get("status") or "").strip().lower()
-                key = _normalize_url_for_match(url)
+                norm = _normalize_url_for_match(url)
+                # Keep the CSV form when nothing matches (a stale prior-launch
+                # row), so it stays out of the requested∩sent charge.
+                key = resolve_identity_match(norm, requested_urls, requested_by_id) or norm
                 if status == "message sent":
                     sent_urls.add(key)
                 else:
