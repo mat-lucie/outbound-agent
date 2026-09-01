@@ -1551,6 +1551,7 @@ def email_daily_cmd(dry_run, yes, force_weekend):
     """Daily email drip: send sequenced emails to campaign contacts."""
     from clients.resend_client import ResendClient
     from workflows.email_campaign import run_email_daily
+    from workflows.email_lane_gate import EmailLaneDisabledError, assert_email_lane_enabled
     from workflows.run_lock import (
         EXIT_TEMPFAIL,
         RunLockHeld,
@@ -1559,6 +1560,15 @@ def email_daily_cmd(dry_run, yes, force_weekend):
     )
 
     click.echo("=== Outbound Agent -- Email Daily ===\n")
+
+    # Email-lane kill switch: the drip is disarmed unless armed on purpose.
+    # Checked here (before the lock) so a disarmed run costs nothing and prints
+    # one clear line; run_email_daily re-checks for programmatic callers.
+    try:
+        assert_email_lane_enabled("email-daily", dry_run=dry_run)
+    except EmailLaneDisabledError as exc:
+        click.echo(f"ABORT: {exc}", err=True)
+        raise SystemExit(1) from exc
 
     # email-wave2 shares this namespace — both write contact email state
     # and must mutually exclude. See cli.py::email_wave2_cmd.
@@ -1602,6 +1612,7 @@ def email_unsubscribe_cmd(email):
 def email_wave2_cmd(dry_run, yes, force_weekend, max_n):
     """Wave-2 re-engage blast: send a fresh email to contacts stalled mid-sequence."""
     from clients.resend_client import ResendClient
+    from workflows.email_lane_gate import EmailLaneDisabledError, assert_email_lane_enabled
     from workflows.run_lock import (
         EXIT_TEMPFAIL,
         RunLockHeld,
@@ -1611,6 +1622,15 @@ def email_wave2_cmd(dry_run, yes, force_weekend, max_n):
     from workflows.wave2_blast import run_wave2_blast
 
     click.echo("=== Outbound Agent -- Wave 2 Blast ===\n")
+
+    # Email-lane kill switch: the drip is disarmed unless armed on purpose.
+    # Checked here (before the lock) so a disarmed run costs nothing and prints
+    # one clear line; run_wave2_blast re-checks for programmatic callers.
+    try:
+        assert_email_lane_enabled("email-wave2", dry_run=dry_run)
+    except EmailLaneDisabledError as exc:
+        click.echo(f"ABORT: {exc}", err=True)
+        raise SystemExit(1) from exc
 
     # Shares the sales-email-daily namespace with `email-daily` — both
     # write contact email state and must mutually exclude. Concurrent

@@ -37,6 +37,7 @@ from workflows.email_compliance import (
     list_unsubscribe_header,
     mark_sent,
 )
+from workflows.email_lane_gate import assert_email_lane_enabled
 from workflows.email_sequencer import get_pending_email, is_weekday
 
 # LinkedIn pipeline stages that count as "active" for anti-collision
@@ -245,6 +246,10 @@ def run_email_daily(
 
     Returns summary dict.
     """
+    # Kill switch first — before the weekday return, before any CRM read.
+    # A disarmed live run must abort loudly, not exit 0 as "weekend".
+    assert_email_lane_enabled("email-daily", dry_run=dry_run)
+
     today = date.today()
 
     if not is_weekday(today) and not force_weekend:

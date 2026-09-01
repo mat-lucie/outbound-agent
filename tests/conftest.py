@@ -317,6 +317,20 @@ def _isolate_llm_dispatch_dirs(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _arm_email_lane(monkeypatch):
+    """Arm the email kill switch for the suite.
+
+    ``OUTBOUND_EMAIL_ENABLED`` ships UNSET (the drip senders are disarmed by
+    default — see workflows/email_lane_gate.py). The email send-path tests
+    predate the switch and deliberately exercise live-send branches against
+    mocks, so arm it here rather than editing every one of them. Tests that
+    assert the gate itself delete the var in their own scope
+    (tests/test_email_lane_gate.py).
+    """
+    monkeypatch.setenv("OUTBOUND_EMAIL_ENABLED", "1")
+
+
+@pytest.fixture(autouse=True)
 def _email_compliance_baseline_env(monkeypatch):
     """Give the suite a compliant email baseline so the CAN-SPAM send-gate
     (workflows.email_compliance.assert_email_compliance_ready) doesn't block the
