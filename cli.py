@@ -1592,14 +1592,26 @@ def email_daily_cmd(dry_run, yes, force_weekend):
 @cli.command("email-unsubscribe")
 @click.argument("email")
 def email_unsubscribe_cmd(email):
-    """Honor an opt-out: mark a contact UNSUBSCRIBED so they're never emailed again."""
-    from workflows.email_compliance import unsubscribe_email
+    """Honor an opt-out: mark ALL contacts with this email UNSUBSCRIBED so the
+    email campaign never sends to them again."""
+    from workflows.email_compliance import UNSUBSCRIBE_LOOKUP_LIMIT, unsubscribe_email
 
     click.echo("=== Outbound Agent -- Email Unsubscribe ===\n")
     with _attio_client() as attio:
-        record_id = unsubscribe_email(attio, email)
-    if record_id:
-        click.echo(f"  Unsubscribed {email} (record {record_id}). They will not be emailed again.")
+        updated, maybe_more = unsubscribe_email(attio, email)
+    if updated:
+        click.echo(
+            f"  Unsubscribed {email}: {len(updated)} record(s) marked "
+            f"UNSUBSCRIBED ({', '.join(updated)}). The email campaign will not "
+            f"send to them again."
+        )
+        if maybe_more:
+            click.echo(
+                f"  ⚠ The lookup hit the {UNSUBSCRIBE_LOOKUP_LIMIT}-record cap — "
+                f"more duplicate records for {email} may exist. Dedupe the "
+                f"workspace and re-run to be certain all are covered.",
+                err=True,
+            )
     else:
         click.echo(f"  No contact found with email {email}. Nothing to do.")
 

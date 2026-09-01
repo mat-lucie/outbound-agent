@@ -13,9 +13,11 @@ a valid physical postal address. This module centralizes those requirements:
   * ``append_footer`` — appends the visible CAN-SPAM footer (sender org +
     physical address + opt-out line) and returns both the HTML body and a
     plaintext alternative.
-  * sent-ledger (``already_sent``/``mark_sent``) — a local append-only record so
-    a crash between the provider send and the CRM stage write does not re-send
-    the same email on the next run.
+  * sent-ledger (``already_sent``/``mark_sent``) — a local record (rewritten
+    atomically on each ``mark_sent``) so a crash between the provider send and
+    the CRM stage write does not re-send the same email on the next run. A
+    corrupt/unreadable ledger fails loud and BLOCKS live sends (dry-run exempt)
+    rather than silently treating history as empty and re-emailing everyone.
 
 Env config (read at call time so tests can monkeypatch; consistent with the
 existing env-only EMAIL_FROM/EMAIL_REPLY_TO):
@@ -34,7 +36,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from html import unescape
+from html import escape, unescape
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -46,6 +48,12 @@ class ComplianceError(Exception):
     """Raised when a live email send would violate a compliance requirement
     (e.g. no physical postal address configured). Always fails loud — never a
     silent send of a non-compliant message."""
+
+
+class LedgerCorruptError(ComplianceError):
+    """Raised when the email sent-ledger exists but can't be parsed. Blocks
+    live sends (dry-run exempt): an unreadable ledger must never be treated as
+    empty history, which would re-email every contact in the crash window."""
 
 
 # ── Env-backed config (read live) ────────────────────────────────────────────
@@ -81,8 +89,17 @@ def _sender_org() -> str:
 
 def assert_email_compliance_ready(*, dry_run: bool = False) -> None:
     """Fail loud before a LIVE email send if a hard compliance requirement is
-    unmet. Currently: a physical postal address (CAN-SPAM). ``dry_run`` is
-    exempt so an operator can preview without configuring everything first."""
+    unmet. ``dry_run`` is exempt so an operator can preview without configuring
+    everything first. Enforced (all must hold for a live send):
+
+      * a physical postal address (CAN-SPAM) — EMAIL_PHYSICAL_ADDRESS;
+      * a resolvable sender org so the footer never ships the literal
+        ``[EMAIL_SENDER_ORG not set]`` placeholder;
+      * an unsubscribe address so the List-Unsubscribe header + footer opt-out
+        actually reach an inbox — EMAIL_UNSUBSCRIBE_MAILTO or EMAIL_REPLY_TO;
+      * a readable sent-ledger — a corrupt ledger blocks live sends so a
+        crash-window contact is never re-emailed against evaporated history.
+    """
     if dry_run:
         return
     if not _physical_address():
@@ -92,6 +109,23 @@ def assert_email_compliance_ready(*, dry_run: bool = False) -> None:
             "EMAIL_PHYSICAL_ADDRESS in your .env before sending live, or use "
             "--dry-run to preview."
         )
+    if not _sender_org():
+        raise ComplianceError(
+            "Sender org is empty. The footer would ship the literal "
+            "'[EMAIL_SENDER_ORG not set]' placeholder. Set EMAIL_SENDER_ORG "
+            "(or a display-named EMAIL_FROM like 'Acme <hi@acme.com>') "
+            "before sending live, or use --dry-run to preview."
+        )
+    if list_unsubscribe_header() is None:
+        raise ComplianceError(
+            "No unsubscribe address configured. Every commercial email must "
+            "carry a working opt-out (RFC 2369 List-Unsubscribe + footer). Set "
+            "EMAIL_UNSUBSCRIBE_MAILTO (or EMAIL_REPLY_TO) before sending live, "
+            "or use --dry-run to preview."
+        )
+    # Probe the ledger so corruption fails HERE (before any send) rather than
+    # per-contact deep in the loop. Raises LedgerCorruptError on a bad file.
+    _load_ledger()
 
 
 # ── List-Unsubscribe header ──────────────────────────────────────────────────
@@ -117,14 +151,24 @@ def list_unsubscribe_header() -> dict[str, str] | None:
 def build_footer() -> tuple[str, str]:
     """Return ``(html_footer, text_footer)`` carrying the sender org, physical
     address, and opt-out line. When the address is unset (dry-run preview), a
-    visible placeholder is rendered so the operator notices it's missing."""
+    visible placeholder is rendered so the operator notices it's missing.
+
+    Language-neutral copy: the opt-out line pairs the English "reply with
+    UNSUBSCRIBE" with the Spanish "responde UNSUBSCRIBE", so ES/EN prospects
+    both get an intelligible instruction (the keyword itself stays constant so
+    the operator's inbox filter can match it)."""
     org = _sender_org() or "[EMAIL_SENDER_ORG not set]"
     addr = _physical_address() or "[EMAIL_PHYSICAL_ADDRESS not set]"
-    optout = "Reply with UNSUBSCRIBE to stop receiving these emails."
+    optout = (
+        "Reply with UNSUBSCRIBE to stop receiving these emails. "
+        "Responde UNSUBSCRIBE para no recibir más correos."
+    )
+    # Escape org/addr for the HTML part: a legitimate "&" in an address (e.g.
+    # "Smith & Co, 1 Main St") would otherwise render as a broken entity.
     html = (
         '<hr style="border:none;border-top:1px solid #ddd;margin:24px 0 12px">'
         '<p style="color:#888;font-size:12px;line-height:1.5">'
-        f"{org}<br>{addr}<br>{optout}</p>"
+        f"{escape(org)}<br>{escape(addr)}<br>{optout}</p>"
     )
     text = f"\n\n--\n{org}\n{addr}\n{optout}"
     return html, text
@@ -178,8 +222,20 @@ def _load_ledger() -> dict[str, str]:
     try:
         with open(LEDGER_FILE) as f:
             data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
+        # Legitimate first run: no ledger yet → empty history.
         return {}
+    except json.JSONDecodeError as exc:
+        # NOT recoverable as {}: silently treating a corrupt ledger as empty
+        # history re-sends every crash-window contact. Fail loud and block.
+        raise LedgerCorruptError(
+            f"Email sent-ledger at {LEDGER_FILE} is corrupt and cannot be "
+            f"parsed ({exc}). Live email sends are BLOCKED until it is repaired "
+            f"or removed: this file is the only record of which contacts were "
+            f"already emailed, and sending with it unreadable risks re-emailing "
+            f"everyone in the crash window. Inspect the file, fix or delete it, "
+            f"then re-run. (--dry-run does not touch the ledger and is exempt.)"
+        ) from exc
     return data if isinstance(data, dict) else {}
 
 
@@ -193,39 +249,56 @@ def already_sent(record_id: str, step: str) -> bool:
 def mark_sent(record_id: str, step: str, day: date) -> None:
     """Record ``(record_id, step)`` in the sent-ledger (value = send date for
     audit). Call IMMEDIATELY after the provider send returns and BEFORE the CRM
-    stage write, so a crash in between never causes a re-send on any later run."""
+    stage write, so a crash in between never causes a re-send on any later run.
+
+    Rewrites the whole ledger atomically (write to a temp file in the same dir,
+    fsync, then ``os.replace``) so an interrupted write can never leave a
+    truncated/corrupt ledger — which would otherwise trip the fail-loud gate."""
     LEDGER_DIR.mkdir(parents=True, exist_ok=True)
     ledger = _load_ledger()
     ledger[_ledger_key(record_id, step)] = day.isoformat()
-    with open(LEDGER_FILE, "w") as f:
+    tmp = LEDGER_FILE.with_name(LEDGER_FILE.name + ".tmp")
+    with open(tmp, "w") as f:
         json.dump(ledger, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, LEDGER_FILE)
 
 
 # ── Honoring opt-outs ─────────────────────────────────────────────────────────
 
 
-def unsubscribe_email(attio, email: str) -> str | None:
-    """Mark the Person with ``email`` as ``email_campaign_stage=UNSUBSCRIBED``.
+UNSUBSCRIBE_LOOKUP_LIMIT = 100
+
+
+def unsubscribe_email(
+    attio, email: str, *, limit: int = UNSUBSCRIBE_LOOKUP_LIMIT
+) -> tuple[list[str], bool]:
+    """Mark ALL Persons with ``email`` as ``email_campaign_stage=UNSUBSCRIBED``.
 
     The operator's way to honor an opt-out (e.g. a reply to the List-Unsubscribe
     mailto, or a manual request). An UNSUBSCRIBED contact is excluded from
     ``ACTIVE_STAGES`` and the send loops' explicit skip, so they are never
     emailed again. Idempotent (re-setting UNSUBSCRIBED is a no-op write).
 
-    Returns the updated Person ``record_id``, or ``None`` if no Person matches.
+    CRM workspaces routinely carry duplicate person records, so more than one
+    Person can share an address — updating only the first match would leave a
+    duplicate still emailable. Every match is updated.
+
+    Returns ``(updated_record_ids, maybe_more)`` where ``maybe_more`` is True
+    when the search returned exactly ``limit`` rows (there may be further
+    duplicates beyond the lookup cap). ``updated_record_ids`` is empty when no
+    Person matches.
     """
     from models.email_campaign import EmailStage
 
-    results = attio.search_people(filter_={"email_addresses": email}, limit=5)
-    record_id = ""
+    results = attio.search_people(filter_={"email_addresses": email}, limit=limit)
+    updated: list[str] = []
     for record in results:
         rid = record.get("id", {}).get("record_id", "")
         if rid:
-            record_id = rid
-            break
-    if not record_id:
-        return None
-    attio.update_person(
-        record_id, {"email_campaign_stage": EmailStage.UNSUBSCRIBED.value}
-    )
-    return record_id
+            attio.update_person(
+                rid, {"email_campaign_stage": EmailStage.UNSUBSCRIBED.value}
+            )
+            updated.append(rid)
+    return updated, len(results) >= limit

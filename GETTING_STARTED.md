@@ -416,13 +416,20 @@ Read this before sending anything for real:
   account restricted or banned. The engine has per-day caps as a safety measure,
   but you accept that risk by running it.
 - **The email path is compliance-*capable*, but you must configure + operate it.**
-  The engine enforces cross-channel suppression on send, refuses to send live
-  without `EMAIL_PHYSICAL_ADDRESS` (CAN-SPAM postal address), appends a footer
-  with that address + an opt-out line, and emits a `List-Unsubscribe` mailto
-  header (one-click in Gmail/Outlook → your `EMAIL_UNSUBSCRIBE_MAILTO` inbox).
+  The engine enforces cross-channel suppression on send; refuses to send live
+  without a CAN-SPAM postal address (`EMAIL_PHYSICAL_ADDRESS`), a resolvable
+  sender org, or a configured unsubscribe address; appends a footer with the
+  address + a bilingual (EN/ES) opt-out line; and emits a `List-Unsubscribe`
+  mailto header (one-click in Gmail/Outlook → your `EMAIL_UNSUBSCRIBE_MAILTO`
+  inbox). It also refuses to send live if the local sent-ledger
+  (`~/.outbound-agent/email_sent.json`) is corrupt, rather than treating an
+  unreadable ledger as empty history and re-emailing the crash window.
+  Separately, the drip senders (`email-daily`, `email-wave2`) are **disarmed by
+  default** — set `OUTBOUND_EMAIL_ENABLED=1` to arm a live send.
   **Your responsibilities:** set the email env vars (`EMAIL_PHYSICAL_ADDRESS`,
-  `EMAIL_FROM`, `EMAIL_UNSUBSCRIBE_MAILTO`); **monitor the unsubscribe inbox** and
-  run `sales email-unsubscribe <email>` to honor each opt-out promptly. **Optional
+  `EMAIL_FROM`, `EMAIL_SENDER_ORG`, `EMAIL_UNSUBSCRIBE_MAILTO`); **monitor the
+  unsubscribe inbox** and run `sales email-unsubscribe <email>` to honor each
+  opt-out promptly (it marks every person record sharing that address). **Optional
   operator infra for full automation** (not shipped — you stand it up): a hosted
   one-click unsubscribe HTTP endpoint (RFC 8058 `List-Unsubscribe-Post`) and a
   Resend bounce/complaint webhook that flips contacts to UNSUBSCRIBED. Until you

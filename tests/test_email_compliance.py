@@ -9,9 +9,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from clients.resend_client import ResendClient
+from workflows import email_compliance
 from workflows.email_campaign import run_email_daily
 from workflows.email_compliance import (
     ComplianceError,
+    LedgerCorruptError,
     already_sent,
     append_footer,
     assert_email_compliance_ready,
@@ -82,9 +84,44 @@ def test_gate_dry_run_exempt(monkeypatch):
     assert_email_compliance_ready(dry_run=True)  # must not raise
 
 
-def test_gate_passes_with_address():
-    # conftest._email_compliance_baseline_env sets EMAIL_PHYSICAL_ADDRESS.
+def test_gate_passes_with_full_config():
+    # conftest._email_compliance_baseline_env sets address + sender org +
+    # unsubscribe mailto; the ledger tmp file doesn't exist yet (→ empty).
     assert_email_compliance_ready(dry_run=False)  # must not raise
+
+
+def test_gate_raises_without_unsubscribe_address(monkeypatch):
+    # A live send needs a working opt-out. Remove both the mailto and the
+    # reply-to fallback so list_unsubscribe_header() returns None.
+    monkeypatch.delenv("EMAIL_UNSUBSCRIBE_MAILTO", raising=False)
+    monkeypatch.delenv("EMAIL_REPLY_TO", raising=False)
+    with pytest.raises(ComplianceError, match="unsubscribe"):
+        assert_email_compliance_ready(dry_run=False)
+
+
+def test_gate_raises_on_unresolvable_sender_org(monkeypatch):
+    # _sender_org() must resolve non-empty or the footer ships the literal
+    # placeholder. Clear the explicit org AND the EMAIL_FROM fallback.
+    monkeypatch.delenv("EMAIL_SENDER_ORG", raising=False)
+    monkeypatch.delenv("EMAIL_FROM", raising=False)
+    with pytest.raises(ComplianceError, match="[Ss]ender org"):
+        assert_email_compliance_ready(dry_run=False)
+
+
+def test_gate_blocks_live_send_on_corrupt_ledger():
+    # A corrupt ledger must fail loud on a live send (not silently reset to
+    # empty history, which would re-email the crash window).
+    email_compliance.LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    email_compliance.LEDGER_FILE.write_text("{ this is not valid json")
+    with pytest.raises(LedgerCorruptError, match="corrupt"):
+        assert_email_compliance_ready(dry_run=False)
+
+
+def test_gate_corrupt_ledger_dry_run_exempt():
+    # dry-run never touches the ledger, so a corrupt file must NOT block it.
+    email_compliance.LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    email_compliance.LEDGER_FILE.write_text("{ this is not valid json")
+    assert_email_compliance_ready(dry_run=True)  # must not raise
 
 
 # ── List-Unsubscribe header ──────────────────────────────────────────────────
@@ -121,6 +158,28 @@ def test_footer_contains_org_address_optout(monkeypatch):
         assert "UNSUBSCRIBE" in blob.upper()
 
 
+def test_footer_html_escapes_org_and_address(monkeypatch):
+    # A legitimate "&" in an org/address must not render as a broken entity in
+    # the HTML part — but the plaintext part stays literal.
+    monkeypatch.setenv("EMAIL_SENDER_ORG", "Smith & Co")
+    monkeypatch.setenv("EMAIL_PHYSICAL_ADDRESS", "1 Main St <Suite 2>, Townsville")
+    html, text = build_footer()
+    assert "Smith &amp; Co" in html
+    assert "&lt;Suite 2&gt;" in html
+    assert "Smith & Co" in text
+    assert "1 Main St <Suite 2>, Townsville" in text
+
+
+def test_footer_optout_line_is_bilingual(monkeypatch):
+    # ES/EN prospects both get an intelligible instruction; the UNSUBSCRIBE
+    # keyword stays constant so an inbox filter can match it.
+    monkeypatch.setenv("EMAIL_PHYSICAL_ADDRESS", "1 Main St")
+    html, text = build_footer()
+    for blob in (html, text):
+        assert "Reply with UNSUBSCRIBE" in blob
+        assert "Responde UNSUBSCRIBE" in blob
+
+
 def test_html_to_text_strips_tags_and_keeps_breaks():
     out = html_to_text("<p>Hello &amp; welcome</p><br><p>Line two</p>")
     assert "Hello & welcome" in out
@@ -151,23 +210,75 @@ def test_ledger_roundtrip():
     assert already_sent("rY", "email1")
 
 
+def test_mark_sent_writes_atomically_no_tmp_left_behind():
+    # mark_sent must write via a temp file + os.replace so an interrupted
+    # write can't corrupt the ledger. After a clean write, the ledger exists and
+    # no stray .tmp remains.
+    mark_sent("rZ", "email1", date(2026, 4, 7))
+    ledger = email_compliance.LEDGER_FILE
+    assert ledger.exists()
+    tmp = ledger.with_name(ledger.name + ".tmp")
+    assert not tmp.exists()
+    # And the file is valid JSON (not truncated).
+    import json
+
+    assert json.loads(ledger.read_text())["rZ|email1"] == "2026-04-07"
+
+
+def test_already_sent_fails_loud_on_corrupt_ledger():
+    # The low-level load must raise, not silently return {}.
+    email_compliance.LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    email_compliance.LEDGER_FILE.write_text("]not json[")
+    with pytest.raises(LedgerCorruptError, match="corrupt"):
+        already_sent("rX", "email1")
+
+
 # ── unsubscribe_email ────────────────────────────────────────────────────────
 
 
 def test_unsubscribe_email_sets_stage():
     attio = MagicMock()
     attio.search_people.return_value = [{"id": {"record_id": "r9"}}]
-    rid = unsubscribe_email(attio, "x@y.com")
-    assert rid == "r9"
+    updated, maybe_more = unsubscribe_email(attio, "x@y.com")
+    assert updated == ["r9"]
+    assert maybe_more is False
     attio.update_person.assert_called_once_with(
         "r9", {"email_campaign_stage": "unsubscribed"}
     )
 
 
+def test_unsubscribe_email_updates_all_duplicates():
+    # CRM workspaces routinely carry duplicate person records — every match
+    # must be updated, not just the first.
+    attio = MagicMock()
+    attio.search_people.return_value = [
+        {"id": {"record_id": "r1"}},
+        {"id": {"record_id": "r2"}},
+        {"id": {"record_id": ""}},  # malformed → skipped, no blind update
+        {"id": {"record_id": "r3"}},
+    ]
+    updated, maybe_more = unsubscribe_email(attio, "dup@y.com")
+    assert updated == ["r1", "r2", "r3"]
+    assert maybe_more is False
+    assert attio.update_person.call_count == 3
+
+
+def test_unsubscribe_email_flags_maybe_more_at_limit():
+    # When the search returns exactly `limit` rows, more duplicates may exist
+    # beyond the cap — signal it so the CLI can warn.
+    attio = MagicMock()
+    attio.search_people.return_value = [{"id": {"record_id": f"r{i}"}} for i in range(3)]
+    updated, maybe_more = unsubscribe_email(attio, "many@y.com", limit=3)
+    assert len(updated) == 3
+    assert maybe_more is True
+
+
 def test_unsubscribe_email_not_found():
     attio = MagicMock()
     attio.search_people.return_value = []
-    assert unsubscribe_email(attio, "no@one.com") is None
+    updated, maybe_more = unsubscribe_email(attio, "no@one.com")
+    assert updated == []
+    assert maybe_more is False
     attio.update_person.assert_not_called()
 
 

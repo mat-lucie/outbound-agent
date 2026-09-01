@@ -336,12 +336,14 @@ def _email_compliance_baseline_env(monkeypatch):
     (workflows.email_compliance.assert_email_compliance_ready) doesn't block the
     many existing live-send tests, which legitimately exercise the send path.
 
-    Sets a test physical address (the one hard gate). Tests that verify the
-    gate's fail-loud behavior delenv this in their own scope (monkeypatch
-    restores it afterward). Other compliance config (sender org, unsubscribe
-    mailto) is intentionally left unset so tests opt into it explicitly.
+    Sets the three hard gates (physical address, resolvable sender org,
+    unsubscribe address). Tests that verify the gate's fail-loud behavior
+    delenv the specific var in their own scope (monkeypatch restores it
+    afterward).
     """
     monkeypatch.setenv("EMAIL_PHYSICAL_ADDRESS", "123 Test St, Test City, TC 00000")
+    monkeypatch.setenv("EMAIL_SENDER_ORG", "Test Org")
+    monkeypatch.setenv("EMAIL_UNSUBSCRIBE_MAILTO", "unsubscribe@example.com")
 
 
 @pytest.fixture(autouse=True)
