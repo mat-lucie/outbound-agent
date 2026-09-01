@@ -23,12 +23,11 @@ from clients.pb_envelope import (
     INVITE_OPTIMISTIC_ADVANCE,
     PBRunFailed,
     PBRunTimeout,
-    compute_invite_outcome,
     has_scraper_dedup_marker,
-    parse_send_outcome,
     should_advance_batch,
 )
 from clients.phantombuster import PhantomBusterClient
+from clients.sender import PBSender
 from models.business_calendar import business_days_between, operator_today
 from models.campaign import (
     DM_STEP_NUMBER,
@@ -2415,11 +2414,17 @@ def run_connection_requests(
     today: date | None = None,
     *,
     daily_run: DailyRun,
+    sender: PBSender | None = None,
 ) -> dict:
     """Part A: Send connection requests to qualified prospects.
 
     `cache` may be supplied by the caller to reuse person records pre-fetched
     by earlier phases; if None, a fresh cache is built.
+
+    ``sender``: injected transport (sender seam). Defaults to a ``PBSender``
+    built from ``pb`` + this module's sheet/session helpers, preserving the
+    pre-seam inline flow exactly. PhantomBuster owns invites — no alternative
+    invite transport is wired into this path.
 
     Returns summary dict with counts.
     """
@@ -2715,10 +2720,23 @@ def run_connection_requests(
         click.echo("Cancelled.")
         return {"sent": 0, "pb_queued": len(to_send_data), "rechecked": 0, "cancelled": True, "skipped_low_score": skipped_low_score}
 
-    # Write combined batch to Google Sheet and launch phantom.
-    sheet_url = write_prospects_to_sheet(combined)
-    click.echo(f"  Wrote {len(combined)} rows to Google Sheet.")
-    launch_args = {"spreadsheetUrl": sheet_url, **_pb_session_args()}
+    # Sender seam: the transport hop (sheet write → Network Booster launch →
+    # wait → result CSV → parse + invite-outcome override) lives in
+    # PBSender.launch_invite_batch — same calls, same args. The module-namespace
+    # helpers are passed at construction so test patches on this module's
+    # `write_prospects_to_sheet` / `_pb_session_args` keep binding.
+    if sender is None:
+        sender = PBSender(
+            pb,
+            network_booster_id=network_booster_id,
+            write_sheet=write_prospects_to_sheet,
+            session_args=_pb_session_args,
+        )
+    requested_urls_for_send = {
+        _normalize_linkedin_url(row["linkedInUrl"])
+        for row in to_send_data
+        if row.get("linkedInUrl")
+    }
     # Split-brain fix (port of upstream #182): mirror of the Part-B DM lease
     # (PR-17 B-SD-006). Reserve capacity on the daily_run row BEFORE PB is
     # touched; confirm with the actual charge (sent_for_cap / re-check count)
@@ -2738,44 +2756,21 @@ def run_connection_requests(
     try:
         if recheck_data:
             visit_lease = daily_run.reserve_send("visits", len(recheck_data))
-        launch = pb.launch_agent(network_booster_id, launch_args)
-        # Block until the phantom finishes — prevents workspace parallel-execution
-        # cap when the next phantom (Message Sender) launches in Part B.
-        completion = pb.wait_for_completion(
-            launch, poll_interval=15, max_wait=1800
-        )
-
-        # F-PR-5 advance gate. Network Booster's CSV reports per-URL send status
-        # the same way Message Sender does. Parse the outcome, then either
-        # advance the rows PB confirmed OR take the dry-skip path with a
-        # `pb_silent_no_op` queue row.
-        csv_text = pb.download_result_csv(launch)
-        requested_urls_for_send = {
-            _normalize_linkedin_url(row["linkedInUrl"])
-            for row in to_send_data
-            if row.get("linkedInUrl")
-        }
-        outcome = parse_send_outcome(
-            launch=launch,
-            completion=completion,
-            csv_text=csv_text,
-            requested_urls=requested_urls_for_send,
-        )
-        # Network Booster (invite) override: its result.csv is unreliable for
-        # per-run send confirmation (no `status` column, accumulates stale rows),
-        # so the parsed outcome is always Skipped/0 and the gate never advanced
-        # invites — they re-queued forever and Phase 0 never watched for accepts.
-        # A clean authenticated launch optimistically advances all requested
-        # invites; a dead-cookie / cap / restriction launch stays Skipped →
-        # pb_silent_no_op. (DM sequencing keeps the strict CSV gate — its
-        # `status` column is reliable.) Because the override flips csv_status to
-        # "Message sent" with sent_urls = all requested, the standard per-row
-        # advance branch below runs and sets sent_for_cap = outcome.sent_count
-        # (= optimistically-advanced count); a cap-blocked launch leaves the
-        # outcome Skipped → gate-fail branch → sent_for_cap = 0. The connections
-        # lease then confirms with that value, so the cap charge matches the
-        # rows actually advanced.
-        outcome = compute_invite_outcome(outcome, completion, requested_urls_for_send)
+        # F-PR-5 advance gate feed. Network Booster's CSV reports per-URL send
+        # status the same way Message Sender does. The sender parses the
+        # outcome (invite override included — its result.csv is unreliable for
+        # per-run send confirmation, so a clean authenticated launch
+        # optimistically advances all requested invites while a dead-cookie /
+        # cap / restriction launch stays Skipped); below we either advance the
+        # rows PB confirmed OR take the dry-skip path with a `pb_silent_no_op`
+        # queue row. Because the override flips csv_status to "Message sent"
+        # with sent_urls = all requested, the standard per-row advance branch
+        # below runs and sets sent_for_cap = outcome.sent_count; a cap-blocked
+        # launch leaves the outcome Skipped → gate-fail branch →
+        # sent_for_cap = 0, so the cap charge matches the rows advanced.
+        pb_result = sender.launch_invite_batch(combined, requested_urls_for_send)
+        launch = pb_result.launch
+        outcome = pb_result.outcome
         if outcome.drift_skipped_reason == INVITE_OPTIMISTIC_ADVANCE:
             click.echo(
                 f"  ↪ Advancing {outcome.sent_count} invite(s) OPTIMISTICALLY — "
@@ -3257,8 +3252,14 @@ def run_dm_sequencing(
     audit_logger: AuditLogger | None = None,
     exclude_ids: set[str] | None = None,
     metrics: Any = None,
+    sender: PBSender | None = None,
 ) -> dict:
     """Part B: Send DMs to accepted connections based on timing.
+
+    ``sender``: injected transport (sender seam). Defaults to a ``PBSender``
+    built from ``pb`` + this module's sheet/session helpers, preserving the
+    pre-seam inline flow exactly. All DMs send via PhantomBuster's Message
+    Sender — PB owns sending.
 
     ``exclude_ids`` (PR-237) is a per-run operator exclusion set — entry_id
     or record_id strings dropped from BOTH the wet queue and the dry-run
@@ -3740,6 +3741,19 @@ def run_dm_sequencing(
         )
 
     _t_phase = phase_timer()
+    # Sender seam: one launch's transport hop (sheet write → Message Sender
+    # launch → wait → result CSV → parse) lives in PBSender.launch_dm_batch —
+    # same calls, same args. The per-step leases and advance loops stay here.
+    # The module-namespace helpers are passed at construction so test patches
+    # on this module's `write_prospects_to_sheet` / `_pb_session_args` keep
+    # binding.
+    if sender is None:
+        sender = PBSender(
+            pb,
+            message_sender_id=message_sender_id,
+            write_sheet=write_prospects_to_sheet,
+            session_args=_pb_session_args,
+        )
     for step, queue in dm_queues.items():
         if not queue:
             continue
@@ -3954,13 +3968,10 @@ def run_dm_sequencing(
             results["dry_run"][step.value] = len(rows)
             continue
 
-        # Write DM batch to Google Sheet and launch phantom
-        sheet_url = write_prospects_to_sheet(rows)
-        click.echo(f"  Wrote {len(rows)} {step.value} messages to Google Sheet.")
-        launch_args = {
-            "spreadsheetUrl": sheet_url,
-            "message": "#message#",  # per-row from sheet column
-            **_pb_session_args(),
+        requested_urls = {
+            _normalize_linkedin_url(row["linkedInUrl"])
+            for row in rows
+            if row.get("linkedInUrl")
         }
         # PR-17 B-SD-006: reserve capacity BEFORE PB is touched. The lease
         # captures the intent ("we are about to send N"); the post-launch
@@ -3971,75 +3982,64 @@ def run_dm_sequencing(
         # daily_run counter between trim and reserve) and must propagate.
         lease_token: str | None = daily_run.reserve_send("messages", len(rows))
         # PR-17 fold-in (5/6 QA convergence): try/finally spans the ENTIRE
-        # reserve → confirm region so any exception between launch and
-        # confirm (PBRunFailed/PBRunTimeout from wait_for_completion, raise
-        # from download_result_csv, ValueError/KeyError from
+        # reserve → confirm region so any exception between the sheet write
+        # and confirm (PBRunFailed/PBRunTimeout from wait_for_completion,
+        # raise from download_result_csv, ValueError/KeyError from
         # parse_send_outcome) releases the lease. Prior code only guarded
         # pb.launch_agent — a wait_for_completion timeout (max_wait=1800)
         # would have left the reservation permanently held for the rest of
         # the run, silencing DM2/DM3 batches (§3.1 quota leak).
         try:
-            # F-PR-5: typed launch + raises-on-error wait. PBRunFailed
-            # bubbles up so the operator sees the failure instead of
-            # silently skipping the batch.
-            launch = pb.launch_agent(message_sender_id, launch_args)
-            # Block until this DM batch finishes before launching the next
-            # step (or anything else) — avoids PB workspace parallel cap.
-            completion = pb.wait_for_completion(
-                launch, poll_interval=15, max_wait=1800
-            )
-
-            # F-PR-5 advance gate (§3.1 chokepoint). Stage MAY advance iff
-            # csv_status == "Message sent" AND container_id matches THIS
+            # F-PR-5 advance gate feed (§3.1 chokepoint). Stage MAY advance
+            # iff csv_status == "Message sent" AND container_id matches THIS
             # launch AND sent_count >= 1. Prior policy ("advance every
             # queued URL on PB success") was the §3.1 violation by
             # omission — PB silent-drops dropped from "Accepted" Attio
             # to ghost-advance, suppressing tomorrow's re-attempt.
             #
-            # wait_for_completion has returned — PB ran and the DMs in this
-            # batch may have been PHYSICALLY SENT. Any raise from here on
-            # (CSV download, parse, or the confirm_lease PATCH) hits the
-            # `finally` below and REFUNDS the messages lease, leaving the
-            # cap uncharged for sends that actually went out. Mirror Part
-            # A's post-launch charge-failure echo so the abort never looks
-            # like a clean pre-send failure.
-            try:
-                result_csv = pb.download_result_csv(launch)
-                requested_urls = {
-                    _normalize_linkedin_url(row["linkedInUrl"])
-                    for row in rows
-                    if row.get("linkedInUrl")
-                }
-                outcome = parse_send_outcome(
-                    launch=launch,
-                    completion=completion,
-                    csv_text=result_csv,
-                    requested_urls=requested_urls,
-                )
+            # Once the sender's wait_for_completion returns, PB ran and the
+            # DMs in this batch may have been PHYSICALLY SENT. Any raise
+            # from there on (CSV download, parse, or the confirm_lease
+            # PATCH) hits the `finally` below and REFUNDS the messages
+            # lease, leaving the cap uncharged for sends that actually went
+            # out. Mirror Part A's post-launch charge-failure echo so the
+            # abort never looks like a clean pre-send failure. PBRunFailed /
+            # PBRunTimeout are re-raised WITHOUT the echo: PB itself
+            # reported the run failed, so there is no silently-sent batch to
+            # reconcile. (The sheet write + launch now live inside the
+            # sender, so a failure there also takes the echo path — a
+            # conservative false positive, never a missed warning.)
+            pb_result = sender.launch_dm_batch(
+                rows, requested_urls, step_label=step.value
+            )
+            launch = pb_result.launch
+            outcome = pb_result.outcome
 
-                # PR-17 B-SD-006: confirm the lease with PB-reported
-                # sent_count AS SOON AS sent_count is known. Both branches
-                # (advance-pass per-row updates + advance-fail
-                # emit_pb_silent_no_op) charge capacity by what PB actually
-                # sent. Setting lease_token=None tells finally not to
-                # release an already-consumed lease.
-                assert lease_token is not None
-                daily_run.confirm_lease(
-                    lease_token, confirmed_count=outcome.sent_count
-                )
-                lease_token = None
-            except Exception:
-                click.echo(
-                    f"  ❌ ERROR: PB Message Sender launch for {step.value} "
-                    f"completed but post-send processing FAILED (CSV download / "
-                    f"parse / charging the daily_run row). The {len(rows)} DM(s) "
-                    f"in this batch MAY HAVE BEEN PHYSICALLY SENT but are now "
-                    f"UNCHARGED (the messages lease refunds on this abort). "
-                    f"Verify today's sends in the LinkedIn inbox and reconcile the "
-                    f"daily_run messages_sent counter before the next run.",
-                    err=True,
-                )
-                raise
+            # PR-17 B-SD-006: confirm the lease with PB-reported
+            # sent_count AS SOON AS sent_count is known. Both branches
+            # (advance-pass per-row updates + advance-fail
+            # emit_pb_silent_no_op) charge capacity by what PB actually
+            # sent. Setting lease_token=None tells finally not to
+            # release an already-consumed lease.
+            assert lease_token is not None
+            daily_run.confirm_lease(
+                lease_token, confirmed_count=outcome.sent_count
+            )
+            lease_token = None
+        except (PBRunFailed, PBRunTimeout):
+            raise
+        except Exception:
+            click.echo(
+                f"  ❌ ERROR: PB Message Sender launch for {step.value} "
+                f"completed but post-send processing FAILED (CSV download / "
+                f"parse / charging the daily_run row). The {len(rows)} DM(s) "
+                f"in this batch MAY HAVE BEEN PHYSICALLY SENT but are now "
+                f"UNCHARGED (the messages lease refunds on this abort). "
+                f"Verify today's sends in the LinkedIn inbox and reconcile the "
+                f"daily_run messages_sent counter before the next run.",
+                err=True,
+            )
+            raise
         finally:
             # Release the lease only if confirm_lease didn't consume it.
             # The reserve→launch→wait→csv→parse→confirm span can raise at
