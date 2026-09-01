@@ -35,6 +35,7 @@ from workflows.email_compliance import (
     assert_email_compliance_ready,
     list_unsubscribe_header,
 )
+from workflows.email_lane_gate import assert_email_lane_enabled
 from workflows.email_sequencer import is_weekday
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,10 @@ def run_wave2_blast(
     max_n: int = 100,
 ) -> dict:
     """Send the wave-2 re-engage email to mid-sequence stalled contacts."""
+    # Kill switch first — before the weekday return, before any CRM read.
+    # A disarmed live run must abort loudly, not exit 0 as "weekend".
+    assert_email_lane_enabled("email-wave2", dry_run=dry_run)
+
     today = date.today()
 
     if not is_weekday(today) and not force_weekend:

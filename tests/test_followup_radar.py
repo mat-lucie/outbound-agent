@@ -156,15 +156,20 @@ class FakeAttio:
     def __init__(
         self, entries=None, deals=None, active_email_ids=(),
         persons=None, bulk_fetch_exc=None, bulk_fetch_failed=0,
-        terminal_email_ids=(), terminal_fetch_exc=None,
+        declined_ids=(), responded_ids=(),
+        decline_fetch_exc=None, responded_fetch_exc=None,
     ):
         self._entries = entries or []
         self._deals = deals or []
         self._active = set(active_email_ids)
-        # WAITING-lane terminal-email exclusion set; terminal_fetch_exc makes
-        # ONLY the terminal-stage queries raise (fail-closed-for-the-lane test).
-        self._terminal = set(terminal_email_ids)
-        self._terminal_fetch_exc = terminal_fetch_exc
+        # Email-stage exclusion sets: hard declines (radar-wide §3.1
+        # suppression, fail closed-HARD) vs responded (WAITING exclusion +
+        # annotation). Each *_fetch_exc makes ONLY that stage family's
+        # queries raise, so the two failure philosophies test independently.
+        self._declined = set(declined_ids)
+        self._responded = set(responded_ids)
+        self._decline_fetch_exc = decline_fetch_exc
+        self._responded_fetch_exc = responded_fetch_exc
         # v2 person-interaction join: {record_id: raw person record}. The
         # engine's ONE bulk fetch resolves against this; bulk_fetch_exc makes
         # the whole fetch raise, bulk_fetch_failed simulates N per-record
@@ -187,12 +192,16 @@ class FakeAttio:
     def search_deals(self, limit=500, *, fail_if_truncated=False):
         return self._deals
 
-    def search_people(self, filter_=None, limit=0):
+    def search_people(self, filter_=None, limit=0, *, fail_if_truncated=False):
         stage = (filter_ or {}).get("email_campaign_stage")
-        if stage in ("email_responded", "email_not_interested", "unsubscribed"):
-            if self._terminal_fetch_exc is not None:
-                raise self._terminal_fetch_exc
-            return [{"id": {"record_id": rid}} for rid in self._terminal]
+        if stage in ("email_not_interested", "unsubscribed"):
+            if self._decline_fetch_exc is not None:
+                raise self._decline_fetch_exc
+            return [{"id": {"record_id": rid}} for rid in self._declined]
+        if stage == "email_responded":
+            if self._responded_fetch_exc is not None:
+                raise self._responded_fetch_exc
+            return [{"id": {"record_id": rid}} for rid in self._responded]
         return [{"id": {"record_id": rid}} for rid in self._active]
 
     # stage + all five followup_* state slugs → schema preflights pass.
@@ -416,8 +425,15 @@ def test_entry_schema_missing_skips_entries_and_degrades(identity_parsers):
 
 def test_active_email_partial_failure_degrades(identity_parsers):
     class FlakyEmail(FakeAttio):
-        def search_people(self, filter_=None, limit=0):
-            raise RuntimeError("attio 503")
+        def search_people(self, filter_=None, limit=0, *, fail_if_truncated=False):
+            stage = (filter_ or {}).get("email_campaign_stage")
+            # Fail ONLY the active-drip queries — the hard-decline and
+            # responded families have their own failure-philosophy tests.
+            if stage in ("queued", "email1_sent", "email2_sent"):
+                raise RuntimeError("attio 503")
+            return super().search_people(
+                filter_=filter_, limit=limit, fail_if_truncated=fail_if_truncated
+            )
 
     attio = FlakyEmail(entries=[_entry("r1", "Responded", last_contact="2026-06-25")])
     res = detect_candidates(attio, today=TODAY)
@@ -1632,38 +1648,116 @@ def test_waiting_deal_surfaces(identity_parsers):
     assert c.value_mult > 1.0  # deal value still weights urgency
 
 
-def test_waiting_excluded_for_terminal_email_person(identity_parsers):
-    # The entry record_id is a person id in a terminal email stage: no
-    # WAITING row (never nudge a decline) — and no stage row here either
-    # (non-warm stage), so the account surfaces nowhere.
+def test_hard_decline_suppresses_every_lane_for_entry(identity_parsers):
+    # A person who declined/unsubscribed on the EMAIL drip must surface in NO
+    # lane (§3.1: no through any channel) — not WAITING (stamped), not the
+    # stage path (warm "Responded" stage), nothing.
     attio = FakeAttio(
-        entries=[_waiting_entry("w1", since="2026-06-20")],
-        terminal_email_ids={"w1"},
+        entries=[
+            _waiting_entry("w1", since="2026-06-20"),
+            _entry("r1", "Responded", last_contact="2026-05-01"),
+        ],
+        declined_ids={"w1", "r1"},
     )
-    assert detect_candidates(attio, today=TODAY).candidates == []
+    res = detect_candidates(attio, today=TODAY)
+    assert res.candidates == []
+    # Counted, never silent — the empty digest must not read "Radar limpio".
+    assert res.email_declined_suppressed == 2
+    digest = render_digest(
+        [], email_declined_suppressed=res.email_declined_suppressed,
+    )
+    assert "hidden by email hard declines" in digest
+    assert "Radar limpio" not in digest
 
 
-def test_waiting_deal_excluded_when_any_associated_person_terminal(identity_parsers):
+def test_hard_decline_suppresses_deal_via_any_associated_person(identity_parsers):
+    # Any associated person in a hard-decline stage kills the whole deal's
+    # follow-up — WAITING and the stage path alike (over-exclusion is the
+    # fail-closed direction for a company-scoped record).
     attio = FakeAttio(
         deals=[_deal("d1", "In Progress", created="2026-05-01",
                      awaiting_reply_since="2026-06-20",
                      associated_people=["p-ok", "p-no"])],
-        terminal_email_ids={"p-no"},
+        declined_ids={"p-no"},
+    )
+    res = detect_candidates(attio, today=TODAY)
+    assert res.candidates == []
+    assert res.email_declined_suppressed == 1
+
+
+def test_hard_decline_fetch_failure_aborts_detection(identity_parsers):
+    # Fail CLOSED-HARD, like build_suppression_set: a holed decline set could
+    # re-contact a prospect who said no, so the whole run refuses to proceed.
+    attio = FakeAttio(
+        entries=[_entry("r1", "Responded", last_contact="2026-05-01")],
+        decline_fetch_exc=RuntimeError("attio down"),
+    )
+    with pytest.raises(RuntimeError, match="hard-decline"):
+        detect_candidates(attio, today=TODAY)
+
+
+def test_waiting_excluded_for_responded_email_person(identity_parsers):
+    # The entry record_id is a person id in email_responded: no WAITING row
+    # (the wait is over — a human owns the thread) — and no stage row here
+    # either (non-warm stage), so the account surfaces nowhere.
+    attio = FakeAttio(
+        entries=[_waiting_entry("w1", since="2026-06-20")],
+        responded_ids={"w1"},
+    )
+    assert detect_candidates(attio, today=TODAY).candidates == []
+
+
+def test_responded_deal_surfaces_flagged_not_waiting(identity_parsers):
+    attio = FakeAttio(
+        deals=[_deal("d1", "In Progress", created="2026-05-01",
+                     awaiting_reply_since="2026-06-20",
+                     associated_people=["p-ok", "p-yes"])],
+        responded_ids={"p-yes"},
     )
     out = detect_candidates(attio, today=TODAY).candidates
     # Not WAITING; the deal still surfaces via its stage path (In Progress,
-    # created 2026-05-01 → stale) — the terminal check only guards the lane.
-    assert all(c.lane is not WarmLane.WAITING for c in out)
+    # created 2026-05-01 → stale) — annotated so the skill layer renders it
+    # without auto-drafting over the human-owned email thread.
+    assert out and all(c.lane is not WarmLane.WAITING for c in out)
+    assert all(c.email_responded for c in out)
 
 
-def test_waiting_fails_closed_when_terminal_fetch_breaks(identity_parsers):
+def test_responded_entry_surfaces_flagged(identity_parsers):
     attio = FakeAttio(
-        entries=[_waiting_entry("w1", since="2026-06-20")],
-        terminal_fetch_exc=RuntimeError("attio down"),
+        entries=[_entry("r1", "Responded", last_contact="2026-05-01")],
+        responded_ids={"r1"},
+    )
+    out = detect_candidates(attio, today=TODAY).candidates
+    assert len(out) == 1
+    assert out[0].email_responded is True
+    # The flag flows to the skill layer (JSON) and the operator (digest row).
+    assert to_json(out)[0]["email_responded"] is True
+    assert "replied by email" in render_digest(out)
+    # A clean row stays unflagged.
+    clean = detect_candidates(
+        FakeAttio(entries=[_entry("r1", "Responded", last_contact="2026-05-01")]),
+        today=TODAY,
+    ).candidates
+    assert clean[0].email_responded is False
+    assert to_json(clean)[0]["email_responded"] is False
+
+
+def test_waiting_fails_closed_when_responded_fetch_breaks(identity_parsers):
+    # Responded-set failure: WAITING lane skipped (fail closed), the rest of
+    # the run continues (fail open-soft for the annotation) and is degraded.
+    attio = FakeAttio(
+        entries=[
+            _waiting_entry("w1", since="2026-06-20"),
+            _entry("r1", "Responded", last_contact="2026-05-01"),
+        ],
+        responded_fetch_exc=RuntimeError("attio down"),
     )
     res = detect_candidates(attio, today=TODAY)
     assert all(c.lane is not WarmLane.WAITING for c in res.candidates)
-    assert any("WAITING lane skipped" in d for d in res.degraded)
+    # The stage-path candidate still surfaces, unflagged (annotation is
+    # best-effort; the C.2 thread re-check remains authoritative).
+    assert {c.record_id for c in res.candidates} == {"r1"}
+    assert any("no WAITING nudges" in d for d in res.degraded)
 
 
 def test_waiting_respects_mute_snooze_and_cooldown(identity_parsers):
@@ -1875,27 +1969,32 @@ def test_drift_alarm_suppressed_when_waiting_consumed_warm_entries(identity_pars
     assert any("stage-title drift" in d for d in res2.degraded)
 
 
-def test_terminal_fetch_is_lazy(identity_parsers):
-    # No awaiting stamps anywhere → the 3 terminal-stage queries never fire.
+def test_terminal_stage_queries_fire_once_per_run(identity_parsers):
+    # The hard-decline (2) and responded (1) queries are eager — they guard
+    # every lane / annotate every candidate, so they run regardless of
+    # awaiting stamps — but exactly ONCE each per run, stamps or not.
     calls = []
 
     class CountingAttio(FakeAttio):
-        def search_people(self, filter_=None, limit=0):
+        def search_people(self, filter_=None, limit=0, *, fail_if_truncated=False):
             stage = (filter_ or {}).get("email_campaign_stage")
             if stage in ("email_responded", "email_not_interested", "unsubscribed"):
                 calls.append(stage)
-            return super().search_people(filter_=filter_, limit=limit)
+            return super().search_people(
+                filter_=filter_, limit=limit, fail_if_truncated=fail_if_truncated
+            )
 
     attio = CountingAttio(entries=[_entry("r1", "Responded", last_contact="2026-06-25")])
     detect_candidates(attio, today=TODAY)
-    assert calls == []
-    # With a stamp present, the fetch fires exactly once (memoized).
+    assert sorted(calls) == ["email_not_interested", "email_responded", "unsubscribed"]
+    calls.clear()
+    # Multiple stamped records still cost the same three queries.
     attio2 = CountingAttio(entries=[
         _waiting_entry("w1", since="2026-06-20"),
         _waiting_entry("w2", since="2026-06-20"),
     ])
     detect_candidates(attio2, today=TODAY)
-    assert len(calls) == 3  # one query per terminal stage, once per run
+    assert len(calls) == 3
 
 
 # ── CRM-agnostic escape-hatch + disabled-by-default path ────────────────────

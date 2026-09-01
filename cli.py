@@ -1551,6 +1551,7 @@ def email_daily_cmd(dry_run, yes, force_weekend):
     """Daily email drip: send sequenced emails to campaign contacts."""
     from clients.resend_client import ResendClient
     from workflows.email_campaign import run_email_daily
+    from workflows.email_lane_gate import EmailLaneDisabledError, assert_email_lane_enabled
     from workflows.run_lock import (
         EXIT_TEMPFAIL,
         RunLockHeld,
@@ -1559,6 +1560,15 @@ def email_daily_cmd(dry_run, yes, force_weekend):
     )
 
     click.echo("=== Outbound Agent -- Email Daily ===\n")
+
+    # Email-lane kill switch: the drip is disarmed unless armed on purpose.
+    # Checked here (before the lock) so a disarmed run costs nothing and prints
+    # one clear line; run_email_daily re-checks for programmatic callers.
+    try:
+        assert_email_lane_enabled("email-daily", dry_run=dry_run)
+    except EmailLaneDisabledError as exc:
+        click.echo(f"ABORT: {exc}", err=True)
+        raise SystemExit(1) from exc
 
     # email-wave2 shares this namespace — both write contact email state
     # and must mutually exclude. See cli.py::email_wave2_cmd.
@@ -1582,14 +1592,26 @@ def email_daily_cmd(dry_run, yes, force_weekend):
 @cli.command("email-unsubscribe")
 @click.argument("email")
 def email_unsubscribe_cmd(email):
-    """Honor an opt-out: mark a contact UNSUBSCRIBED so they're never emailed again."""
-    from workflows.email_compliance import unsubscribe_email
+    """Honor an opt-out: mark ALL contacts with this email UNSUBSCRIBED so the
+    email campaign never sends to them again."""
+    from workflows.email_compliance import UNSUBSCRIBE_LOOKUP_LIMIT, unsubscribe_email
 
     click.echo("=== Outbound Agent -- Email Unsubscribe ===\n")
     with _attio_client() as attio:
-        record_id = unsubscribe_email(attio, email)
-    if record_id:
-        click.echo(f"  Unsubscribed {email} (record {record_id}). They will not be emailed again.")
+        updated, maybe_more = unsubscribe_email(attio, email)
+    if updated:
+        click.echo(
+            f"  Unsubscribed {email}: {len(updated)} record(s) marked "
+            f"UNSUBSCRIBED ({', '.join(updated)}). The email campaign will not "
+            f"send to them again."
+        )
+        if maybe_more:
+            click.echo(
+                f"  ⚠ The lookup hit the {UNSUBSCRIBE_LOOKUP_LIMIT}-record cap — "
+                f"more duplicate records for {email} may exist. Dedupe the "
+                f"workspace and re-run to be certain all are covered.",
+                err=True,
+            )
     else:
         click.echo(f"  No contact found with email {email}. Nothing to do.")
 
@@ -1602,6 +1624,7 @@ def email_unsubscribe_cmd(email):
 def email_wave2_cmd(dry_run, yes, force_weekend, max_n):
     """Wave-2 re-engage blast: send a fresh email to contacts stalled mid-sequence."""
     from clients.resend_client import ResendClient
+    from workflows.email_lane_gate import EmailLaneDisabledError, assert_email_lane_enabled
     from workflows.run_lock import (
         EXIT_TEMPFAIL,
         RunLockHeld,
@@ -1611,6 +1634,15 @@ def email_wave2_cmd(dry_run, yes, force_weekend, max_n):
     from workflows.wave2_blast import run_wave2_blast
 
     click.echo("=== Outbound Agent -- Wave 2 Blast ===\n")
+
+    # Email-lane kill switch: the drip is disarmed unless armed on purpose.
+    # Checked here (before the lock) so a disarmed run costs nothing and prints
+    # one clear line; run_wave2_blast re-checks for programmatic callers.
+    try:
+        assert_email_lane_enabled("email-wave2", dry_run=dry_run)
+    except EmailLaneDisabledError as exc:
+        click.echo(f"ABORT: {exc}", err=True)
+        raise SystemExit(1) from exc
 
     # Shares the sales-email-daily namespace with `email-daily` — both
     # write contact email state and must mutually exclude. Concurrent

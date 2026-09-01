@@ -317,17 +317,33 @@ def _isolate_llm_dispatch_dirs(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _arm_email_lane(monkeypatch):
+    """Arm the email kill switch for the suite.
+
+    ``OUTBOUND_EMAIL_ENABLED`` ships UNSET (the drip senders are disarmed by
+    default — see workflows/email_lane_gate.py). The email send-path tests
+    predate the switch and deliberately exercise live-send branches against
+    mocks, so arm it here rather than editing every one of them. Tests that
+    assert the gate itself delete the var in their own scope
+    (tests/test_email_lane_gate.py).
+    """
+    monkeypatch.setenv("OUTBOUND_EMAIL_ENABLED", "1")
+
+
+@pytest.fixture(autouse=True)
 def _email_compliance_baseline_env(monkeypatch):
     """Give the suite a compliant email baseline so the CAN-SPAM send-gate
     (workflows.email_compliance.assert_email_compliance_ready) doesn't block the
     many existing live-send tests, which legitimately exercise the send path.
 
-    Sets a test physical address (the one hard gate). Tests that verify the
-    gate's fail-loud behavior delenv this in their own scope (monkeypatch
-    restores it afterward). Other compliance config (sender org, unsubscribe
-    mailto) is intentionally left unset so tests opt into it explicitly.
+    Sets the three hard gates (physical address, resolvable sender org,
+    unsubscribe address). Tests that verify the gate's fail-loud behavior
+    delenv the specific var in their own scope (monkeypatch restores it
+    afterward).
     """
     monkeypatch.setenv("EMAIL_PHYSICAL_ADDRESS", "123 Test St, Test City, TC 00000")
+    monkeypatch.setenv("EMAIL_SENDER_ORG", "Test Org")
+    monkeypatch.setenv("EMAIL_UNSUBSCRIBE_MAILTO", "unsubscribe@example.com")
 
 
 @pytest.fixture(autouse=True)
