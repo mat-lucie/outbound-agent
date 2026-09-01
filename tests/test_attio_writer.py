@@ -292,6 +292,66 @@ class TestRetryAndDlq:
         line = json.loads(dlq_files[0].read_text().strip())
         assert line["kind"] == "max_attempts"
 
+    def test_transient_500_retried_then_succeeds(self, mock_attio, dlq_tmp, monkeypatch):
+        """Attio 500s are transient in practice (weekly-finalize crash loop;
+        repeated daily-run escalation-write crashes). AttioWriter PATCHes are
+        same-values idempotent, so a 500 must be retried like 429/502/503/504
+        — not DLQ'd as permanent on the first attempt."""
+        mock_attio._client.request.side_effect = [
+            _error_response(500, "internal server error"),
+            _success_response(),
+        ]
+        monkeypatch.setattr(
+            "clients.attio_writer.AttioWriter._sleep_with_jitter",
+            lambda self, attempt: None,
+        )
+        writer = AttioWriter(attio=mock_attio)
+        result = writer.apply(_make_intent())
+        assert mock_attio._client.request.call_count == 2
+        assert "values" in result
+        # No DLQ entry — the write succeeded.
+        assert list(dlq_tmp.glob("attio-*.jsonl")) == []
+
+    def test_sustained_500_exhausts_as_transient_not_permanent(
+        self, mock_attio, dlq_tmp, monkeypatch
+    ):
+        """A sustained 500 outage exhausts the retry budget and lands in
+        the DLQ as max_attempts (transient class), NOT permanent_http_500."""
+        mock_attio._client.request.return_value = _error_response(500)
+        monkeypatch.setattr(
+            "clients.attio_writer.AttioWriter._sleep_with_jitter",
+            lambda self, attempt: None,
+        )
+        monkeypatch.setattr(
+            "workflows.escalation.escalate",
+            lambda **kw: {},
+        )
+        writer = AttioWriter(attio=mock_attio)
+        with pytest.raises(AttioRateLimitExhausted):
+            writer.apply(_make_intent())
+        assert mock_attio._client.request.call_count == MAX_ATTEMPTS
+        dlq_files = list(dlq_tmp.glob("attio-*.jsonl"))
+        assert len(dlq_files) == 1
+        line = json.loads(dlq_files[0].read_text().strip())
+        assert line["kind"] == "max_attempts"
+
+    def test_501_stays_permanent(self, mock_attio, dlq_tmp, monkeypatch):
+        """Only 500 joins the retryable set — 501 (Not Implemented) is a
+        genuine contract error, not a transient blip. Pin the boundary."""
+        mock_attio._client.request.return_value = _error_response(501)
+        monkeypatch.setattr(
+            "workflows.escalation.escalate",
+            lambda **kw: {},
+        )
+        writer = AttioWriter(attio=mock_attio)
+        with pytest.raises(AttioPermanentError):
+            writer.apply(_make_intent())
+        assert mock_attio._client.request.call_count == 1
+        dlq_files = list(dlq_tmp.glob("attio-*.jsonl"))
+        assert len(dlq_files) == 1
+        line = json.loads(dlq_files[0].read_text().strip())
+        assert line["kind"] == "permanent_http_501"
+
     def test_timeout_is_retryable(self, mock_attio, monkeypatch):
         # Timeout exceptions are RAISED by _client.request itself (not
         # via raise_for_status). Use side_effect for those.

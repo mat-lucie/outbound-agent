@@ -12,7 +12,7 @@ F-PR-4 ships:
 
   * A typed exception hierarchy (`AttioError` and 7 subclasses)
   * Retry policy: 5 attempts, full jitter, retry on
-    429/502/503/504/timeout, overall deadline 300s
+    429/500/502/503/504/timeout, overall deadline 300s
   * DLQ: `~/.outbound-agent/dlq/attio-{date}.jsonl` + a typed
     `attio_write_failed` queue row via `escalate()`
   * Stage rank-monotonicity check via F-PR-1's `STAGE_RANK`
@@ -136,7 +136,16 @@ if TYPE_CHECKING:
     from clients.attio import AttioClient
 
 DLQ_DIR = Path.home() / ".outbound-agent" / "dlq"
-RETRY_STATUS_CODES = frozenset({429, 502, 503, 504})
+# 500 is in the retryable set: Attio 500s are transient in practice
+# (weekly-finalize crash loop; repeated daily-run crashes on escalation
+# writes) and every AttioWriter write is a same-values PATCH — idempotent,
+# so retrying is safe. 501/505 etc. stay permanent: they signal a contract
+# error, not a blip. Same rationale as the opt-in retry_500 in
+# clients.attio._request — but note only update_person opts in there, so on
+# the people dispatch path a 500 retries at BOTH layers (see the
+# retry-stacking note in _single_patch); companies and list entries retry
+# 500 in this outer loop only.
+RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 RETRY_BUDGET_SECONDS = 300
 MAX_ATTEMPTS = 5
 
@@ -151,7 +160,7 @@ class AttioError(Exception):
 
 
 class AttioTransientError(AttioError):
-    """Retryable Attio failure — 429/502/503/504/timeout."""
+    """Retryable Attio failure — 429/500/502/503/504/timeout."""
 
 
 class AttioRateLimitExhausted(AttioTransientError):
@@ -159,7 +168,8 @@ class AttioRateLimitExhausted(AttioTransientError):
 
 
 class AttioPermanentError(AttioError):
-    """Non-retryable Attio failure — 4xx other than 429."""
+    """Non-retryable Attio failure — 4xx other than 429, plus
+    non-transient 5xx (501, 505, ...)."""
 
 
 class AttioWriteFailed(AttioError):
@@ -433,7 +443,7 @@ class AttioWriter:
                     # Transient — sleep with full jitter and retry.
                     self._sleep_with_jitter(attempt)
                     continue
-                # Permanent 4xx — try compensating rollback if multi-attr.
+                # Permanent (4xx other than 429, or non-transient 5xx).
                 self._dlq_and_escalate(intent, f"permanent_http_{code}", exc)
                 raise AttioPermanentError(
                     f"non-retryable {code} on {intent.object}.{intent.record_id}: "
@@ -471,7 +481,10 @@ class AttioWriter:
 
         Retry-stacking trade-off (engineer-QA-build4 #1, revisited):
         AttioClient._request has its own 3-attempt retry loop with
-        5/10/20s backoff for (429, 502, 503). AttioWriter's
+        5/10/20s backoff for (429, 502, 503) — plus 500 on call sites
+        that pass retry_500=True (update_person does; update_company
+        and update_list_entry don't, so their 500s retry only in this
+        outer loop). AttioWriter's
         ``_patch_with_retry`` adds 5 outer attempts capped by
         ``RETRY_BUDGET_SECONDS=300``. The pre-Wave-2-B raw-PATCH path
         avoided this stacking; the Wave-2-B helper-dispatch path
