@@ -479,3 +479,93 @@ class TestRetryStopsAtDeadline:
         writer = AttioWriter(attio=mock_attio)
         with pytest.raises(AttioRateLimitExhausted, match="deadline"):
             writer.apply(_make_intent())
+
+
+class TestNoneUnsetSerialization:
+    """None in ``WriteIntent.updates`` means "unset this attribute" — but
+    Attio v2 rejects a literal JSON ``null`` in ``values``/``entry_values``
+    with a 400 ``validation_errors: [{"code": "invalid", ...}]``; its
+    documented unset shape is an empty array ``[]``. The writer owns that
+    wire translation so every clear path (``clear_awaiting_reply``,
+    ``clear_verified_touch``, future ones) stays a plain ``None`` at the
+    intent level.
+
+    Regression for the upstream live failure: ``followup-await --clear``
+    400'd because the raw-PATCH path sent nulls verbatim.
+    """
+
+    def test_raw_patch_path_serializes_none_as_empty_array(self, mock_attio):
+        """Deals go through the raw httpx fallback — the exact live-bug path."""
+        writer = AttioWriter(attio=mock_attio)
+        writer.apply(WriteIntent(
+            object="deals",
+            record_id="deal_1",
+            updates={
+                "awaiting_reply_since": None,
+                "awaiting_reply_thread_id": None,
+                "awaiting_reply_nudge_count": None,
+            },
+            prior_values={},
+            writer_module="workflows.followup_state",
+        ))
+        body = mock_attio._client.request.call_args[1]["json"]["data"]["values"]
+        assert body == {
+            "awaiting_reply_since": [],
+            "awaiting_reply_thread_id": [],
+            "awaiting_reply_nudge_count": [],
+        }
+
+    def test_raw_patch_path_leaves_real_values_untouched(self, mock_attio):
+        """Mixed set+unset in one intent: only the Nones become []."""
+        writer = AttioWriter(attio=mock_attio)
+        writer.apply(WriteIntent(
+            object="deals",
+            record_id="deal_1",
+            updates={"last_verified_touch": None, "referred_by": "a@b.co"},
+            prior_values={},
+            writer_module="workflows.followup_state",
+        ))
+        body = mock_attio._client.request.call_args[1]["json"]["data"]["values"]
+        assert body == {"last_verified_touch": [], "referred_by": "a@b.co"}
+
+    def test_list_entry_path_serializes_none_as_empty_array(self, mock_attio):
+        writer = AttioWriter(attio=mock_attio)
+        writer.apply(WriteIntent(
+            object="linkedin_outreach",
+            record_id="entry_1",
+            updates={"awaiting_reply_since": None, "awaiting_reply_nudge_count": None},
+            prior_values={},
+            writer_module="workflows.followup_state",
+            is_list_entry=True,
+            list_id="list_xyz",
+        ))
+        kwargs = mock_attio.update_list_entry.call_args.kwargs
+        assert kwargs["entry_attributes"] == {
+            "awaiting_reply_since": [],
+            "awaiting_reply_nudge_count": [],
+        }
+
+    def test_clear_awaiting_reply_end_to_end_sends_empty_arrays(self, mock_attio):
+        """The actual failing call chain from ``followup-await --clear``:
+        followup_state.clear_awaiting_reply → AttioWriter → raw PATCH."""
+        from workflows import followup_state
+
+        writer = AttioWriter(attio=mock_attio)
+        followup_state.clear_awaiting_reply(writer, object="deals", record_id="deal_1")
+        body = mock_attio._client.request.call_args[1]["json"]["data"]["values"]
+        assert body == {
+            "awaiting_reply_since": [],
+            "awaiting_reply_thread_id": [],
+            "awaiting_reply_nudge_count": [],
+        }
+        assert "awaiting_reply_note_id" not in body  # canonical note survives
+
+    def test_clear_verified_touch_end_to_end_sends_empty_array(self, mock_attio):
+        """Same latent bug in the other clear path — fixed by the same
+        serialization boundary."""
+        from workflows import followup_state
+
+        writer = AttioWriter(attio=mock_attio)
+        followup_state.clear_verified_touch(writer, deal_id="deal_1")
+        body = mock_attio._client.request.call_args[1]["json"]["data"]["values"]
+        assert body == {"last_verified_touch": []}

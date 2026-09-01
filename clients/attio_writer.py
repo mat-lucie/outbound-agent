@@ -530,6 +530,15 @@ class AttioWriter:
                 f"no typed write available for {intent.object!r}: the "
                 f"configured CRMProvider exposes no inner AttioClient."
             )
+
+        # None in updates means "unset" at the intent level, but Attio v2
+        # rejects a literal JSON null in values/entry_values with a 400
+        # validation error — its unset shape is an empty array. Translate
+        # here, once, so every dispatch path below gets the same wire form.
+        # intent.updates keeps the semantic None for the DLQ / queue-row
+        # forensic records.
+        values = {k: ([] if v is None else v) for k, v in intent.updates.items()}
+
         if intent.is_list_entry:
             if not intent.list_id:
                 raise AttioWriteFailed(
@@ -537,13 +546,13 @@ class AttioWriter:
                 )
             return self._crm.update_list_entry(
                 entry_id=intent.record_id,
-                entry_attributes=intent.updates,
+                entry_attributes=values,
                 list_id=intent.list_id,
             )
         if intent.object == "companies":
-            return self._crm.update_company(intent.record_id, intent.updates)
+            return self._crm.update_company(intent.record_id, values)
         if intent.object == "people":
-            return self._crm.update_person(intent.record_id, intent.updates)
+            return self._crm.update_person(intent.record_id, values)
 
         # Fallback for object types without a dedicated update helper
         # (daily_run, weekly_kpi_snapshot, weekly_strategy_brief,
@@ -563,7 +572,7 @@ class AttioWriter:
         # AttioClient handle comes from the AttioProvider this writer composes
         # (non-None is already guaranteed by the guard above).
         path = f"/objects/{intent.object}/records/{intent.record_id}"
-        body = {"data": {"values": intent.updates}}
+        body = {"data": {"values": values}}
         resp = self._attio_client._client.request("PATCH", path, json=body)
         resp.raise_for_status()
         data = resp.json() if resp.content else {}
