@@ -433,6 +433,15 @@ def _check_one_company(
         "stage": target_stage.value,
         "last_contact_date": stamp_date.isoformat(),
     }
+    # Stamp the converged step's dm{N}_sent_at from the tally date so the
+    # sweep-recorded send stays visible to learn.py's per-step denominators
+    # (PR-9b NULL gate excludes unstamped rows). Only fill when currently
+    # NULL — an existing stamp from the in-run advance is the truer send
+    # date and must not be overwritten by a later tally date.
+    sent_at_slug = f"{step.value}_sent_at"
+    existing_sent_at = _entry_value(entry, sent_at_slug) if entry else None
+    if not existing_sent_at:
+        intended_attrs[sent_at_slug] = stamp_date.isoformat()
     next_eligible = compute_next_eligible_send_date(
         last_contact_date=stamp_date, just_sent_step=step.value
     )

@@ -77,7 +77,9 @@ class TestEmptyListId:
         assert "ATTIO_LIST_ID" in str(exc.value)
 
 
-def _assigned_dict_keys(func, var_name: str) -> set[str]:
+def _assigned_dict_keys(
+    func, var_name: str, *, require_literal: bool = True
+) -> set[str]:
     """All string keys assigned into *var_name* within *func*'s source,
     extracted structurally via ast (no char-window/regex fragility):
 
@@ -88,6 +90,11 @@ def _assigned_dict_keys(func, var_name: str) -> set[str]:
     Keys of OTHER dict literals (e.g. a ``"var_name": var_name`` item
     inside a payload dict) are ignored — only assignments whose target
     is *var_name* count.
+
+    ``require_literal=False`` supports scanning a function whose dict is
+    BUILT elsewhere (``var_name = helper(...)``) for call-site subscript
+    additions only — used to pin run_dm_sequencing to adding no keys after
+    _confirmed_dm_advance_attrs returns.
     """
     import ast
     import inspect
@@ -121,7 +128,7 @@ def _assigned_dict_keys(func, var_name: str) -> set[str]:
                     and isinstance(target.slice.value, str)
                 ):
                     keys.add(target.slice.value)
-    assert found_literal, (
+    assert found_literal or not require_literal, (
         f"No dict-literal assignment to {var_name!r} found in "
         f"{func.__qualname__} — the write site moved; update this guard."
     )
@@ -134,14 +141,48 @@ class TestWriterAttrDrift:
     week_starting class returns. These tests fail on drift."""
 
     def test_entry_attrs_match_dm_advance_write_site(self):
-        import workflows.daily_check as dc
+        from datetime import date
 
-        # The attrs_to_update literal in run_dm_sequencing is the
-        # single construction site for DM-advance entry writes.
-        written = _assigned_dict_keys(dc.run_dm_sequencing, "attrs_to_update")
+        import workflows.daily_check as dc
+        from models.campaign import MessageStep
+        from workflows.dm_sequencer import NEXT_STAGE
+
+        # _confirmed_dm_advance_attrs is the single construction site for
+        # DM-advance entry writes (extracted from run_dm_sequencing,
+        # 2026-06-10). Checked BEHAVIORALLY — the dm{N}_sent_at key is
+        # built from step.value, so an ast scan can't see it; calling the
+        # helper for every step enumerates the full writable key set in
+        # both directions (a new attr the preflight doesn't know, or a
+        # frozenset entry no write site produces).
+        written: set[str] = set()
+        for step in (MessageStep.DM1, MessageStep.DM2, MessageStep.DM3):
+            written |= set(
+                dc._confirmed_dm_advance_attrs(
+                    step=step,
+                    next_stage=NEXT_STAGE[step],
+                    today=date(2026, 6, 10),
+                    today_str="2026-06-10",
+                ).keys()
+            )
         assert written == DM_ENTRY_WRITER_ATTRS, (
-            f"DM_ENTRY_WRITER_ATTRS is out of sync with run_dm_sequencing. "
+            f"DM_ENTRY_WRITER_ATTRS is out of sync with "
+            f"_confirmed_dm_advance_attrs. "
             f"In source: {written}, in frozenset: {DM_ENTRY_WRITER_ATTRS}"
+        )
+        # The behavioral enumeration above only sees the helper's output.
+        # Guard the other direction too: run_dm_sequencing must not add
+        # keys at the call site after the helper returns — the pre-refactor
+        # AST scan caught exactly that pattern, and losing it would let a
+        # call-site `attrs_to_update["x"] = y` ship untested and surface in
+        # production as UnauthorizedAttioWriteError on the DM-advance path.
+        call_site_keys = _assigned_dict_keys(
+            dc.run_dm_sequencing, "attrs_to_update", require_literal=False
+        )
+        assert call_site_keys == set(), (
+            f"run_dm_sequencing assigns {call_site_keys} to attrs_to_update "
+            "at the call site; new DM-advance keys belong inside "
+            "_confirmed_dm_advance_attrs (the single construction site) so "
+            "the preflight drift test and schema coverage see them."
         )
 
     def test_company_attrs_match_tally_write_site(self):
@@ -181,6 +222,18 @@ class TestWriterAttrDrift:
             f"ast extraction missed expected repair keys: "
             f"{expected - assigned}. The write site changed shape; "
             f"update _assigned_dict_keys."
+        )
+        # The sweep's dm{N}_sent_at NULL-fill (2026-06-10) uses a DYNAMIC
+        # key (intended_attrs[sent_at_slug]) the ast extraction cannot see.
+        # Pin its preflight coverage explicitly so removing the attrs from
+        # DM_ENTRY_WRITER_ATTRS while the sweep still writes them fails
+        # here instead of as an UnauthorizedAttioWriteError in production.
+        # (Behavioral coverage of the slug itself lives in
+        # tests/test_per_step_attribution.py::TestSweepStampsSentAt.)
+        sent_at_attrs = {"dm1_sent_at", "dm2_sent_at", "dm3_sent_at"}
+        assert sent_at_attrs <= DM_ENTRY_WRITER_ATTRS, (
+            f"sweep writes {sent_at_attrs - DM_ENTRY_WRITER_ATTRS} without "
+            "preflight coverage"
         )
 
 

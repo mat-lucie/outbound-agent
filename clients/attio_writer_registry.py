@@ -155,23 +155,29 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
     # per §3.11 (at merge time the attrs are typically null on
     # duplicates; dedup writes from inferred per-duplicate
     # last_contact_date when any non-null is present).
+    # 2026-06-10 fix: the consistency sweep records confirmed sends the
+    # in-run advance missed, so it stamps the converged step's sent_at
+    # (NULL-fill only — never overwrites an existing stamp).
     ("linkedin_outreach", "dm1_sent_at"): [
         "workflows.daily_check.run_dm_sequencing",
         "scripts.backfill_per_step_timestamps",
         "scripts.attio_dedup",
         "workflows.pb_send_recovery.recover_unrecorded_dm_sends",
+        "workflows.consistency_sweep.run_company_tally_consistency_sweep",
     ],
     ("linkedin_outreach", "dm2_sent_at"): [
         "workflows.daily_check.run_dm_sequencing",
         "scripts.backfill_per_step_timestamps",
         "scripts.attio_dedup",
         "workflows.pb_send_recovery.recover_unrecorded_dm_sends",
+        "workflows.consistency_sweep.run_company_tally_consistency_sweep",
     ],
     ("linkedin_outreach", "dm3_sent_at"): [
         "workflows.daily_check.run_dm_sequencing",
         "scripts.backfill_per_step_timestamps",
         "scripts.attio_dedup",
         "workflows.pb_send_recovery.recover_unrecorded_dm_sends",
+        "workflows.consistency_sweep.run_company_tally_consistency_sweep",
     ],
     # response_received_at — primary writer is classify_reply; PR-9.5
     # union-merge takes MAX-non-null across duplicates.

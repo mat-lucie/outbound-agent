@@ -26,6 +26,7 @@ from clients.pb_envelope import (
 from clients.phantombuster import PhantomBusterClient
 from models.business_calendar import business_days_between, operator_today
 from models.campaign import (
+    DM_STEP_NUMBER,
     MessageStep,
     MissingMessageError,
     Persona,
@@ -715,6 +716,50 @@ def _write_company_throttle_tally(
                 error_class=type(exc).__name__,
                 person_advance_ok=person_advance_ok,
             )
+
+
+def _confirmed_dm_advance_attrs(
+    *,
+    step: "MessageStep",
+    next_stage: PipelineStage,
+    today: date,
+    today_str: str,
+) -> dict:
+    """Build the entry-attribute payload for a PB-confirmed DM send.
+
+    Single construction site for DM-advance entry writes (2026-06-10 fix,
+    reimplemented 2026-07-15 after the original was lost in the 2026-07-03
+    stash mishap — tests/test_per_step_attribution.py is the surviving
+    spec). Keep every writable key here in sync with
+    schema_preflight.DM_ENTRY_WRITER_ATTRS; the preflight drift test
+    enumerates this function's output behaviorally.
+
+    dm{N}_sent_at (PR-9a): learn.py's per-step denominators exclude rows
+    where the routed step's sent_at is NULL (PR-9b gate), so a send this
+    payload does not stamp is invisible to experiment measurement forever.
+    Before this helper existed the live path stamped nothing and every
+    cohort's per-step n_observed collapsed to the handful of rows touched
+    by pb_send_recovery.
+
+    PR-12 (B-PD-007): next_eligible_send_date stamps the forward-only
+    cadence floor for the NEXT step. compute_next_eligible_send_date
+    returns None for DM3 (no DM4 exists in v1 cadence) — the key is
+    omitted so the value resolves to NULL or whatever PR-39's NURTURE
+    math chooses. The write owner per §3.15 is
+    workflows.daily_check.run_dm_sequencing, already registered.
+    """
+    attrs: dict = {
+        "dm_step": DM_STEP_NUMBER[step],
+        "last_contact_date": today_str,
+        "stage": next_stage.value,
+        f"{step.value}_sent_at": today_str,
+    }
+    next_eligible = compute_next_eligible_send_date(
+        last_contact_date=today, just_sent_step=step.value
+    )
+    if next_eligible is not None:
+        attrs["next_eligible_send_date"] = next_eligible.isoformat()
+    return attrs
 
 
 def _finalize_confirmed_dm_send(
@@ -4088,23 +4133,12 @@ def run_dm_sequencing(
                 pb_unreported.append(row["linkedInUrl"])
                 continue
 
-            attrs_to_update = {
-                "dm_step": int(step.value.replace("dm", "")),
-                "last_contact_date": today_str,
-                "stage": next_stage.value,
-            }
-            # PR-12 (B-PD-007): stamp the forward-only cadence floor for
-            # the NEXT step. compute_next_eligible_send_date returns None
-            # for DM3 (no DM4 exists in v1 cadence) — leave the attribute
-            # untouched in that case so the value resolves to NULL or
-            # whatever PR-39's NURTURE math chooses. The write owner per
-            # §3.15 is workflows.daily_check.run_dm_sequencing (this
-            # function), already registered.
-            next_eligible = compute_next_eligible_send_date(
-                last_contact_date=today, just_sent_step=step.value
+            attrs_to_update = _confirmed_dm_advance_attrs(
+                step=step,
+                next_stage=next_stage,
+                today=today,
+                today_str=today_str,
             )
-            if next_eligible is not None:
-                attrs_to_update["next_eligible_send_date"] = next_eligible.isoformat()
             # PR-13 (§3.15): tally Companies.last_outreach_at + 3 siblings
             # IMMEDIATELY after the prospect advance, BEFORE the next due
             # row's throttle check evaluates — Round-4 D32 multi-thread

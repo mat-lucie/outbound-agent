@@ -1101,7 +1101,7 @@ class TestRunIdCrossReference:
                 return e
 
         with patch.object(script_mod, "AttioClient", _FakeAttioClient):
-            rc = script_mod.main(["--apply", "--list-id", "list-test"])
+            rc = script_mod.main(["--apply", "--accept-responder-censoring", "--list-id", "list-test"])
 
         assert rc == 0
         assert "mig_payload" in captured
@@ -1173,7 +1173,7 @@ class TestMainEntryPoint:
         from scripts import backfill_per_step_timestamps as script_mod
         attio = self._stub_attio(entries=[])
         with self._patched_attio_client(script_mod, attio):
-            rc = script_mod.main(["--apply", "--list-id", "list-test"])
+            rc = script_mod.main(["--apply", "--accept-responder-censoring", "--list-id", "list-test"])
         assert rc == 0
 
     def test_main_returns_EX_PARTIAL_when_rows_fail(self):
@@ -1197,7 +1197,7 @@ class TestMainEntryPoint:
         # parse_entry passthrough so the flat _entry() dict survives the
         # AttioClient.parse_entry() call inside _backfill_timestamps.
         with self._patched_attio_client(script_mod, attio):
-            rc = script_mod.main(["--apply", "--list-id", "list-test"])
+            rc = script_mod.main(["--apply", "--accept-responder-censoring", "--list-id", "list-test"])
         assert rc == 1, "Row-level failures must surface as EX_PARTIAL (1)."
 
     def test_main_returns_EX_TEMPFAIL_on_scope_failure(self):
@@ -1208,7 +1208,7 @@ class TestMainEntryPoint:
             query_raises=httpx.ConnectError("attio scope failure"),
         )
         with self._patched_attio_client(script_mod, attio):
-            rc = script_mod.main(["--apply", "--list-id", "list-test"])
+            rc = script_mod.main(["--apply", "--accept-responder-censoring", "--list-id", "list-test"])
         assert rc == 75, (
             "Attio scope failure (cannot list entries) must surface as "
             "EX_TEMPFAIL (75)."
@@ -1465,3 +1465,101 @@ class TestNarrowScopeFailureExcept:
 
         with pytest.raises(RuntimeError, match="failed to query list entries"):
             _backfill_timestamps(attio, rec, mig, list_id="list-001", dry_run=True)
+
+
+class TestResponderCensoringGuard:
+    """2026-07-15 guard: --apply without PB history rests on the
+    last_contact_date source alone, which cannot stamp rows that left the
+    DM{N} Sent stages (responders above all). Simulated on a historical
+    cohort (252 DM'd / 47 responders): every responder received zero stamps, so
+    per-step denominators inflated past SMALL_N_THRESHOLD while successes
+    stayed structurally zero — enough for a wet learn to strike a terminal
+    verdict on censored data. main() must refuse unless the operator
+    explicitly accepts that risk."""
+
+    def _stub_attio(self):
+        mock_attio = MagicMock()
+        mock_attio.query_list_entries.return_value = []
+        mock_attio.list_notes_for_record.return_value = []
+        mock_attio.parse_entry.side_effect = lambda e: e
+        mock_attio._request.side_effect = lambda *a, **k: {"data": {}}
+        return mock_attio
+
+    def _patched(self, script_mod, mock_attio):
+        class _FakeAttioClient:
+            def __new__(cls, *args, **kwargs):
+                return mock_attio
+
+            @staticmethod
+            def parse_entry(e):
+                return e
+
+        return patch.object(script_mod, "AttioClient", _FakeAttioClient)
+
+    def _no_pb_history(self, script_mod, tmp_path):
+        return patch.object(
+            script_mod, "PB_HISTORY_DIR", tmp_path / "absent-pb-history"
+        )
+
+    def test_apply_refused_without_pb_history(self, tmp_path, capsys):
+        from scripts import backfill_per_step_timestamps as script_mod
+
+        with self._no_pb_history(script_mod, tmp_path):
+            rc = script_mod.main(["--apply", "--list-id", "list-test"])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "censoring" in err
+        assert "--accept-responder-censoring" in err
+
+    def test_apply_proceeds_with_override(self, tmp_path):
+        from scripts import backfill_per_step_timestamps as script_mod
+
+        attio = self._stub_attio()
+        with self._no_pb_history(script_mod, tmp_path), \
+                self._patched(script_mod, attio):
+            rc = script_mod.main([
+                "--apply", "--accept-responder-censoring",
+                "--list-id", "list-test",
+            ])
+        assert rc == 0
+
+    def test_apply_proceeds_when_pb_history_present(self, tmp_path):
+        from scripts import backfill_per_step_timestamps as script_mod
+
+        pb_dir = tmp_path / "pb_history"
+        pb_dir.mkdir()
+        (pb_dir / "run.jsonl").write_text(
+            '{"url": "https://linkedin.com/in/x", "step": "dm1", '
+            '"sent_at": "2026-06-01T12:00:00Z"}\n',
+            encoding="utf-8",
+        )
+        attio = self._stub_attio()
+        with patch.object(script_mod, "PB_HISTORY_DIR", pb_dir), \
+                self._patched(script_mod, attio):
+            rc = script_mod.main(["--apply", "--list-id", "list-test"])
+        assert rc == 0
+
+    def test_dry_run_unaffected_by_guard(self, tmp_path):
+        from scripts import backfill_per_step_timestamps as script_mod
+
+        attio = self._stub_attio()
+        with self._no_pb_history(script_mod, tmp_path), \
+                self._patched(script_mod, attio):
+            rc = script_mod.main(["--dry-run", "--list-id", "list-test"])
+        assert rc == 0
+
+    def test_apply_refused_when_pb_history_all_malformed(self, tmp_path, capsys):
+        """A dir that globs *.jsonl but parses to nothing (the MED-5
+        schema-drift case) must be refused the same as an absent dir —
+        the guard gates on _load_pb_history() content, not file presence."""
+        from scripts import backfill_per_step_timestamps as script_mod
+
+        pb_dir = tmp_path / "pb_history"
+        pb_dir.mkdir()
+        (pb_dir / "drifted.jsonl").write_text(
+            'not json at all\n{"wrong": "shape"}\n', encoding="utf-8"
+        )
+        with patch.object(script_mod, "PB_HISTORY_DIR", pb_dir):
+            rc = script_mod.main(["--apply", "--list-id", "list-test"])
+        assert rc == 2
+        assert "--accept-responder-censoring" in capsys.readouterr().err

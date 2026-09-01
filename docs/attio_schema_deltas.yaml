@@ -264,7 +264,7 @@ attributes:
     options: null
     pr_id: PR-9a
     status: shipped
-    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends]
+    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends, workflows.consistency_sweep.run_company_tally_consistency_sweep]
     note: |
       §3.15 backfill exception: PR-9b's scripts.backfill_per_step_timestamps
       is the second authorized writer, scoped to one-shot historical
@@ -276,6 +276,10 @@ attributes:
       Per-step DM send timestamps. Pre-PR-9b only last_contact_date
       existed; PR-9b backfills these from PB action history + Attio
       note created_at.
+      2026-06-10: workflows.consistency_sweep.run_company_tally_consistency_sweep
+      added as fifth writer — the sweep records confirmed sends the in-run
+      advance missed and NULL-fills the converged step's sent_at (never
+      overwrites an existing stamp).
 
   - object: linkedin_outreach
     slug: dm2_sent_at
@@ -283,7 +287,7 @@ attributes:
     options: null
     pr_id: PR-9a
     status: shipped
-    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends]
+    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends, workflows.consistency_sweep.run_company_tally_consistency_sweep]
     note: "Multi-writer per §3.15 + §3.11 union-merge + crash-recovery (see dm1_sent_at note)."
 
   - object: linkedin_outreach
@@ -292,7 +296,7 @@ attributes:
     options: null
     pr_id: PR-9a
     status: shipped
-    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends]
+    write_owner_module: [workflows.daily_check.run_dm_sequencing, scripts.backfill_per_step_timestamps, scripts.attio_dedup, workflows.pb_send_recovery.recover_unrecorded_dm_sends, workflows.consistency_sweep.run_company_tally_consistency_sweep]
     note: "Multi-writer per §3.15 + §3.11 union-merge + crash-recovery (see dm1_sent_at note)."
 
   - object: linkedin_outreach
