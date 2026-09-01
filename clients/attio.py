@@ -1413,6 +1413,16 @@ class AttioClient:
             # at PROSPECT-commit (promotes the legacy scoring_lane string).
             "nurture_re_eligible_at": AttioClient._extract_value(values, "nurture_re_eligible_at"),
             "cadence_lane": AttioClient._extract_value(values, "cadence_lane"),
+            # Delivery-transport routing stamp (optional attribute; reads
+            # None on any workspace that never provisioned it, which
+            # `_resolve_send_channel` resolves to "pb"). EVERY consumer of
+            # the stamp goes through this dict — the invite exclusion, the
+            # DM queue hold-out, the Phase 0 / 0.5 scope skips and the
+            # event-ingest scope guard. Without the extraction they would
+            # all read "pb" for every row, the hold-out would never fire,
+            # and a prospect another transport still holds could take a
+            # second first-touch from PhantomBuster.
+            "send_channel": AttioClient._extract_value(values, "send_channel"),
         }
 
     @staticmethod

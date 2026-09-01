@@ -27,7 +27,7 @@ from clients.pb_envelope import (
     should_advance_batch,
 )
 from clients.phantombuster import PhantomBusterClient
-from clients.sender import PBSender
+from clients.sender import BotdogSender, PBSender
 from models.business_calendar import business_days_between, operator_today
 from models.campaign import (
     DM_STEP_NUMBER,
@@ -61,7 +61,12 @@ from models.resolution import (
 )
 from workflows import recheck_cache
 from workflows.daily_check_helpers import (
+    SEND_CHANNEL_BOTDOG,  # re-exported: shared channel resolver home
+    SEND_CHANNEL_DEFAULT,
+    SEND_CHANNEL_PB,
+    BlankMessageError,  # re-exported alongside UnresolvedPlaceholderError
     UnresolvedPlaceholderError,  # re-exported; consumed by tests + cli.py
+    _assert_no_blank_messages,
     _assert_no_unresolved_placeholders,
     _dedupe_by_linkedin_url,
     _fresh_csv_name,
@@ -70,6 +75,7 @@ from workflows.daily_check_helpers import (
     _normalize_linkedin_url,
     _pb_session_args,
     _resolve_degree_check_backend,
+    _resolve_send_channel,
     build_sales_nav_launch_args,
     preflight_legacy_profile_scraper,
 )
@@ -77,7 +83,19 @@ from workflows.daily_check_helpers import (
 # Intentional re-exports — silence F401. UnresolvedPlaceholderError is
 # imported by cli.py + email_campaign tests; can_send_messages is patched
 # via `workflows.daily_check.can_send_messages` in integration tests.
-__all__ = ["UnresolvedPlaceholderError", "can_send_messages"]
+# The SEND_CHANNEL_* constants + _resolve_send_channel live in
+# daily_check_helpers (their home — detect_responses and botdog_ingest
+# cannot import this module without a cycle) and are re-exported here so
+# every `daily_check.SEND_CHANNEL_*` reference keeps working.
+__all__ = [
+    "BlankMessageError",
+    "SEND_CHANNEL_BOTDOG",
+    "SEND_CHANNEL_DEFAULT",
+    "SEND_CHANNEL_PB",
+    "UnresolvedPlaceholderError",
+    "_resolve_send_channel",
+    "can_send_messages",
+]
 from workflows.audit import AuditLogger
 from workflows.consistency_sweep import run_company_tally_consistency_sweep
 from workflows.content_guard import assert_content_replaced
@@ -174,6 +192,54 @@ PHASE0_PROSPECT_MIN_BUDGET = 10
 # that just resolved (and may flip to 1st on the next scrape) don't spam the
 # queue.
 SUSPECTED_STALE_MIN_AGE_DAYS = 4
+
+
+def _build_botdog_sender() -> "BotdogSender":
+    """Construct the OPTIONAL `BotdogSender` for the event drain.
+
+    PhantomBuster owns sending: no send path in this module constructs a
+    Botdog sender, and no `.env` value can route a send to it. The sole
+    caller is the event-ingest drain (`workflows.botdog_ingest`), which
+    uses the sender's `fetch_events` to absorb delivery events for rows an
+    operator stamped `send_channel=botdog`. Called LAZILY — only when that
+    drain actually runs — so an ordinary PB run never requires
+    BOTDOG_API_KEY or a populated `config/botdog.yaml`. A missing key or
+    an unconfigured transport fails loudly here.
+
+    The blacklist presence gate is deliberately NOT run here: it is a
+    PRE-SEND safety step, and the drain is read-only. A gate failure must
+    never kill an event drain for a send path that does not exist.
+    """
+    from clients.botdog_config import BOTDOG_API_KEY_ENV, load_botdog_config
+
+    if not os.environ.get(BOTDOG_API_KEY_ENV):
+        raise RuntimeError(
+            f"{BOTDOG_API_KEY_ENV} is not set but the Botdog event-ingest "
+            f"drain is active (BOTDOG_SEND_ENABLED on). Set "
+            f"{BOTDOG_API_KEY_ENV} in .env, or set BOTDOG_SEND_ENABLED=false "
+            f"to stop polling Botdog events. Nothing was sent."
+        )
+    config = load_botdog_config()
+    if not config.campaign_ids:
+        raise RuntimeError(
+            "The Botdog event-ingest drain is active (BOTDOG_SEND_ENABLED "
+            "on) but config/botdog.yaml declares no campaigns, so the poll "
+            "would scan the whole connected account and hit the pagination "
+            "cap. Fill in `campaigns:` (see config/botdog.example.yaml) or "
+            "set BOTDOG_SEND_ENABLED=false. Nothing was sent."
+        )
+
+    from clients.botdog import BotdogClient
+
+    client = BotdogClient()
+    return BotdogSender(
+        client,
+        campaign_id_for_role=config.campaign_id,
+        # Scope the event poll to OUR campaigns: an account can hold
+        # thousands of unrelated/externally-synced leads, and an
+        # unfiltered scan hits the pagination cap.
+        campaign_ids=config.campaign_ids,
+    )
 
 
 def _is_blocked_by_stored_floor(
@@ -1408,9 +1474,20 @@ def detect_accepted_connections(
             continue
         last_sent = (attrs.get("last_contact_date") or "")[:10]
         # L1-2: collect records older than the escalation threshold BEFORE
-        # the acceptance-window filter so we get the full stale set.
+        # the acceptance-window filter so we get the full stale set. The
+        # botdog scope skip comes AFTER this collection deliberately: a
+        # botdog-stamped row with no confirming event is exactly the
+        # frozen-and-quiet state the stale escalation exists to surface,
+        # so it must stay in the stale net.
         if last_sent and last_sent < stale_escalate_cutoff:
             stale_record_ids.append(str(attrs["record_id"]))
+        # Botdog-channel scope guard: a row stamped send_channel=botdog
+        # gets its accepts from Botdog lead events
+        # (workflows.botdog_ingest, while the drain flag is on), not PB
+        # scraping — skip it here so Phase 0 doesn't waste a scrape and
+        # doesn't race the event-confirmed flip.
+        if _resolve_send_channel(attrs) == SEND_CHANNEL_BOTDOG:
+            continue
         if not last_sent or last_sent < cutoff:
             skipped_stale += 1
             continue
@@ -1437,6 +1514,10 @@ def detect_accepted_connections(
     prospect_cands: list[dict] = []
     for attrs in all_parsed:
         if attrs["stage"] != PipelineStage.PROSPECT.value:
+            continue
+        # Botdog-channel scope guard (see the CONNECTION_SENT loop):
+        # botdog-stamped rows are event-driven, not scrape-driven.
+        if _resolve_send_channel(attrs) == SEND_CHANNEL_BOTDOG:
             continue
         # Sourced-gate (prospect-perception safety): only sweep records WE
         # prospected. `prospect_committed_at` is stamped unconditionally on
@@ -2443,8 +2524,39 @@ def run_connection_requests(
 
     # Query all entries — filter Prospects and CONNECTION_SENT
     all_parsed = _get_all_entries_parsed(attio)
+
+    # ── Botdog residual census ────────────────────────────────────────
+    # Count EVERY row stamped send_channel=botdog, at ANY stage. This is
+    # the one instrument that also covers rows outside the invite slice
+    # and the DM queue (e.g. a stamped CONNECTION_SENT or DM3_SENT row):
+    # such a row is excluded from PB sends AND from the Phase 0 / 0.5
+    # scrape detectors, and with the Botdog event drain off it has no
+    # event source either — without this line it would freeze silently.
+    # Zero on any install this engine wrote (nothing stamps `botdog`).
+    botdog_stamped_total = sum(
+        1 for a in all_parsed
+        if _resolve_send_channel(a) == SEND_CHANNEL_BOTDOG
+    )
+    if botdog_stamped_total:
+        click.echo(
+            f"  ⚠ Botdog residual: {botdog_stamped_total} row(s) stamped "
+            f"send_channel=botdog (all stages). PhantomBuster owns "
+            f"sending — these rows get no sends and no scrape detection "
+            f"until they are re-stamped send_channel=pb (pause/empty the "
+            f"Botdog campaigns first, so no lead is double-contacted).",
+            err=True,
+        )
+
     prospects = []
     connection_sent = []
+    # Channel-stamp guard: a prospect stamped `send_channel=botdog` was
+    # handed to another transport, so letting the PB batch pick it up
+    # risks the same prospect getting a second invite from a second
+    # transport. Excluded HERE, before the degree check and before batch
+    # assembly, so a stamped row cannot reach PB by any route. Counted
+    # after the NOT_PROSPECT arm so the number means "botdog-stamped
+    # prospects in the invite slice", not "every botdog row in the list".
+    botdog_excluded = 0
     # Caller-supplied today (operator-TZ-aware); fall back to system date
     # for tests that omit it. Production cli.py always supplies it.
     today_op = today if today is not None else operator_today()
@@ -2465,6 +2577,10 @@ def run_connection_requests(
             continue
         reason = invite_slice_reason(attrs, today_op)
         if reason is InviteExclusionReason.NOT_PROSPECT:
+            continue
+        if _resolve_send_channel(attrs) == SEND_CHANNEL_BOTDOG:
+            # See the `botdog_excluded` declaration above.
+            botdog_excluded += 1
             continue
         if reason is InviteExclusionReason.MISSING_QUALITY_SCORE:
             # L1-5: quality_score=None means the weekly pipeline never
@@ -2511,6 +2627,15 @@ def run_connection_requests(
             f"  Quarantine: held back {quarantine_skipped} fresh prospect(s) "
             f"whose invite_eligible_after has not yet elapsed."
         )
+    if botdog_excluded:
+        click.echo(
+            f"  ⚠ {botdog_excluded} botdog-stamped prospect(s) excluded "
+            f"from PB invites. These get NO invite from any transport "
+            f"until they are re-stamped send_channel=pb — do that only "
+            f"after the Botdog campaigns are paused and their leads "
+            f"removed, or the prospect gets two first-touches.",
+            err=True,
+        )
 
     # Sort by ICP priority then score so the daily slice picks the best
     # cohort first instead of relying on Attio's non-deterministic order.
@@ -2533,7 +2658,7 @@ def run_connection_requests(
     # backfill). `target` below bounds the actual count to remaining capacity.
     if not can_send_connections(1):
         click.echo(f"Daily connection limit reached.\n{get_status()}")
-        return {"sent": 0, "pb_queued": 0, "skipped": len(prospects), "reason": "daily_limit", "skipped_low_score": skipped_low_score}
+        return {"botdog_excluded": botdog_excluded, "botdog_stamped_total": botdog_stamped_total, "sent": 0, "pb_queued": 0, "skipped": len(prospects), "reason": "daily_limit", "skipped_low_score": skipped_low_score}
 
     remaining = get_remaining()
     # Split-brain fix (port of upstream #182): the daily_run row is the
@@ -2544,7 +2669,7 @@ def run_connection_requests(
     remaining_attio = daily_run.remaining("connections")
     if remaining_attio <= 0:
         click.echo("Daily connection limit reached (daily_run counter).")
-        return {"sent": 0, "pb_queued": 0, "skipped": len(prospects), "reason": "daily_limit", "skipped_low_score": skipped_low_score}
+        return {"botdog_excluded": botdog_excluded, "botdog_stamped_total": botdog_stamped_total, "sent": 0, "pb_queued": 0, "skipped": len(prospects), "reason": "daily_limit", "skipped_low_score": skipped_low_score}
     # Target = how many invites to fill this run. Bounded by the remaining
     # daily connection capacity from BOTH the local file and the daily_run row,
     # plus the batch_size knob. The trim echo names the binding ledger so an
@@ -2598,8 +2723,14 @@ def run_connection_requests(
     if dropped_send:
         click.echo(f"  Dropped {len(dropped_send)} duplicate prospect URL(s): {dropped_send[:3]}{'...' if len(dropped_send) > 3 else ''}")
 
-    # Pre-send guard: refuse to ship any row with an unresolved [...] placeholder.
+    # Pre-send guards: refuse to ship any row with an unresolved [...]
+    # placeholder, or a blank rendered note. The blank guard matters MORE
+    # here than on the DM path: PB injects the note verbatim via the sheet
+    # without rejecting blanks, so a systemic template break would burn the
+    # day's invite budget on note-less first-touches while the run reported
+    # success.
     _assert_no_unresolved_placeholders(to_send_data, "connection_note")
+    _assert_no_blank_messages(to_send_data, "connection_note")
 
     # Pre-invite degree check: scrape LinkedIn degree for each PROSPECT and
     # partition out anyone who's already a 1st-degree connection (flip them to
@@ -2696,7 +2827,7 @@ def run_connection_requests(
 
     if not combined:
         click.echo("No prospects or re-checks ready.")
-        return {"sent": 0, "pb_queued": 0, "rechecked": 0, "skipped": 0, "skipped_low_score": skipped_low_score}
+        return {"botdog_excluded": botdog_excluded, "botdog_stamped_total": botdog_stamped_total, "sent": 0, "pb_queued": 0, "rechecked": 0, "skipped": 0, "skipped_low_score": skipped_low_score}
 
     click.echo(f"Prepared {len(to_send_data)} connection requests + {len(recheck_data)} re-checks.")
 
@@ -2711,6 +2842,8 @@ def run_connection_requests(
         for row in recheck_data:
             click.echo(f"  [DRY RUN RE-CHECK] {row['linkedInUrl']}")
         return {
+            "botdog_excluded": botdog_excluded,
+            "botdog_stamped_total": botdog_stamped_total,
             "sent": 0, "pb_queued": len(to_send_data), "rechecked": 0,
             "dry_run": len(to_send_data), "dry_run_rechecks": len(recheck_data),
             "skipped_low_score": skipped_low_score,
@@ -2718,7 +2851,7 @@ def run_connection_requests(
 
     if not auto_confirm and not click.confirm(f"Send {len(to_send_data)} connections + {len(recheck_data)} re-checks?"):
         click.echo("Cancelled.")
-        return {"sent": 0, "pb_queued": len(to_send_data), "rechecked": 0, "cancelled": True, "skipped_low_score": skipped_low_score}
+        return {"botdog_excluded": botdog_excluded, "botdog_stamped_total": botdog_stamped_total, "sent": 0, "pb_queued": len(to_send_data), "rechecked": 0, "cancelled": True, "skipped_low_score": skipped_low_score}
 
     # Sender seam: the transport hop (sheet write → Network Booster launch →
     # wait → result CSV → parse + invite-outcome override) lives in
@@ -3238,6 +3371,10 @@ def run_connection_requests(
         "skipped_same_company_run": skipped_same_company_run,
         "skipped_missing_url": skipped_missing_url,
         "skipped_low_score": skipped_low_score,  # L1-5: visible in summary
+        # botdog-stamped prospects held out of the PB invite batch.
+        "botdog_excluded": botdog_excluded,
+        # Residual census: ALL rows stamped botdog, at any stage.
+        "botdog_stamped_total": botdog_stamped_total,
     }
 
 
@@ -3458,6 +3595,13 @@ def run_dm_sequencing(
     # queue rows.
     queue_throttled_count = 0
 
+    # Per-step tally of DM-due rows held out of the queue because they
+    # (or a sibling entry for the same LinkedIn identity) are stamped
+    # send_channel=botdog. PhantomBuster owns sending; a stamped row was
+    # handed to another transport, so it gets NO send from any transport
+    # until it is re-stamped send_channel=pb.
+    botdog_channel_skipped = {"dm1": 0, "dm2": 0, "dm3": 0}
+
     # Wave-1.6.3 (adversarial follow-up): tally failed escalate() calls
     # raised inside the post-PB-send helpers. Mirrors the counter in
     # run_connection_requests; see the helpers' inner try/except for
@@ -3483,6 +3627,13 @@ def run_dm_sequencing(
     # operator-facing divergence report. Remember the first URL seen per key
     # so the report stays clickable.
     key_to_display_url: dict[str, str] = {}
+    # Identity keys owned by ANY botdog-stamped entry. A prospect can have
+    # duplicate entries with divergent stamps (slug variants, merged
+    # records); if one sibling is botdog-stamped, another transport may
+    # still hold the lead, so the whole identity is held out of the PB
+    # send below — resolving the channel on just the kept dedupe row would
+    # let the pb-stamped sibling double-send.
+    botdog_stamped_keys: set[str] = set()
     for attrs in all_parsed:
         try:
             s = PipelineStage(attrs["stage"])
@@ -3493,6 +3644,8 @@ def run_dm_sequencing(
             continue
         key = linkedin_identity_key(url)
         key_to_display_url.setdefault(key, url)
+        if _resolve_send_channel(attrs) == SEND_CHANNEL_BOTDOG:
+            botdog_stamped_keys.add(key)
         rank = STAGE_RANK.get(s, 0)
         if rank > url_to_max_rank.get(key, -1):
             url_to_max_rank[key] = rank
@@ -3586,11 +3739,29 @@ def run_dm_sequencing(
             continue
         pending_dm = verdict.step
 
+        # ── botdog-stamped hold-out ──────────────────────────────────
+        # No send path routes to Botdog. A row stamped
+        # send_channel=botdog was handed to that transport, so sending it
+        # through PB could double-message a lead a Botdog campaign still
+        # holds. Held out HERE, at queue build, so these rows never
+        # consume a cap-trim slot, never inflate the wet confirm count,
+        # never compose a message, and never charge a lease — and a
+        # dry-run reports them identically to a wet run.
+        if _resolve_send_channel(attrs) == SEND_CHANNEL_BOTDOG:
+            botdog_channel_skipped[pending_dm.value] += 1
+            continue
+
         # Cross-URL guard: a sibling record for this LinkedIn URL may already be
         # at or past the stage we're about to advance to. Skip if so.
         _, _, url, _, _ = cache.get(attrs["record_id"])
         if url:
             key = linkedin_identity_key(url)
+            if key in botdog_stamped_keys:
+                # A sibling entry for the same LinkedIn identity is
+                # botdog-stamped — same double-send risk (see the
+                # botdog_stamped_keys build above). Held out with it.
+                botdog_channel_skipped[pending_dm.value] += 1
+                continue
             next_rank = STAGE_RANK[NEXT_STAGE[pending_dm]]
             if url_to_max_rank.get(key, -1) >= next_rank:
                 click.echo(
@@ -3614,6 +3785,20 @@ def run_dm_sequencing(
         dm_queues[pending_dm].append(attrs)
     record_phase_or_skip(metrics, "queue_build", _t_phase)
 
+    # Loud hold-out report — fires on dry AND wet runs, and also when the
+    # hold-out emptied the whole queue (the early return below).
+    _bd_held = sum(botdog_channel_skipped.values())
+    if _bd_held:
+        click.echo(
+            f"  ⚠ {_bd_held} botdog-stamped DM-due row(s) held out of the "
+            f"queue ({botdog_channel_skipped}). PhantomBuster owns "
+            f"sending, so these rows get NO sends from any transport "
+            f"until they are re-stamped send_channel=pb — do that only "
+            f"after the Botdog campaigns are paused/archived AND their "
+            f"leads removed, or the prospect gets a duplicate message.",
+            err=True,
+        )
+
     total_messages = sum(len(q) for q in dm_queues.values())
     if total_messages == 0:
         if queue_throttled_count:
@@ -3627,7 +3812,14 @@ def run_dm_sequencing(
             )
         else:
             click.echo("No DMs due today.")
-        _early = {"dm1": 0, "dm2": 0, "dm3": 0, "dry_run": {"dm1": 0, "dm2": 0, "dm3": 0}}
+        _early = {
+            "dm1": 0, "dm2": 0, "dm3": 0,
+            "dry_run": {"dm1": 0, "dm2": 0, "dm3": 0},
+            # Rows held out at queue build because they (or a sibling
+            # entry) are stamped send_channel=botdog — reported even when
+            # the hold-out emptied the whole queue.
+            "botdog_channel_skipped": botdog_channel_skipped,
+        }
         # write-free exit: no list entries were advanced this run — reuse snapshot
         _consistency_sweep_epilogue(_early, entries_snapshot=_raw_entries_snapshot)
         return _early
@@ -3720,6 +3912,10 @@ def run_dm_sequencing(
         "skipped_language_mismatch": 0,
         "skipped_company_throttled": queue_throttled_count,
         "skipped_missing_copy": 0,
+        # Rows held out at queue build because they (or a sibling entry)
+        # are stamped send_channel=botdog — no send from any transport
+        # until they are re-stamped send_channel=pb.
+        "botdog_channel_skipped": botdog_channel_skipped,
         # Advisory count (mostly dry-run): rows whose language no signal
         # corroborates — see UNVERIFIED_LANGUAGE_SOURCES.
         "language_unverified": 0,
@@ -3952,9 +4148,14 @@ def run_dm_sequencing(
             click.echo(f"  No {step.value} rows remain after filtering; skipping batch.")
             continue
 
-        # Pre-send guard — abort the batch if any message still contains a
-        # [...] placeholder. Safer to fail loudly than to ship literal tokens.
+        # Pre-send guards — abort the batch if any message still contains a
+        # [...] placeholder, or rendered blank (a systemic template break,
+        # not N flaky prospects). Both run before the dry-run preview and
+        # before the lease reservation; a transport's per-row validation
+        # stays as backstop. Safer to fail loudly than to ship literal
+        # tokens or empty messages.
         _assert_no_unresolved_placeholders(rows, step.value)
+        _assert_no_blank_messages(rows, step.value)
 
         if dry_run:
             for row in rows:
@@ -4529,6 +4730,12 @@ def compute_due_dm_counts(
 
     due = {"dm1": 0, "dm2": 0, "dm3": 0}
     for attrs in all_parsed:
+        # botdog-stamped hold-out: a stamped row is dropped by
+        # run_dm_sequencing's queue build, so counting it here would prop
+        # up due_dm* (and the starvation signal derived from it) with rows
+        # no transport will touch.
+        if _resolve_send_channel(attrs) == SEND_CHANNEL_BOTDOG:
+            continue
         # Shared attrs-only DM-due chain (see dm_due_step). strict=True per
         # the PR-17 fold-in (code-reviewer IMPORTANT): match
         # run_dm_sequencing's behavior — let date.fromisoformat raise

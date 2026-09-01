@@ -203,7 +203,18 @@ def cli():
     help="Proceed with a wet run even when the checkout is behind origin/main "
          "(the staleness is still stamped into the run's provenance).",
 )
-def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profile_scraper_id, sales_nav_profile_scraper_id, inbox_scraper_id, skip_dms, skip_followups, force_weekend, allow_stale):
+@click.option(
+    "--botdog-send-enabled", is_flag=True, envvar="BOTDOG_SEND_ENABLED",
+    help="Turn on the OPTIONAL Botdog event drain (default off). It does "
+         "NOT enable Botdog sending — PhantomBuster owns all invites and "
+         "DMs regardless of this flag, and no send path routes to Botdog. "
+         "ON only makes Phase 0.7 poll Botdog lead events so rows stamped "
+         "send_channel=botdog can absorb their confirming advances. Set it "
+         "in .env — a shell export does not reach a scheduled run. Rows "
+         "stamped send_channel=botdog are held out of PB sends either way "
+         "until they are re-stamped send_channel=pb.",
+)
+def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profile_scraper_id, sales_nav_profile_scraper_id, inbox_scraper_id, skip_dms, skip_followups, force_weekend, allow_stale, botdog_send_enabled):
     """Daily check: send connections, queue DMs, detect responses."""
     from clients.gmail import GmailClient, GmailCredentialsMissing
     from clients.phantombuster import PhantomBusterClient
@@ -582,6 +593,60 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                                     click.echo(f"  ⚠ {_n} {_label}", err=_key not in ("auto_generated_skipped", "no_start_timestamp"))
                             click.echo("")
 
+                    # Phase 0.7: Botdog event ingestion — OPTIONAL drain
+                    # only. PhantomBuster owns sending; this phase exists
+                    # so an operator with rows stamped
+                    # send_channel=botdog can absorb their confirming
+                    # accept / DM-advance / reply events. Gated on
+                    # BOTDOG_SEND_ENABLED so an ordinary PB run never
+                    # needs BOTDOG_API_KEY. Dry-run polls (read-only) +
+                    # reports what WOULD change, writes nothing.
+                    click.echo("--- Phase 0.7: Botdog Event Ingestion ---")
+                    #
+                    # BROAD except by design: this is a read-and-reconcile
+                    # phase — it sends nothing. A Botdog API outage, an
+                    # expired key, or a schema change here must NEVER take
+                    # down the PhantomBuster sends that run after it. The
+                    # consequence of skipping ingestion is a one-run delay
+                    # in event-confirmed advances, which the next run's
+                    # poll cursor recovers.
+                    if not botdog_send_enabled:
+                        click.echo("Skipping (BOTDOG_SEND_ENABLED off)\n")
+                    else:
+                        try:
+                            from workflows.botdog_ingest import (
+                                format_report,
+                                ingest_botdog_events,
+                            )
+                            botdog_report = ingest_botdog_events(
+                                _attio_inner_client(crm),
+                                dry_run=mode.is_dry_run(),
+                                audit_logger=audit_logger,
+                            )
+                            click.echo(format_report(botdog_report) + "\n")
+                            if botdog_report.get("failures"):
+                                metrics.warn(
+                                    f"botdog_ingest failures="
+                                    f"{botdog_report['failures']} — "
+                                    f"attio_write_failed queue row(s) opened"
+                                )
+                        except Exception as exc:  # noqa: BLE001 — see comment above
+                            click.echo(
+                                f"  ⚠ Botdog event ingestion SKIPPED "
+                                f"[{type(exc).__name__}: {exc}] — "
+                                f"event-confirmed advances for "
+                                f"botdog-stamped rows are delayed to the "
+                                f"next run (the poll cursor is not advanced "
+                                f"on failure, so the next run re-polls "
+                                f"them). PhantomBuster sends are "
+                                f"unaffected.\n",
+                                err=True,
+                            )
+                            metrics.warn(
+                                f"botdog_ingest_phase_failed="
+                                f"{type(exc).__name__}"
+                            )
+
                     # Pipeline-starvation check (PR-43).
                     click.echo("--- Pipeline starvation check ---")
                     if mode.is_dry_run():
@@ -788,6 +853,40 @@ def daily(dry_run, yes, batch_size, network_booster_id, message_sender_id, profi
                     click.echo(f"Connections sent: {conn_result.get('sent', 0)}")
                     total_dms = dm_result.get("dm1", 0) + dm_result.get("dm2", 0) + dm_result.get("dm3", 0)
                     click.echo(f"DMs sent: {total_dms}")
+                    # The only botdog counters are hold-outs: rows stamped
+                    # send_channel=botdog that no transport touches until
+                    # they are re-stamped send_channel=pb.
+                    _bd_dm_skipped = sum(
+                        int(v or 0)
+                        for v in (dm_result.get("botdog_channel_skipped") or {}).values()
+                    )
+                    if _bd_dm_skipped:
+                        click.echo(
+                            f"  ⚠ {_bd_dm_skipped} botdog-stamped DM(s) "
+                            f"SKIPPED — PhantomBuster owns sending; "
+                            f"re-stamp these rows send_channel=pb (no "
+                            f"sends from any transport until then)",
+                            err=True,
+                        )
+                    _bd_excluded = int(conn_result.get("botdog_excluded", 0) or 0)
+                    if _bd_excluded:
+                        click.echo(
+                            f"  ⚠ {_bd_excluded} botdog-stamped prospect(s) "
+                            f"excluded from PB invites (awaiting a "
+                            f"send_channel=pb re-stamp)",
+                            err=True,
+                        )
+                    _bd_census = int(conn_result.get("botdog_stamped_total", 0) or 0)
+                    if _bd_census:
+                        click.echo(
+                            f"  ⚠ Botdog residual census: {_bd_census} "
+                            f"row(s) stamped send_channel=botdog across "
+                            f"ALL stages — no sends, no scrape detection "
+                            f"for them until they are re-stamped "
+                            f"send_channel=pb (see the Part A warning "
+                            f"above)",
+                            err=True,
+                        )
                     click.echo(f"Code: {format_provenance(code_provenance)}")
 
                     # Phase C: warm follow-up radar (read-only detection, PR-211).
