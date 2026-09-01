@@ -662,6 +662,55 @@ class TestFetchEvents:
         err = capsys.readouterr().err
         assert "detail fetch failed for lead lead-1" in err
         assert "1 of 2 lead detail(s) could not be read" in err
+        # COMPLETENESS SIGNAL: the unreadable lead emitted no events, so
+        # the poll must tell the ingest it was INCOMPLETE — otherwise the
+        # ingest advances its cursor past events it never saw.
+        assert events.leads_unread == 1
+
+    def test_lead_row_without_id_counts_as_unread(self, capsys):
+        client = _events_client(
+            [{"id": "lead-1", "linkedinProfile": _url(0),
+              "connectedAt": "2026-08-12T11:00:00Z"}],
+            rows=[{"id": "lead-1"}, {"createdAt": "2026-08-01T00:00:00Z"}],
+        )
+
+        events = _sender_for(client).fetch_events(None)
+
+        assert events.leads_unread == 1
+        assert "lead row with no id" in capsys.readouterr().err
+
+    def test_fully_read_poll_reports_nothing_unread(self):
+        client = _events_client([
+            {"id": "lead-1", "linkedinProfile": _url(0),
+             "connectedAt": "2026-08-12T11:00:00Z"},
+        ])
+
+        assert _sender_for(client).fetch_events(None).leads_unread == 0
+
+    def test_unread_count_survives_the_since_filter(self):
+        """The `since` filter drops EVENTS, never the completeness signal
+        — a filtered poll that left leads unread is still incomplete."""
+        client = _events_client([
+            {"id": "lead-1", "linkedinProfile": _url(0),
+             "connectedAt": "2026-08-12T11:00:00Z"},
+            {"id": "lead-2", "linkedinProfile": _url(1),
+             "connectedAt": "2026-08-13T11:00:00Z"},
+        ])
+        details = client.get_lead.side_effect
+
+        def _flaky(lead_id):
+            if lead_id == "lead-1":
+                raise BotdogError("detail down", status_code=503)
+            return details(lead_id)
+
+        client.get_lead.side_effect = _flaky
+
+        events = _sender_for(client).fetch_events(
+            datetime(2026, 12, 1, tzinfo=UTC)
+        )
+
+        assert list(events) == []  # every event is below the floor
+        assert events.leads_unread == 1
 
 
 class TestFetchEventsDetailCap:
@@ -693,11 +742,15 @@ class TestFetchEventsDetailCap:
         monkeypatch.setattr(sender_mod, "BOTDOG_MAX_DETAIL_FETCHES", 3)
         client = self._client(self._rows(5))
 
-        _sender_for(client).fetch_events(None)
+        events = _sender_for(client).fetch_events(None)
 
         assert client.get_lead.call_count == 3
         err = capsys.readouterr().err
         assert "2 lead(s) NOT polled this run" in err
+        # Capped-out leads are UNREAD, not "nothing happened": the count
+        # rides back so the ingest holds its cursor instead of aging
+        # their events past the next poll's floor.
+        assert events.leads_unread == 2
 
     def test_replied_leads_are_polled_first(self, capsys, monkeypatch):
         """PRIORITIZATION CHOICE: `hasReplied` is the only activity hint

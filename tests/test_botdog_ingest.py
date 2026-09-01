@@ -19,6 +19,10 @@ Covered, and why each area is load-bearing:
   failure/scope-skip WATERMARK and its HOLD CAP (an event that cannot be
   applied must be re-polled next run, but one permanently unmatchable
   lead must not pin the cursor forever);
+- the UNREAD-LEAD HOLD — a lead the transport never read emits NO
+  events, so the watermark cannot speak for it; the cursor must be held
+  at its previous value (or not written at all on an unbounded first
+  poll) instead of advancing past events nobody ever saw;
 - the UNLEDGERED-SEND CROSSCHECK — a message-sent event with no local
   submission record means the cadence is being driven by something the
   operator cannot see in the run log; it must advance anyway and count
@@ -35,7 +39,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from clients.sender import LeadEvent
+from clients.sender import LeadEvent, LeadEventBatch
 from models.pipeline import PipelineStage
 from workflows import botdog_ingest, botdog_ledger
 from workflows.botdog_ingest import ingest_botdog_events
@@ -83,15 +87,24 @@ def _isolated_botdog_state(monkeypatch, tmp_path):
 
 
 class _FakeSender:
-    """Sender stub: fetch_events returns a canned list; records `since`."""
+    """Sender stub: fetch_events returns a canned list; records `since`.
 
-    def __init__(self, events: list[LeadEvent]):
+    With ``leads_unread=0`` it returns a PLAIN list — the shape of a
+    transport that carries no completeness signal (PB) — so the ingest's
+    tolerance of that shape stays covered. With a non-zero count it
+    returns the richer `LeadEventBatch`, like the Botdog transport.
+    """
+
+    def __init__(self, events: list[LeadEvent], *, leads_unread: int = 0):
         self._events = events
+        self._leads_unread = leads_unread
         self.since_calls: list[object] = []
 
     def fetch_events(self, since):
         self.since_calls.append(since)
-        return list(self._events)
+        if not self._leads_unread:
+            return list(self._events)
+        return LeadEventBatch(self._events, leads_unread=self._leads_unread)
 
     def send_invites(self, batch):  # pragma: no cover - protocol filler
         raise NotImplementedError
@@ -142,7 +155,16 @@ def _entry(
     return entry
 
 
-def _run(monkeypatch, *, events, entries, dry_run=False, capture=None, tmp=None):
+def _run(
+    monkeypatch,
+    *,
+    events,
+    entries,
+    dry_run=False,
+    capture=None,
+    tmp=None,
+    leads_unread=0,
+):
     """Run ingest with a fake sender + injected entries; capture advances."""
     if capture is None:
         capture = MagicMock(return_value=True)
@@ -155,7 +177,7 @@ def _run(monkeypatch, *, events, entries, dry_run=False, capture=None, tmp=None)
         # run here can ever touch the real ~/.outbound-agent.
         monkeypatch.setattr(botdog_ingest, "POLL_STATE_DIR", tmp)
         monkeypatch.setattr(botdog_ingest, "POLL_STATE_FILE", tmp / "botdog_poll.json")
-    sender = _FakeSender(events)
+    sender = _FakeSender(events, leads_unread=leads_unread)
     report = ingest_botdog_events(
         MagicMock(),
         sender=sender,
@@ -656,6 +678,152 @@ class TestScopeSkipWatermark:
         )
         assert report["cursor_hold_capped"] is False
         assert report["cursor_after"] == "2026-06-18T12:00:00+00:00"
+
+
+# ── leads the transport never read ────────────────────────────────────
+
+
+class TestUnreadLeadHold:
+    """A lead the transport could not READ (detail-fetch budget, failed
+    detail GET) emits NO events, so the failure/scope-skip watermark has
+    nothing to hold with. Advancing the cursor to `now` anyway would put
+    that lead's real accept/reply permanently below the next poll's floor
+    — a total, silent loss with `failures=0` in the report. The poll's
+    `leads_unread` signal therefore pins the cursor."""
+
+    def test_unread_leads_hold_cursor_at_previous_value(
+        self, monkeypatch, tmp_path
+    ):
+        prior = datetime(2026, 6, 18, tzinfo=UTC)  # inside the hold cap
+        monkeypatch.setattr(botdog_ingest, "POLL_STATE_DIR", tmp_path)
+        monkeypatch.setattr(
+            botdog_ingest, "POLL_STATE_FILE", tmp_path / "botdog_poll.json"
+        )
+        botdog_ingest.write_cursor(prior)
+
+        report, _cap, _ = _run(
+            monkeypatch,
+            events=[],
+            entries=[],
+            tmp=tmp_path,
+            leads_unread=3,
+        )
+
+        assert report["leads_unread"] == 3
+        # Held at the last point we know was fully read — NOT `now`.
+        assert report["cursor_after"] == prior.isoformat()
+        assert botdog_ingest.read_cursor() == prior
+
+    def test_applied_events_still_apply_while_the_cursor_is_held(
+        self, monkeypatch, tmp_path
+    ):
+        """Holding the cursor must not block this run's work — the
+        readable leads still advance; only the cursor waits."""
+        prior = datetime(2026, 6, 18, tzinfo=UTC)  # inside the hold cap
+        monkeypatch.setattr(botdog_ingest, "POLL_STATE_DIR", tmp_path)
+        monkeypatch.setattr(
+            botdog_ingest, "POLL_STATE_FILE", tmp_path / "botdog_poll.json"
+        )
+        botdog_ingest.write_cursor(prior)
+
+        report, cap, _ = _run(
+            monkeypatch,
+            events=[_ev("LEAD_INVITATION_ACCEPTED", URL_ALICE, 15)],
+            entries=[_entry(stage=PipelineStage.CONNECTION_SENT.value)],
+            tmp=tmp_path,
+            leads_unread=1,
+        )
+
+        assert report["applied"] == 1
+        assert cap.called
+        assert report["cursor_after"] == prior.isoformat()
+
+    def test_unread_leads_on_unbounded_first_poll_write_no_cursor(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """With no prior cursor the poll was unbounded. Writing ANY
+        cursor now would put a floor under the next poll — below which the
+        unread leads' events sit forever. So nothing is written."""
+        report, _cap, _ = _run(
+            monkeypatch,
+            events=[],
+            entries=[],
+            tmp=tmp_path,
+            leads_unread=2,
+        )
+
+        assert report["cursor_write_skipped"] is True
+        assert report["cursor_after"] is None
+        assert botdog_ingest.read_cursor() is None
+        assert "cursor NOT written" in capsys.readouterr().err
+
+    def test_unread_hold_is_still_bounded_by_the_hold_cap(
+        self, monkeypatch, tmp_path
+    ):
+        """A permanently unreadable lead must not pin the cursor forever
+        — the same cap that bounds the failure watermark bounds this."""
+        prior = datetime(2026, 5, 1, tzinfo=UTC)  # 50 days before `now`
+        monkeypatch.setattr(botdog_ingest, "POLL_STATE_DIR", tmp_path)
+        monkeypatch.setattr(
+            botdog_ingest, "POLL_STATE_FILE", tmp_path / "botdog_poll.json"
+        )
+        botdog_ingest.write_cursor(prior)
+
+        report, _cap, _ = _run(
+            monkeypatch,
+            events=[],
+            entries=[],
+            tmp=tmp_path,
+            leads_unread=1,
+        )
+
+        floor = datetime(2026, 6, 20, 9, 0, tzinfo=UTC) - timedelta(
+            days=botdog_ingest.BOTDOG_MAX_CURSOR_HOLD_DAYS
+        )
+        assert report["cursor_hold_capped"] is True
+        assert report["cursor_after"] == floor.isoformat()
+
+    def test_incomplete_poll_is_loud_and_in_the_report_line(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        report, _cap, _ = _run(
+            monkeypatch,
+            events=[],
+            entries=[],
+            tmp=tmp_path,
+            leads_unread=4,
+        )
+        assert "poll INCOMPLETE" in capsys.readouterr().err
+        line = botdog_ingest.format_report(report)
+        assert "leads-unread=4" in line
+        assert "INCOMPLETE poll" in line
+
+    def test_dry_run_never_writes_a_cursor_even_with_unread_leads(
+        self, monkeypatch, tmp_path
+    ):
+        report, _cap, _ = _run(
+            monkeypatch,
+            events=[],
+            entries=[],
+            tmp=tmp_path,
+            dry_run=True,
+            leads_unread=2,
+        )
+        assert report["leads_unread"] == 2
+        assert report["cursor_after"] is None
+        assert report["cursor_write_skipped"] is False
+        assert botdog_ingest.read_cursor() is None
+
+    def test_transport_without_the_signal_advances_normally(
+        self, monkeypatch, tmp_path
+    ):
+        """A plain list (a transport with no completeness signal, e.g. PB)
+        means nothing was left unread — the cursor advances as before."""
+        report, _cap, _ = _run(
+            monkeypatch, events=[], entries=[], tmp=tmp_path
+        )
+        assert report["leads_unread"] == 0
+        assert report["cursor_after"] == "2026-06-20T09:00:00+00:00"
 
 
 # ── naive timestamps must not crash the watermark math ────────────────

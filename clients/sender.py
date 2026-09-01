@@ -54,7 +54,7 @@ from clients.pb_envelope import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
     from datetime import datetime
 
     from clients.botdog import BotdogClient
@@ -75,6 +75,35 @@ class LeadEvent:
     lead_linkedin_url: str
     occurred_at: datetime | None
     raw: dict
+
+
+class LeadEventBatch(list):  # list[LeadEvent]
+    """One poll's events PLUS how many leads the poll never READ.
+
+    Subclasses `list` so every caller keeps treating a poll result as a
+    plain list of events (``fetch_events(...) == []`` still holds), while
+    an ingest that cares about COMPLETENESS can read `leads_unread`:
+    leads dropped by a per-poll detail-fetch budget, rows with no id, and
+    leads whose detail fetch raised. Those leads produced NO events this
+    run, so they cannot show up in any event-timestamp watermark — an
+    ingest that advanced its cursor to `now` anyway would push their real
+    events permanently below the next poll's floor (silent, total loss,
+    with `failures=0` in the report).
+
+    CONTRACT: a non-zero `leads_unread` means THIS POLL IS INCOMPLETE. An
+    event-ingest MUST hold its cursor (see
+    `workflows.botdog_ingest.ingest_botdog_events`) instead of advancing
+    past leads the transport never read.
+    """
+
+    def __init__(
+        self,
+        events: Iterable[LeadEvent] = (),
+        *,
+        leads_unread: int = 0,
+    ) -> None:
+        super().__init__(events)
+        self.leads_unread = int(leads_unread)
 
 
 @dataclass(frozen=True)
@@ -151,6 +180,11 @@ class Sender(Protocol):
 
         Transports without an event feed (PB) return an empty list —
         their detection stays scrape-based.
+
+        A transport whose poll can be INCOMPLETE (a fetch budget, a
+        failed per-lead read) returns a `LeadEventBatch` so the caller
+        can see `leads_unread` and hold its cursor; a plain list means
+        "nothing was left unread".
         """
         ...
 
@@ -298,10 +332,10 @@ class PBSender:
             [row], requested, step_label=str(row.get("dm_step") or "dm")
         ).outcome
 
-    def fetch_events(self, since: datetime | None) -> list[LeadEvent]:
+    def fetch_events(self, since: datetime | None) -> LeadEventBatch:
         # PB has no event feed — accept/reply detection stays scrape-based
-        # (Phase 0 / 0.5).
-        return []
+        # (Phase 0 / 0.5). Nothing is polled, so nothing is left unread.
+        return LeadEventBatch()
 
 
 # ---------------------------------------------------------------------
@@ -760,7 +794,7 @@ class BotdogSender:
 
     # ── events ─────────────────────────────────────────────────────────
 
-    def fetch_events(self, since: datetime | None) -> list[LeadEvent]:
+    def fetch_events(self, since: datetime | None) -> LeadEventBatch:
         """Derive `LeadEvent`s from lead DETAILS (list rows have none).
 
         A lead LIST row carries no event data and no timestamps beyond
@@ -791,6 +825,14 @@ class BotdogSender:
         Events without a parseable timestamp are INCLUDED regardless of
         `since` — dropping them would silently lose events, and the
         ingestion layer is idempotent.
+
+        UNREAD LEADS ARE PART OF THE RESULT. Leads dropped by
+        `BOTDOG_MAX_DETAIL_FETCHES`, rows with no id, and leads whose
+        detail GET raised contribute NO events, so nothing downstream
+        could otherwise tell them apart from "this lead had nothing new".
+        Their count rides back on the returned `LeadEventBatch` as
+        `leads_unread` so the ingest holds its cursor instead of
+        advancing past events it never saw (see `LeadEventBatch`).
         """
         if self._campaign_ids:
             # Campaign-scoped poll (see __init__): union of our campaigns'
@@ -814,13 +856,16 @@ class BotdogSender:
         # server's natural order — `sorted` is stable, so this is a
         # partition, not a reshuffle.
         ordered = sorted(leads, key=lambda row: not bool(row.get("hasReplied")))
+        leads_unread = 0
         if len(ordered) > BOTDOG_MAX_DETAIL_FETCHES:
             skipped = ordered[BOTDOG_MAX_DETAIL_FETCHES:]
+            leads_unread += len(skipped)
             click.echo(
                 f"  ⚠ Botdog event poll: {len(ordered)} lead(s) but the "
                 f"per-poll detail-fetch cap is {BOTDOG_MAX_DETAIL_FETCHES} "
                 f"— {len(skipped)} lead(s) NOT polled this run (their "
-                f"events are invisible until a later poll). Replied leads "
+                f"events are invisible until a later poll, and the ingest "
+                f"cursor is HELD until they are read). Replied leads "
                 f"were polled first. Narrow the lead set (campaign filter) "
                 f"or raise BOTDOG_MAX_DETAIL_FETCHES deliberately.",
                 err=True,
@@ -860,26 +905,31 @@ class BotdogSender:
                 self._lead_detail_events(detail, url=url, lead_id=lead_id)
             )
 
+        leads_unread += detail_failures
         if detail_failures:
             click.echo(
                 f"  ⚠ Botdog event poll: {detail_failures} of "
                 f"{len(ordered)} lead detail(s) could not be read — their "
-                f"events are missing from this run's report.",
+                f"events are missing from this run's report, and the "
+                f"ingest cursor is HELD until they are read.",
                 err=True,
             )
 
         if since is None:
-            return events
+            return LeadEventBatch(events, leads_unread=leads_unread)
         # Coerce an offset-less `since` rather than risk a naive/aware
         # TypeError aborting the poll (every occurred_at is UTC-aware).
         from datetime import UTC as _utc
 
         floor = since if since.tzinfo is not None else since.replace(tzinfo=_utc)
-        return [
-            ev
-            for ev in events
-            if ev.occurred_at is None or ev.occurred_at >= floor
-        ]
+        return LeadEventBatch(
+            (
+                ev
+                for ev in events
+                if ev.occurred_at is None or ev.occurred_at >= floor
+            ),
+            leads_unread=leads_unread,
+        )
 
     def _lead_detail_events(
         self, detail: dict, *, url: str, lead_id: str

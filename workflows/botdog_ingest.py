@@ -45,6 +45,15 @@ leaves:
   e.g. an Attio row whose ``send_channel`` stamp has not landed yet,
   or a person record still being created), the cursor is held at the
   earliest such event so the next run sees it again.
+- UNREAD LEADS (the events we never saw at all): a lead the transport
+  could not READ — dropped by its per-poll detail-fetch budget, or its
+  detail fetch raised — emits NO events, so the watermark above has
+  nothing to hold with. ``fetch_events`` reports those as
+  ``LeadEventBatch.leads_unread``; a non-zero count pins the cursor to
+  its PREVIOUS value (or skips the write entirely on a first,
+  unbounded poll), so the next run re-reads them instead of aging
+  their real events past the poll floor. Surfaced as ``leads_unread``
+  in the run report — never a silent ``failures=0``.
 - HOLD CAP (bounds the tail): a lead that will NEVER resolve — a
   Botdog lead manually added outside our pipeline, so no Attio row
   will ever match it — would pin the watermark forever, and every
@@ -325,6 +334,10 @@ def _new_report(dry_run: bool) -> _Report:
         "poll_since": None,
         "cursor_hold_capped": False,
         "cursor_released_events": 0,
+        # Leads the transport never READ this run (fetch budget / failed
+        # detail read). They emit no events, so they hold the cursor.
+        "leads_unread": 0,
+        "cursor_write_skipped": False,
         "unledgered_message_sent": 0,
         "unledgered_message_sent_urls": [],
         "stale_botdog_invites": 0,
@@ -884,9 +897,9 @@ def ingest_botdog_events(
     guard); pb-channel and unmatched leads are skipped + counted (and
     their events hold the cursor — see the module docstring). Returns
     a LOUD run report (per-event-type counts, applied vs skipped vs
-    unknown, cursor age + effective poll floor, unledgered sends, stale
-    rows, failures) — this path is prospect-state-critical and must
-    never drift silently.
+    unknown, leads the transport never read, cursor age + effective poll
+    floor, unledgered sends, stale rows, failures) — this path is
+    prospect-state-critical and must never drift silently.
 
     ``sender`` defaults to ``daily_check._build_botdog_sender()`` (lazy —
     only constructed here, so a pure-PB run that never calls this stays
@@ -916,6 +929,13 @@ def ingest_botdog_events(
     report["poll_since"] = poll_since.isoformat() if poll_since else None
 
     events = sender.fetch_events(since=poll_since)
+    # COMPLETENESS SIGNAL: leads the transport could not read this run
+    # (detail-fetch budget, unreadable lead). They contribute NO events,
+    # so `held_event_times` below can never speak for them — the cursor
+    # is held separately (see the cursor block). A transport without the
+    # signal (a plain list, e.g. PB) leaves nothing unread by definition.
+    leads_unread = int(getattr(events, "leads_unread", 0) or 0)
+    report["leads_unread"] = leads_unread
     report["events_total"] = len(events)
     by_type: dict[str, int] = {}
     for ev in events:
@@ -1029,11 +1049,46 @@ def ingest_botdog_events(
 
     scan_stale_botdog_rows(entries, today=now.date(), report=report)
 
-    if not dry_run:
+    if leads_unread:
+        click.echo(
+            f"  ⚠ Botdog event poll INCOMPLETE: {leads_unread} lead(s) "
+            f"were never read this run (detail-fetch budget or an "
+            f"unreadable lead — see the poll warnings above). They "
+            f"produced NO events, so the ingest cursor is HELD at its "
+            f"previous value; their events are re-polled next run. "
+            f"A count that stays non-zero every run means the lead set "
+            f"is too big for the per-poll budget — narrow it (campaign "
+            f"filter) or raise the budget deliberately.",
+            err=True,
+        )
+
+    if not dry_run and leads_unread and cursor is None:
+        # UNREAD LEADS ON A FIRST (unbounded) POLL: there is no previous
+        # cursor to hold at, and writing ANY cursor would put a floor
+        # under the next poll — below which the unread leads' real events
+        # would sit forever. Skip the write so the next run is unbounded
+        # again. Loud, and reported.
+        report["cursor_write_skipped"] = True
+        click.echo(
+            f"  ⚠ Botdog cursor NOT written: this was an unbounded first "
+            f"poll and {leads_unread} lead(s) went unread. Writing a "
+            f"cursor now would hide their events below the next poll's "
+            f"floor. The next run polls unbounded again.",
+            err=True,
+        )
+    elif not dry_run:
         # Advance to `now`, EXCEPT hold at the earliest un-applied event
         # so its lead is retried next run (idempotent). A dry-run never
         # moves the cursor — we never advance PAST unprocessed state.
         watermark = min(held_event_times) if held_event_times else None
+        if leads_unread and cursor is not None:
+            # Unread leads emit no events, so the watermark above cannot
+            # represent them. Hold at the PREVIOUS cursor — the last
+            # point we know was fully read — so nothing they may carry
+            # ages past the poll floor. The hold cap below still bounds
+            # this, so a permanently unreadable lead cannot pin the
+            # cursor forever without an announcement.
+            watermark = cursor if watermark is None else min(watermark, cursor)
         safe_cursor = now if watermark is None else min(now, watermark)
 
         # HOLD CAP: never let the cursor lag more than
@@ -1052,11 +1107,13 @@ def ingest_botdog_events(
                 f"watermark ({safe_cursor.isoformat()}) is more than "
                 f"{BOTDOG_MAX_CURSOR_HOLD_DAYS} days behind now. "
                 f"Releasing the cursor to {floor.isoformat()} — "
-                f"{released} event(s) older than that will NEVER be "
-                f"polled again (beyond recovery). This means a lead has "
-                f"been failing or scope-skipped every run for a week: "
-                f"find it (see scope-skip / failure counts above) and "
-                f"fix the Attio row or the write path.",
+                f"{released} known event(s) older than that will NEVER "
+                f"be polled again (beyond recovery — plus anything "
+                f"carried by leads that went unread). This means a lead "
+                f"has been failing, scope-skipped, or unreadable every "
+                f"run for a week: find it (see scope-skip / failure / "
+                f"leads-unread counts above) and fix the Attio row, the "
+                f"write path, or the poll budget.",
                 err=True,
             )
             safe_cursor = floor
@@ -1074,6 +1131,17 @@ def format_report(report: dict) -> str:
     by_type = report.get("events_by_type") or {}
     type_str = ", ".join(f"{k}={v}" for k, v in sorted(by_type.items())) or "none"
     extras = ""
+    if report.get("leads_unread"):
+        extras += (
+            f"\n  ⚠ INCOMPLETE poll: {report['leads_unread']} lead(s) "
+            f"never read (no events from them) — cursor held"
+            + (
+                " (not written: unbounded first poll)"
+                if report.get("cursor_write_skipped")
+                else ""
+            )
+            + "."
+        )
     if report.get("cursor_hold_capped"):
         extras += (
             f"\n  ⚠ cursor hold CAP hit — "
@@ -1110,6 +1178,7 @@ def format_report(report: dict) -> str:
         f"Botdog ingest{' (dry-run)' if report.get('dry_run') else ''}: "
         f"{report.get('events_total', 0)} events across "
         f"{report.get('leads_seen', 0)} lead(s) [{type_str}]; cursor age {age_str}. "
+        f"leads-unread={report.get('leads_unread', 0)} "
         f"applied={report.get('applied', 0)} "
         f"idempotent-skip={report.get('skipped_idempotent', 0)} "
         f"scope-skip(pb)={report.get('skipped_scope_pb', 0)} "
