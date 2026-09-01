@@ -36,7 +36,10 @@ from scripts.gmail_sweep import (
 # `@mail\.` rule silenced.
 BRAND_GTLD = "s.rivera@mail.northwind"
 
-OPERATOR_DOMAIN = "example.com"
+# Deliberately NOT an example.* domain: `internal_domains` treats the
+# IANA-reserved documentation domains as unconfigured placeholders, so an
+# example.com operator would make this whole fixture a no-op.
+OPERATOR_DOMAIN = "operatorco.com"
 
 
 @pytest.fixture(autouse=True)
@@ -136,6 +139,35 @@ def test_internal_domains_is_empty_when_nothing_is_configured(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     assert internal_domains() == frozenset()
     assert not is_internal("dana@example.com")
+
+
+def test_shipped_example_identity_reads_as_unconfigured(monkeypatch):
+    """`.env.example` ships EMAIL_FROM/EMAIL_REPLY_TO as outbound@example.com,
+    UNCOMMENTED. An operator who copied it without editing must still trip the
+    fail-loud UNCONFIGURED guard — otherwise example.com resolves as "ours"
+    and every thread misclassifies silently, which is the exact failure the
+    guard exists to prevent."""
+    monkeypatch.delenv("OUTBOUND_INTERNAL_DOMAINS", raising=False)
+    monkeypatch.setenv("EMAIL_FROM", "Outbound Agent <outbound@example.com>")
+    monkeypatch.setenv("EMAIL_REPLY_TO", "outbound@example.com")
+    assert internal_domains() == frozenset()
+
+
+def test_example_domains_are_dropped_from_the_explicit_env_list(monkeypatch):
+    """Same rule on the declared path: a reserved domain is a placeholder,
+    never an operator identity, however it arrived."""
+    monkeypatch.setenv(
+        "OUTBOUND_INTERNAL_DOMAINS",
+        "example.com, example.org, example.net, mail.example.com, corp.example, acme.com",
+    )
+    assert internal_domains() == frozenset({"acme.com"})
+
+
+def test_env_list_of_only_example_domains_reads_as_unconfigured(monkeypatch):
+    monkeypatch.setenv("OUTBOUND_INTERNAL_DOMAINS", "example.com, sub.example.net")
+    # Must NOT silently fall through to the EMAIL_FROM fallback either.
+    monkeypatch.setenv("EMAIL_FROM", "Outbound Agent <outbound@example.com>")
+    assert internal_domains() == frozenset()
 
 
 def test_extra_vendor_domains_come_from_config(monkeypatch):

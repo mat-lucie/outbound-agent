@@ -102,6 +102,24 @@ def _isolate_run_provenance(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_denylist_token_cache():
+    """Drop the process-level denylist-token memo between tests.
+
+    ``weekly_prospect._denylist_tokens_cached`` parses the Botdog YAML once per
+    process (``is_denylisted_candidate`` runs per candidate ROW, so re-parsing
+    per call meant thousands of parses per ingest). The cache is keyed on
+    ``OUTBOUND_CONFIG_DIR``, which the suite pins globally — so a test that
+    monkeypatches ``denylist_tokens`` itself would otherwise be served an
+    earlier test's tokens. Cleared on both sides so neither direction leaks.
+    """
+    from workflows.weekly_prospect import _denylist_tokens_cached
+
+    _denylist_tokens_cached.cache_clear()
+    yield
+    _denylist_tokens_cached.cache_clear()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_anthropic_api_key(monkeypatch):
     """Guarantee no test ever hits the real Anthropic API.
 
