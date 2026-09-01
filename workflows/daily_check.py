@@ -8,7 +8,12 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 import click
 import httpx
 
-from clients.attio import AttioClient, linkedin_identity_key
+from clients.attio import (
+    AttioClient,
+    linkedin_identity_key,
+    linkedin_identity_map,
+    resolve_identity_match,
+)
 
 if TYPE_CHECKING:
     from clients.crm.base import CRMProvider
@@ -1709,8 +1714,12 @@ def detect_accepted_connections(
         # phantom (rollback requires a NEW agent id).
         preflight_legacy_profile_scraper(pb, profile_scraper_id)
 
-    # Build URL set for matching results back to our batch
+    # Build URL set for matching results back to our batch. The identity map
+    # bridges slug-variant echoes: the scraper can report a profile under its
+    # CURRENT slug rather than the queried one, and an exact-string miss here
+    # would leave an accepted connection undetected (cadence-leak family).
     our_urls = {_normalize_linkedin_url(p["linkedin_url"]) for p in scrape_batch}
+    our_urls_by_id = linkedin_identity_map(our_urls)
 
     # Write to Google Sheet and launch Profile Scraper (expects 'profileUrl' column)
     sheet_rows = [{"profileUrl": p["linkedin_url"]} for p in scrape_batch]
@@ -1908,8 +1917,13 @@ def detect_accepted_connections(
         )
         degree = row.get("connectionDegree", "")
         if url and degree:
-            norm = _normalize_linkedin_url(url)
-            if norm in our_urls:
+            # Exact match primary; on a miss bridge a slug-variant echo back
+            # to OUR url form via the profile-id, so the degree_lookup /
+            # pending_lookup reads below (keyed on our form) still hit.
+            norm = resolve_identity_match(
+                _normalize_linkedin_url(url), our_urls, our_urls_by_id
+            )
+            if norm:
                 degree_lookup[norm] = degree
                 pending_lookup[norm] = (
                     row.get(SALES_NAV_HAS_PENDING_INVITATION_COL) or ""

@@ -326,6 +326,59 @@ def linkedin_identity_key(url: str) -> str:
     return _canonical_linkedin_url(url)
 
 
+def linkedin_identity_map(urls) -> dict[str, str]:
+    """Map `li-id:<profile-id>` identity key → the input URL, for READ-side
+    match-back bridging.
+
+    Scraper CSVs can echo a profile under its CURRENT slug (the
+    `linkedinProfileUrl` column) rather than the slug we queried, so an
+    exact-string match-back misses when the person renamed their vanity URL
+    between our ingest and the scrape. Callers keep the exact match primary
+    and consult this map only on a miss: the CSV URL's identity key resolves
+    back to OUR url form, so downstream lookups keyed on our form still hit.
+
+    Only URLs whose slug carries a numeric profile-id participate (vanity
+    slugs without one can't be bridged safely). A profile-id shared by two
+    DIFFERENT input URLs is dropped from the map — a bridge that could pick
+    the wrong sibling is worse than no bridge; those fall back to exact
+    matching only.
+    """
+    mapping: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for url in urls:
+        key = linkedin_identity_key(url)
+        if not key.startswith("li-id:"):
+            continue
+        if key in mapping and mapping[key] != url:
+            ambiguous.add(key)
+        else:
+            mapping[key] = url
+    for key in ambiguous:
+        del mapping[key]
+    return mapping
+
+
+def resolve_identity_match(
+    norm: str, exact_set: set[str], by_id: dict[str, str]
+) -> str:
+    """Match a scraped/echoed URL back to one of our requested URLs.
+
+    Exact match stays primary: if `norm` is already one of ours, return it
+    unchanged. Only on an exact miss do we bridge via the numeric profile-id
+    (`by_id`, from `linkedin_identity_map`), which catches a slug-variant echo
+    — the scraper reporting a profile under its CURRENT slug rather than the
+    one we queried. Returns "" when neither matches, so callers can
+    `if not matched: continue`.
+
+    `norm` must already be normalized by the CALLER's normalizer, and
+    `exact_set` / `by_id` must be built from that SAME normalizer, so the
+    returned value is always in the caller's own key space.
+    """
+    if norm in exact_set:
+        return norm
+    return by_id.get(linkedin_identity_key(norm), "")
+
+
 def _linkedin_url_variants(url: str) -> list[str]:
     """Return every variant of a LinkedIn URL that Attio may have stored.
 

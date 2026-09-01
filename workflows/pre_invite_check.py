@@ -83,7 +83,12 @@ from typing import TYPE_CHECKING
 import click
 import httpx
 
-from clients.attio import AttioClient, linkedin_identity_key
+from clients.attio import (
+    AttioClient,
+    linkedin_identity_key,
+    linkedin_identity_map,
+    resolve_identity_match,
+)
 from clients.attio_writer import (
     AttioError,
     AttioWriter,
@@ -427,6 +432,13 @@ def _launch_sales_nav_scrape(
         return container_id, {}, {}
 
     our_urls = {_normalize_linkedin_url(u) for u in urls}
+    # Slug-variant bridge: `linkedinProfileUrl` carries the profile's CURRENT
+    # slug, which can differ from the slug we queried (the person renamed
+    # their vanity URL). On an exact miss, re-key the row to OUR url form via
+    # the numeric profile-id so callers' lookups (keyed on our form) still
+    # hit — otherwise the row reads as scrape-missing and re-queues/escalates
+    # forever (cadence-leak family).
+    our_urls_by_id = linkedin_identity_map(our_urls)
     degree_lookup: dict[str, str] = {}
     extras: dict[str, dict] = {}
     for row in csv.DictReader(io.StringIO(csv_text)):
@@ -439,8 +451,10 @@ def _launch_sales_nav_scrape(
         )
         if not url:
             continue
-        norm = _normalize_linkedin_url(url)
-        if norm not in our_urls:
+        norm = resolve_identity_match(
+            _normalize_linkedin_url(url), our_urls, our_urls_by_id
+        )
+        if not norm:
             continue
         degree = (row.get(SALES_NAV_DEGREE_COL) or "").strip()
         if degree:
@@ -907,6 +921,7 @@ def _pre_invite_degree_check(
                 return [], []
 
             scraped_lookup = {}
+            our_urls_by_id = linkedin_identity_map(our_urls)
             for row in csv.DictReader(io.StringIO(result_csv)):
                 url = (
                     row.get("linkedin_url", "")
@@ -917,8 +932,12 @@ def _pre_invite_degree_check(
                 degree = (row.get("connectionDegree") or "").strip()
                 if not url or not degree:
                     continue
-                norm = _normalize_linkedin_url(url)
-                if norm in our_urls:
+                # Exact match primary; slug-variant echo bridges to OUR url
+                # form via the profile-id (see _launch_sales_nav_scrape).
+                norm = resolve_identity_match(
+                    _normalize_linkedin_url(url), our_urls, our_urls_by_id
+                )
+                if norm:
                     scraped_lookup[norm] = degree
         degree_lookup.update(scraped_lookup)
 
