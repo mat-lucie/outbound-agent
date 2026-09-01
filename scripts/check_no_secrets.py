@@ -229,6 +229,7 @@ NAMES_DENYLIST = (
     "therese",                      # López-Therese (founder surname)
     "pepe",                         # nickname carried in a dedup fixture
     "bachoco", "suzano", "canela",  # other real companies from private notes
+    "bafar",                        # real company from the operator's never-contact set
 )
 
 for _name in NAMES_DENYLIST:

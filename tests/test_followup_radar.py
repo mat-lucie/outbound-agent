@@ -1251,7 +1251,7 @@ def test_detect_join_recency_unstales_an_old_looking_deal(identity_parsers):
 
 
 def test_detect_join_recency_stales_a_fresh_looking_deal(identity_parsers):
-    """The Bafar replay in miniature: a recently-created deal whose real last
+    """Replay of a real incident in miniature: a recently-created deal whose real last
     interaction is months old surfaces with REAL silence, not deal age."""
     attio = FakeAttio(
         deals=[_deal("d", "In Progress", created="2026-06-25",  # 6d — under threshold
@@ -1497,7 +1497,7 @@ def test_parse_deal_extracts_v2_fields():
         "id": {"record_id": "d1"},
         "created_at": "2026-02-11T18:56:15.015000000Z",
         "values": {
-            "name": [{"value": "GRUPO BAFAR"}],
+            "name": [{"value": "CONTOSO HOLDINGS"}],
             "stage": [{"status": {"title": "In Progress"}}],
             "associated_people": [
                 {"target_object": "people", "target_record_id": "p-1",
