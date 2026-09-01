@@ -181,6 +181,9 @@ class TestPayloadValidation:
                 "company": "Acme Foods",
                 "prospect_committed_at": "2026-06-28",
                 "degree": "1st",
+                # Slug-variant cadence-leak fix: prior-cadence context is
+                # required (empty when no profile-id sibling exists).
+                "prior_cadence_entries": [],
             },
         )
 

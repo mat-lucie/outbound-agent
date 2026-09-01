@@ -1230,6 +1230,17 @@ class PatternASuspectedDuplicatePayload(TypedDict):
     records must keep flipping — the legitimate silent-acceptance Pattern-A
     case), so this row only fires when recency is provable.
 
+    `prior_cadence_entries` (slug-variant cadence-leak fix): existing pipeline
+    entries whose LinkedIn URL shares this row's profile-id suffix (slug
+    variants of the same person), each
+    `{entry_id, record_id, linkedin_url, stage, dm_step, dm1_sent_at,
+    dm2_sent_at, dm3_sent_at, last_contact_date}`. The upstream incident's
+    quarantine row was flagged correctly but misjudged as a real accept
+    because the operator had no view of the prior DM3-complete entry — this
+    field puts that cadence in the payload. Empty when no sibling exists;
+    `prior_cadence_lookup_error` is set instead when the lookup itself failed
+    (the escalation still opens — degraded context beats no row).
+
     Idempotency key: `record_id`.
     """
     record_id: str
@@ -1239,6 +1250,8 @@ class PatternASuspectedDuplicatePayload(TypedDict):
     company: str
     prospect_committed_at: str
     degree: str
+    prior_cadence_entries: list[dict]
+    prior_cadence_lookup_error: NotRequired[str]
 
 
 class ManualReplySuppressedSelfEchoPayload(TypedDict):
@@ -1253,7 +1266,15 @@ class ManualReplySuppressedSelfEchoPayload(TypedDict):
     is NOT flipped to Responded; the operator confirms the thread.
 
     A body that doesn't match any template passes through unchanged (a real
-    reply still flips). Idempotency key: `entry_id|date`.
+    reply still flips).
+
+    Idempotency key: `entry_id|matched_template_id|total_messages` — the
+    thread SIGNATURE, not the date. A self-echo thread's last message
+    permanently matches our own template, so the old `entry_id|date` key
+    re-opened an identical row every day after the operator resolved it.
+    Keyed on the signature, `escalate()` finds the prior row (open or
+    resolved) and no-ops; any change to the thread (a real reply, a further
+    DM) changes `total_messages` and opens a fresh row.
     """
     record_id: str
     entry_id: str

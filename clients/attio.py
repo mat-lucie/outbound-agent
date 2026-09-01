@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import time
 from collections.abc import Callable
@@ -276,6 +277,53 @@ def _vanity_url_slug(url: str) -> str:
             slug = slug.split("?", 1)[0]
             return slug
     return ""
+
+
+# LinkedIn's auto-generated /in/ slugs end with a numeric member-id suffix
+# (e.g. `dana-q-70481235`), and slug VARIANTS for the same person keep that
+# suffix while the name portion drifts (`dana-quiroga-ramos-mba-70481235` —
+# the shape of the upstream 2026-08-18 cadence-leak incident). >=6 digits so a
+# short user-chosen tail like `john-smith-2` is never mistaken for a member id.
+_LINKEDIN_PROFILE_ID_RE = re.compile(r"-(\d{6,})$")
+
+
+def linkedin_profile_id(url: str) -> str:
+    """Extract the trailing numeric profile-id from a /in/ slug, or ''.
+
+    Two slug variants of the same profile share this suffix, so it is a
+    stronger identity key than the full slug. Returns '' for slugs without a
+    >=6-digit numeric tail (custom vanity URLs), non-/in/ URLs, and empty
+    input — callers must fall back to full-URL comparison then.
+    """
+    slug = _vanity_url_slug(url)
+    if not slug:
+        return ""
+    # `_vanity_url_slug` strips a plain trailing `?query`, but a `/?query`,
+    # `#fragment`, or `/sub-path` suffix survives into the slug and would
+    # defeat the $-anchored regex — the id must come from the first path
+    # segment only.
+    slug = slug.split("?", 1)[0].split("#", 1)[0].split("/", 1)[0]
+    match = _LINKEDIN_PROFILE_ID_RE.search(slug)
+    return match.group(1) if match else ""
+
+
+def linkedin_identity_key(url: str) -> str:
+    """Identity key for LinkedIn-URL dedup: profile-id when present, else
+    the canonical URL.
+
+    Two URLs whose slugs share the numeric profile-id suffix map to the same
+    key even when the name portion of the slug differs — closing the
+    exact-string-dedup gap that let a weekly ingest re-prospect a
+    DM3-complete person under a shortened slug variant. URLs without a
+    numeric suffix compare by canonical form, identical to the old behavior.
+
+    The `li-id:` prefix keeps id-keys disjoint from URL-shaped keys so a mixed
+    set can hold both without collision.
+    """
+    profile_id = linkedin_profile_id(url)
+    if profile_id:
+        return f"li-id:{profile_id}"
+    return _canonical_linkedin_url(url)
 
 
 def _linkedin_url_variants(url: str) -> list[str]:

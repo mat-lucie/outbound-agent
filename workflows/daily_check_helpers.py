@@ -13,7 +13,7 @@ from urllib.parse import unquote
 
 import httpx
 
-from clients.attio import AttioClient
+from clients.attio import AttioClient, linkedin_identity_key
 from clients.pb_config import (
     _BACKEND_DEFAULT,
     li_user_agent_stripped,
@@ -56,6 +56,11 @@ def _dedupe_by_linkedin_url(rows: list[dict]) -> tuple[list[dict], list[str]]:
     entry_id (at least one, potentially more). The legacy `entry_id` key is
     preserved for callers that only need one.
 
+    Keyed on `linkedin_identity_key` (slug-variant cadence-leak fix): two slug
+    VARIANTS sharing the numeric profile-id suffix are the same person and
+    must collapse to one send, with both entry_ids advanced in lock-step.
+    URLs without the suffix compare by canonical form as before.
+
     Returns (deduped_rows, dropped_urls) where dropped_urls lists each extra
     occurrence — useful for logging only.
     """
@@ -66,7 +71,7 @@ def _dedupe_by_linkedin_url(rows: list[dict]) -> tuple[list[dict], list[str]]:
         url = row.get("linkedInUrl", "")
         if not url:
             continue
-        key = _normalize_linkedin_url(url)
+        key = linkedin_identity_key(url)
         entry_id = row.get("entry_id")
         if key in by_url:
             dropped.append(url)

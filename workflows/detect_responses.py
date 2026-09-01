@@ -1351,11 +1351,23 @@ def detect_responses(
                 counts["self_echo_suppressed"] += 1
                 _primary = actionable[0]
                 try:
+                    # Idempotency on the SIGNATURE (entry|template|count), not
+                    # the date: a self-echo thread's last message permanently
+                    # matches our own template, so a date-scoped key re-opened
+                    # an identical row every day even after the operator
+                    # resolved it. escalate() returns an existing row — open
+                    # OR resolved — without mutating it, so a resolved
+                    # signature stays resolved. A real reply (or a further DM)
+                    # changes total_messages → new signature → fresh row.
+                    # record_id fallback: an entry_id-less row must not share
+                    # the key with every other entry_id-less row (they would
+                    # collapse into one queue row and hide each other).
                     escalate(
                         type="manual_reply_suppressed_self_echo",
                         idempotency_key=(
-                            f"{_primary.get('entry_id') or ''}"
-                            f"|{date.today().isoformat()}"
+                            f"{_primary.get('entry_id') or _primary.get('record_id') or ''}"
+                            f"|{matched_template_id}"
+                            f"|{total_messages}"
                         ),
                         payload={
                             "record_id": str(_primary.get("record_id") or ""),
