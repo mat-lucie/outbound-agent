@@ -48,7 +48,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import httpx  # noqa: E402
 
-from clients.attio import AttioClient  # noqa: E402
+from clients.attio import AttioClient, linkedin_identity_key  # noqa: E402
 from workflows.escalation import escalate  # noqa: E402
 
 # Transient errors that can legitimately happen mid-run against Attio and
@@ -443,18 +443,29 @@ def compute_merge_fields(winner: dict, losers: list[dict], fields: tuple[str, ..
 def detect_conflicts(
     group: list[dict],
     fields: tuple[str, ...],
+    normalizers: dict[str, Any] | None = None,
 ) -> list[str]:
-    """Return a list of conflict reasons (empty list = auto-safe)."""
+    """Return a list of conflict reasons (empty list = auto-safe).
+
+    `normalizers` maps a field name to a `str -> str` callable applied
+    before comparison — values that normalize to the same key are not a
+    conflict. `bucket_people` uses it to compare `linkedin` by identity
+    key, so slug/www/encoding variants of the bucket's own profile don't
+    flag a spurious conflict on the very field the bucket was keyed on.
+    The reported values stay raw for operator forensics.
+    """
     reasons: list[str] = []
     for field in fields:
+        normalize = (normalizers or {}).get(field)
         seen_values: set[str] = set()
         seen_on: list[str] = []
         for rec in group:
             val = comparable(rec.get("values", {}).get(field, []))
             if val is None:
                 continue
-            if val not in seen_values:
-                seen_values.add(val)
+            key = normalize(val) if normalize else val
+            if key not in seen_values:
+                seen_values.add(key)
                 seen_on.append(f"{record_id(rec)[:8]}={val!r}")
         if len(seen_values) > 1:
             reasons.append(f"{field}: " + ", ".join(seen_on))
@@ -562,13 +573,20 @@ def bucket_people(
     records: list[dict],
     entries_by_person: dict[str, list[dict]],
 ) -> tuple[list[dict], list[dict]]:
-    """Bucket people by normalized LinkedIn URL. Return (auto_safe_groups, conflict_groups)."""
+    """Bucket people by LinkedIn identity key. Return (auto_safe_groups, conflict_groups).
+
+    The key is `clients.attio.linkedin_identity_key`: the numeric
+    profile-id when the slug carries one, else the canonical URL form.
+    Exact-URL bucketing could not group slug-variant duplicates of the
+    same profile (the upstream cadence-leak pair reported 0 groups);
+    identity-key bucketing groups them for merge.
+    """
     buckets: dict[str, list[dict]] = {}
     for rec in records:
-        key = record_linkedin(rec)
-        if not key:
+        url = record_linkedin(rec)
+        if not url:
             continue  # people without a linkedin URL can't be safely bucketed
-        buckets.setdefault(key, []).append(rec)
+        buckets.setdefault(linkedin_identity_key(url), []).append(rec)
 
     auto_safe: list[dict] = []
     conflicts: list[dict] = []
@@ -580,12 +598,19 @@ def bucket_people(
         winner_id = record_id(winner)
         bucket_ids = {record_id(r) for r in group}
 
-        reasons = detect_conflicts(group, PEOPLE_COMPARE_FIELDS)
+        # `linkedin` compares by identity key: within a bucket the records
+        # are same-profile by construction, so slug/www/encoding variance
+        # on the bucketing field itself must not force human triage.
+        reasons = detect_conflicts(
+            group, PEOPLE_COMPARE_FIELDS,
+            normalizers={"linkedin": linkedin_identity_key},
+        )
         reasons.extend(detect_list_entry_conflicts(bucket_ids, entries_by_person))
         entry_actions = plan_list_entry_actions(winner_id, bucket_ids, entries_by_person)
 
         group_entry = {
             "linkedin_url_normalized": key,
+            "linkedin_urls": sorted({record_linkedin(r) for r in group}),
             "winner_id": winner_id,
             "loser_ids": [record_id(r) for r in losers],
             "fields_to_merge": compute_merge_fields(winner, losers, PEOPLE_COMPARE_FIELDS),

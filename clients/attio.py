@@ -357,6 +357,27 @@ def _linkedin_url_variants(url: str) -> list[str]:
     return out
 
 
+def person_record_linkedin_url(
+    record: dict, field_slug: Callable[[str], str] | None = None
+) -> str:
+    """Extract the stored LinkedIn URL string from a raw person record.
+
+    Attio returns the LinkedIn text attribute as a list of value dicts;
+    returns '' when the attribute is empty or the record has no values.
+
+    ``field_slug`` resolves the configurable ``linkedin_url`` engine field to
+    the workspace's vendor slug (the same seam
+    ``is_linkedin_clearbit_corrupted`` uses); it defaults to the canonical
+    Attio slug ``linkedin``.
+    """
+    slug = field_slug("linkedin_url") if field_slug else "linkedin"
+    items = (record.get("values") or {}).get(slug) or []
+    if not items:
+        return ""
+    first = items[0]
+    return str(first.get("value", "") if isinstance(first, dict) else first)
+
+
 def first_option_title(raw) -> str:
     """Extract the first option title from a CRM select-attribute value list.
 
@@ -652,23 +673,45 @@ class AttioClient:
     def search_person_by_linkedin(self, linkedin_url: str) -> dict | None:
         """Find a person record by LinkedIn URL. Returns None if not found.
 
-        Tries every URL variant Attio may have stored: canonical (URL-decoded,
-        no www, no trailing slash), with-www, with-trailing-slash, and the
-        raw input. Attio's exact-string filter means otherwise-equivalent
-        URLs miss their duplicates and the caller creates yet another record.
+        Two phases:
+        1. Exact-variant probes — every URL form Attio may have stored:
+           canonical (URL-decoded, no www, no trailing slash), with-www,
+           with-trailing-slash, and the raw input. Attio's exact-string
+           filter means otherwise-equivalent URLs miss their duplicates
+           and the caller creates yet another record.
+        2. Identity-key fallback — slug VARIANTS of the same profile share
+           the numeric member-id suffix but differ as exact strings (the
+           slug-variant cadence leak), so the probes above cannot see them.
+           When the slug carries a profile-id, a `$contains` search on the
+           id suffix finds them; because `$contains` over-matches (id
+           `-70481235` is a substring of `-704812350`), every candidate is
+           verified by `linkedin_identity_key` before being returned. This
+           closes the variant-slug duplicate gap for ingest paths that do
+           not run the weekly URL gate (intake, backfill scripts,
+           reconciliation).
         """
         if not linkedin_url:
             return None
+        slug = self._field_slug("linkedin_url")
         seen: set[str] = set()
         for variant in _linkedin_url_variants(linkedin_url):
             if variant in seen:
                 continue
             seen.add(variant)
-            results = self.search_people(
-                filter_={self._field_slug("linkedin_url"): variant}, limit=1
-            )
+            results = self.search_people(filter_={slug: variant}, limit=1)
             if results:
                 return results[0]
+        profile_id = linkedin_profile_id(linkedin_url)
+        if not profile_id:
+            return None
+        target_key = f"li-id:{profile_id}"
+        candidates = self.search_people(
+            filter_={slug: {"$contains": f"-{profile_id}"}}, limit=10,
+        )
+        for candidate in candidates:
+            stored_url = person_record_linkedin_url(candidate, self._field_slug)
+            if stored_url and linkedin_identity_key(stored_url) == target_key:
+                return candidate
         return None
 
     def create_person(self, attributes: dict) -> dict:
@@ -708,6 +751,24 @@ class AttioClient:
             if existing:
                 record_id = existing.get("id", {}).get("record_id", "")
                 if record_id:
+                    # READ the stored URL through the workspace's resolved
+                    # slug (the WRITE key below stays the literal `linkedin`
+                    # per the residual documented above) — a renamed slug must
+                    # not read as "no stored URL" and silently skip the guard.
+                    stored_canonical = _canonical_linkedin_url(
+                        person_record_linkedin_url(existing, self._field_slug)
+                    )
+                    if canonical and stored_canonical and stored_canonical != canonical:
+                        # Found via the identity-key fallback under a DIFFERENT
+                        # slug variant. Keep the stored URL: it is the
+                        # exact-string join key for list entries
+                        # (canonical_linkedin_url) and historical sends, and
+                        # rewriting it to the incoming variant would desync
+                        # those joins. Encoding/www variants share a canonical
+                        # form and never reach this branch.
+                        attributes = {
+                            k: v for k, v in attributes.items() if k != "linkedin"
+                        }
                     return self.update_person(record_id, attributes)
             return self.create_person(attributes)
         # Fallback: use the native PUT upsert for truly unique attributes (email, record_id)

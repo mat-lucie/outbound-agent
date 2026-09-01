@@ -45,6 +45,7 @@ except ImportError as exc:  # pragma: no cover — surfaces dep failure early
         "(declared in pyproject.toml [project.dependencies])."
     ) from exc
 
+from clients.attio import linkedin_identity_key
 from models.bayesian import (
     FROZEN_AT_EXCLUDED,
     SMALL_N_THRESHOLD,
@@ -410,10 +411,15 @@ def _persona_summary(p_entries: list[dict]) -> dict:
 def _dedup_by_canonical_url(entries: list[dict]) -> list[dict]:
     """PR-22 measure-side dedup (B-AW-DEDUP-006).
 
-    Deduplicate entries by `canonical_linkedin_url` before cohort grouping.
-    When two entries share the same canonical URL, keep the one with higher
-    `stage_rank` (the entry furthest along the funnel) — it carries the most
-    informative state for cohort math.
+    Deduplicate entries by the LinkedIn identity key of their
+    `canonical_linkedin_url` before cohort grouping. The identity key
+    (`clients.attio.linkedin_identity_key`) collapses slug VARIANTS of the
+    same profile — slugs sharing the numeric member-id suffix, the
+    cadence-leak shape — as well as www/encoding variants; exact-URL
+    comparison counted a variant-duplicate pair as two people and inflated
+    experiment-cohort denominators. When two entries share a key, keep the
+    one with higher `stage_rank` (the entry furthest along the funnel) — it
+    carries the most informative state for cohort math.
 
     Entries with no `canonical_linkedin_url` (None or empty string) are
     included as-is; we cannot dedup without a key.
@@ -456,7 +462,7 @@ def _dedup_by_canonical_url(entries: list[dict]) -> list[dict]:
         i_id = incumbent.get("record_id") or ""
         return c_id < i_id
 
-    seen: dict[str, dict] = {}  # canonical_url → best entry seen so far
+    seen: dict[str, dict] = {}  # identity key → best entry seen so far
     no_url: list[dict] = []
 
     for entry in entries:
@@ -464,7 +470,7 @@ def _dedup_by_canonical_url(entries: list[dict]) -> list[dict]:
         if not url or not str(url).strip():
             no_url.append(entry)
             continue
-        normalized = str(url).strip().rstrip("/").lower()
+        normalized = linkedin_identity_key(str(url).strip())
         prior = seen.get(normalized)
         if prior is None or _is_preferred(entry, prior):
             seen[normalized] = entry
