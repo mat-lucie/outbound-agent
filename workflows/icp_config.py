@@ -93,6 +93,14 @@ class ICPConfig:
     # ops/production buyer), OPS_OVERRIDE disjoint-span bypass still rescues
     # genuine manufacturing-ops titles.
     medical_regulatory_title_keywords: list[str]
+    # PR-298: integrator / service-provider COMPANY family, keyed on the company
+    # DESCRIPTION rather than its name — "SELLS to buyers" vs "IS a buyer".
+    # Fires only in CONJUNCTION with an off-ICP industry label (see
+    # `off_icp_industries`); the carve-out list holds SUBJECT-CARRYING
+    # self-assertions that suppress it. See
+    # workflows.quality_gate._is_integrator_service_provider.
+    integrator_description_keywords: list[str]
+    integrator_manufacturer_carveouts: list[str]
 
     # LLM qualifier prompt slots (P2b). The narrative, ICP-specific pieces of
     # the LLM tiebreaker's system prompt. The render lives in
@@ -273,6 +281,8 @@ def load_icp_config() -> ICPConfig:
         competitor_company_keywords=_str_list(dq, "competitor_company_keywords", section_name="disqualifiers"),
         freelance_employer_keywords=_str_list(dq, "freelance_employer_keywords", section_name="disqualifiers"),
         medical_regulatory_title_keywords=_str_list(dq, "medical_regulatory_title_keywords", section_name="disqualifiers"),
+        integrator_description_keywords=_str_list(dq, "integrator_description_keywords", section_name="disqualifiers"),
+        integrator_manufacturer_carveouts=_str_list(dq, "integrator_manufacturer_carveouts", section_name="disqualifiers"),
         qualifier_product_summary=_str(qp, "product_summary", section_name="qualifier_prompt"),
         qualifier_geography_requirement=_str(qp, "geography_requirement", section_name="qualifier_prompt"),
         qualifier_lanes=lanes,

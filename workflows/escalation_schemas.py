@@ -642,7 +642,11 @@ class DisqualifierMatchPayload(TypedDict):
     `disqualifier_government`, `disqualifier_healthcare`,
     `disqualifier_competitor`, `disqualifier_freelance`. PR-238 adds the
     medical/regulatory/clinical-affairs title family:
-    `disqualifier_medical_regulatory`.
+    `disqualifier_medical_regulatory`. PR-298 adds
+    `disqualifier_integrator` — a service-provider company DESCRIPTION at a
+    company the industry classifier labelled off-ICP ("sells to our buyers",
+    not "is one"); `matched_keyword` there is the description phrase, not a
+    title or company-name token.
 
     `matched_keyword` is the specific keyword that fired — operators
     audit keyword false-positives without re-running the matcher.

@@ -1578,11 +1578,13 @@ class TestPausedPersonaSkip:
         assert "paused" not in capsys.readouterr().err
 
 
-class TestResolveCompanyIndustry:
-    """PR-225: ingest-time industry resolution (CRM lookup, classify-on-miss)."""
+class TestResolveCompanySignals:
+    """PR-225: ingest-time company-signal resolution (CRM lookup,
+    classify-on-miss). PR-298 widened the return to a 3-field CompanySignals
+    (industry, status, description)."""
 
     def test_existing_label_returned_with_status(self):
-        from workflows.weekly_prospect import _resolve_company_industry
+        from workflows.weekly_prospect import _resolve_company_signals
         attio = MagicMock()
         attio.search_company_by_domain.return_value = {
             "id": {"record_id": "c1"},
@@ -1592,20 +1594,20 @@ class TestResolveCompanyIndustry:
             },
         }
         cache: dict = {}
-        assert _resolve_company_industry(
+        assert _resolve_company_signals(
             attio, "Acme", "acme.com", cache, dry_run=False,
-        ) == ("Food & Beverage", "confirmed")
+        ) == ("Food & Beverage", "confirmed", "")
 
     def test_existing_label_no_status_returns_none_status(self):
-        from workflows.weekly_prospect import _resolve_company_industry
+        from workflows.weekly_prospect import _resolve_company_signals
         attio = MagicMock()
         attio.search_company_by_domain.return_value = {
             "id": {"record_id": "c1"},
             "values": {"industry_vertical": [{"option": {"title": "Retail"}}]},
         }
-        assert _resolve_company_industry(
+        assert _resolve_company_signals(
             attio, "Acme", "acme.com", {}, dry_run=False,
-        ) == ("Retail", None)
+        ) == ("Retail", None, "")
 
     def test_classify_on_miss_writes_payload(self):
         from unittest.mock import patch
@@ -1616,10 +1618,10 @@ class TestResolveCompanyIndustry:
         attio.search_companies.return_value = []
         summary: dict = {}
         with patch("workflows.industry_classifier.classify_industry", return_value="Logistics"):
-            label, status = weekly_prospect._resolve_company_industry(
+            signals = weekly_prospect._resolve_company_signals(
                 attio, "NewCo", None, {}, dry_run=False, summary=summary,
             )
-        assert (label, status) == ("Logistics", "low_confidence")
+        assert signals == ("Logistics", "low_confidence", "")
         assert summary["industry_classified_at_ingest"] == 1
 
     def test_dry_run_does_not_classify_or_write(self):
@@ -1630,29 +1632,29 @@ class TestResolveCompanyIndustry:
         attio.search_company_by_domain.return_value = None
         attio.search_companies.return_value = []
         with patch("workflows.industry_classifier.classify_industry") as cls:
-            result = weekly_prospect._resolve_company_industry(
+            result = weekly_prospect._resolve_company_signals(
                 attio, "NewCo", None, {}, dry_run=True,
             )
-        assert result == (None, None)
+        assert result == (None, None, "")
         cls.assert_not_called()
         attio.update_company.assert_not_called()
 
     def test_cache_prevents_second_lookup(self):
-        from workflows.weekly_prospect import _resolve_company_industry
+        from workflows.weekly_prospect import _resolve_company_signals
         attio = MagicMock()
         attio.search_company_by_domain.return_value = {
             "id": {"record_id": "c1"},
             "values": {"industry_vertical": [{"option": {"title": "Retail"}}]},
         }
         cache: dict = {}
-        _resolve_company_industry(attio, "Acme", "acme.com", cache, dry_run=False)
-        _resolve_company_industry(attio, "Acme", "acme.com", cache, dry_run=False)
+        _resolve_company_signals(attio, "Acme", "acme.com", cache, dry_run=False)
+        _resolve_company_signals(attio, "Acme", "acme.com", cache, dry_run=False)
         assert attio.search_company_by_domain.call_count == 1
 
     def test_transient_http_error_degrades(self):
         import httpx
 
-        from workflows.weekly_prospect import _resolve_company_industry
+        from workflows.weekly_prospect import _resolve_company_signals
         attio = MagicMock()
         resp = MagicMock()
         resp.status_code = 500
@@ -1660,16 +1662,16 @@ class TestResolveCompanyIndustry:
             "boom", request=MagicMock(), response=resp,
         )
         summary: dict = {}
-        assert _resolve_company_industry(
+        assert _resolve_company_signals(
             attio, "Acme", "acme.com", {}, dry_run=False, summary=summary,
-        ) == (None, None)
+        ) == (None, None, "")
         assert summary["industry_resolve_errors"] == 1
 
     def test_auth_error_propagates(self):
         import httpx
         import pytest
 
-        from workflows.weekly_prospect import _resolve_company_industry
+        from workflows.weekly_prospect import _resolve_company_signals
         attio = MagicMock()
         resp = MagicMock()
         resp.status_code = 403
@@ -1677,4 +1679,4 @@ class TestResolveCompanyIndustry:
             "forbidden", request=MagicMock(), response=resp,
         )
         with pytest.raises(httpx.HTTPStatusError):
-            _resolve_company_industry(attio, "Acme", "acme.com", {}, dry_run=False)
+            _resolve_company_signals(attio, "Acme", "acme.com", {}, dry_run=False)

@@ -85,6 +85,9 @@ class TestVerdictPathsRegistry:
             "disqualifier_freelance",
             # PR-238
             "disqualifier_medical_regulatory",
+            # PR-298: small integrator / service provider — "sells to our
+            # buyers" vs "is one". See tests/test_integrator_disqualifier.py.
+            "disqualifier_integrator",
         })
         assert expected == DISQUALIFIER_VERDICT_PATHS
 

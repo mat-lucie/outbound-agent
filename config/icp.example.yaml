@@ -513,3 +513,127 @@ disqualifiers:
     - regulatory affairs
     - clinical operations
     - pharmacovigilance
+
+  # ── Integrator / service-provider COMPANY family (DESCRIPTION-keyed) ──
+  # "IS a buyer" vs "SELLS to buyers". A small integrator/consultancy that
+  # serves your ICP looks identical to your ICP on every other signal — its
+  # CRM categories, its people's titles, and often its brand-only company
+  # name. The one field that states the business model is the company
+  # DESCRIPTION, so this family reads that instead of the name.
+  #
+  # It is a CONJUNCTION and never fires on the description alone: the industry
+  # classifier must ALSO have labelled the company an off-ICP vertical (see
+  # industries.off_icp) with a status other than "unknown". Either half missing
+  # abstains. Description-alone is far too loose — large equipment makers that
+  # genuinely run plants describe themselves in exactly these words.
+  #
+  # Word-boundary matched, so short tokens ("integrator") cannot substring-fire
+  # inside unrelated prose. Replace with the service-provider phrasings that
+  # describe the middlemen around YOUR ICP.
+  integrator_description_keywords:
+    # English
+    - solutions provider
+    - solution provider
+    - provider of solutions
+    - service provider
+    - systems integrator
+    - system integrator
+    - systems integration
+    - integrator
+    - integration services
+    - engineering services
+    - consulting
+    - consultancy
+    - consulting services
+    - turnkey solutions
+    - turnkey projects
+    - software development
+    - it services
+    - our customers include
+    # Both inflections of each verb — a description written in the first person
+    # ("we help companies") and the third ("helps companies") are the same
+    # signal, and listing only one silently drops half of them.
+    - helps companies
+    - help companies
+    - helps its clients
+    - help our clients
+    # Spanish
+    - proveedor de soluciones
+    - proveedor de servicios
+    - prestador de servicios
+    - integrador de sistemas
+    - integradora de sistemas
+    - servicios de ingeniería
+    - servicios de ingenieria
+    - consultoría
+    - consultoria
+    - llave en mano
+    # Portuguese ("integrador de sistemas" / "consultoria" are shared with the
+    # Spanish block above — listed once, not per language).
+    - fornecedor de soluções
+    - fornecedor de solucoes
+    - prestadora de serviços
+    - prestadora de servicos
+    - serviços de engenharia
+    - servicos de engenharia
+    - chave na mão
+    - chave na mao
+
+  # Carve-outs for the family above — description phrases in which the company
+  # asserts that IT is the operator you sell to. Any hit suppresses the family
+  # (a company that both integrates and operates is judged on what it operates).
+  # Substring-matched, so a shorter phrase subsumes its plural ("our plant"
+  # covers "our plants").
+  #
+  # Every phrase MUST carry its own subject. Two ways to get this wrong:
+  #   * A bare stem. "manufactur" reads as a carve-out inside "a systems
+  #     integrator serving discrete MANUFACTURERS" — the single most common
+  #     sentence an integrator writes — and un-catches the whole population.
+  #   * A bare genitive. "manufacturer of" matches the vendor an integrator
+  #     RESELLS ("authorized distributor for Contoso, manufacturer of drives"),
+  #     and naming your vendor is standard integrator copy.
+  # Adjectival self-descriptions ("leading manufacturer") and explicit
+  # first/third-person claims ("is a manufacturer", "we manufacture") carry the
+  # subject; the bare genitive does not.
+  integrator_manufacturer_carveouts:
+    # English
+    - is a manufacturer
+    - are a manufacturer
+    - we manufacture
+    - manufactures
+    - leading manufacturer
+    - largest manufacturer
+    - we produce
+    - we run our plant
+    - our factory
+    - our factories
+    - our plant
+    - our own plant
+    - our production facilit
+    - our manufacturing plant
+    - our manufacturing facilit
+    # Spanish
+    - es fabricante
+    - somos fabricante
+    - fabricamos
+    - producimos
+    - fabricante líder
+    - fabricante lider
+    - principal fabricante
+    - nuestra planta
+    - nuestras plantas
+    - nuestra fábrica
+    - nuestra fabrica
+    - nuestras fábricas
+    - nuestras fabricas
+    - plantas de producción propias
+    # Portuguese ("somos fabricante" / "fabricamos" are shared with Spanish).
+    - é fabricante
+    - produzimos
+    - nossa fábrica
+    - nossa fabrica
+    - nossas fábricas
+    - nossas fabricas
+    - nossa planta
+    - nossas plantas
+
