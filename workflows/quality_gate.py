@@ -351,6 +351,54 @@ FREELANCE_EMPLOYER_KEYWORDS = _ICP.freelance_employer_keywords
 # disjoint-span bypass. Values are operator ICP DATA, sourced from config.
 MEDICAL_REGULATORY_TITLE_KEYWORDS = _ICP.medical_regulatory_title_keywords
 
+# ── PR-298: integrator / service-provider COMPANY family (DESCRIPTION-keyed) ──
+# "IS a buyer" vs "SELLS to buyers". Every signal the scorer reads about a small
+# automation integrator points the wrong way: its CRM categories are the ICP's
+# own categories, its people carry plant-coded titles, and its company NAME is
+# often a bare brand with no service token to catch. The one field that states
+# the business model is the company DESCRIPTION.
+#
+# The family is a CONJUNCTION — a service-provider DESCRIPTION at a company the
+# industry classifier already labelled off-ICP. Neither half is sufficient
+# alone. Description-alone is far too loose: large equipment MAKERS that run
+# real plants describe themselves in exactly these words, so a description-only
+# predicate hard-rejects in-ICP manufacturers. Off-ICP-alone is far too broad to
+# hard-reject on (it is a scoring penalty by design, not a rejection).
+#
+# Deliberately NOT keyed on company size, though size is the intuitive
+# discriminator. Headcount/revenue are premium CRM enrichment attributes that a
+# base API entitlement reads as empty on every record, so a conjunction keyed on
+# one could never fire in production — a gate that looks like a fix and is
+# structurally a no-op. If the enrichment entitlement is present, size becomes an
+# additional precision lever worth revisiting.
+#
+# ABSTAIN, never default: no description, or an industry label that is missing /
+# in-ICP / unrecognized / classified "unknown", yields NO match.
+#
+# Coverage is genuinely partial, and it is worth being precise about where. The
+# description comes from CRM enrichment, absent for a company the pipeline has
+# never seen — so a brand-new integrator is NOT caught at first ingest. It
+# becomes catchable once the CRM enriches the company and the row is re-scored on
+# a later weekly. Companies already committed before this family shipped are
+# never re-scored at all; scripts/audit_integrator_prospects.py sweeps those
+# read-only, and reports rather than acts.
+#
+# Word-boundary matched (like the other keyword families) so short tokens
+# ("integrator") cannot substring-fire inside unrelated prose. Values are
+# operator ICP DATA, sourced from config (config/icp.yaml → icp.example.yaml).
+INTEGRATOR_DESCRIPTION_KEYWORDS = _ICP.integrator_description_keywords
+
+# Carve-outs — description phrases in which the company asserts that IT runs
+# production. A company that both integrates and manufactures is judged on the
+# plant it owns, so any of these suppresses the family.
+#
+# Every configured phrase must carry its own SUBJECT (the config comments spell
+# out why): a bare stem like "manufactur" reads as a carve-out inside "a systems
+# integrator serving discrete MANUFACTURERS", and a bare genitive like
+# "manufacturer of" matches the OEM an integrator RESELLS. Matching is substring
+# (not word-boundary), so a shorter phrase subsumes its plural.
+INTEGRATOR_MANUFACTURER_CARVEOUTS = _ICP.integrator_manufacturer_carveouts
+
 
 def _find_first_match(
     text: str, keywords: list[str], *, word_boundary: bool
@@ -389,8 +437,74 @@ def _find_first_match(
     return best
 
 
-def _match_disqualifier(title_lower: str, company_lower: str) -> tuple[str, str] | None:
+def _is_integrator_service_provider(
+    description: str,
+    industry: str | None,
+    industry_status: str = "confirmed",
+) -> str | None:
+    """Return the matched description keyword when the company reads as a
+    service provider rather than an in-ICP operator, else None.
+
+    Both halves are required and neither is defaulted:
+
+      * `industry` must be an OFF_ICP_INDUSTRIES label — the industry
+        classifier's own verdict that this company is not the kind of business
+        the operator sells to. A missing, in-ICP, or unrecognized label
+        abstains.
+      * `industry_status` must not be "unknown". `unknown` means the classifier
+        abstained or its dispatch failed — there is no verdict to conjoin with,
+        so the family abstains too. `score_prospect` maps any unrecognized
+        status string to "unknown", so schema drift lands here and fails safe.
+      * `description` must carry a service-provider phrase and no carve-out —
+        a company that says it runs plants is judged on the plants.
+
+    `low_confidence` IS accepted here, unlike the abstain in `_industry_score`,
+    and the difference is deliberate. The ingest-time classifier stamps
+    `low_confidence` on everything it labels, and only the manual
+    `industry-approve` CLI ever writes `confirmed` — so a confirmed-only
+    predicate would fire on operator-approved rows and on NOTHING the pipeline
+    classifies itself, i.e. it would be silent on exactly the newly-ingested
+    companies this family exists to catch. That is a dead gate, the same class
+    of failure as keying on an unreadable enrichment attribute.
+
+    The reason it is safe to relax here and not in `_industry_score`: there the
+    label moves the score as a SINGLE signal, so a shaky classification silently
+    moves a number on its own. Here it is one half of a conjunction whose other
+    half is an explicit, human-readable business-model statement. A false hard
+    reject needs a classifier error AND a service-provider description AND no
+    operator self-assertion — and the family opens a typed Operator Review Queue
+    row, so the rejection is auditable and reversible.
+    """
+    if not description:
+        return None
+    if not industry or industry not in OFF_ICP_INDUSTRIES:
+        return None
+    if industry_status == "unknown":
+        return None
+    if _match_any(description, INTEGRATOR_MANUFACTURER_CARVEOUTS):
+        return None
+    hit = _find_first_match(
+        description, INTEGRATOR_DESCRIPTION_KEYWORDS, word_boundary=True
+    )
+    return hit[2] if hit is not None else None
+
+
+def _match_disqualifier(
+    title_lower: str,
+    company_lower: str,
+    *,
+    description_lower: str = "",
+    industry: str | None = None,
+    industry_status: str = "confirmed",
+) -> tuple[str, str] | None:
     """Return `(verdict_path_slug, matched_keyword)` for this prospect, or None.
+
+    `description_lower` / `industry` / `industry_status` describe the parent
+    company and feed the integrator / service-provider family only (see
+    INTEGRATOR_DESCRIPTION_KEYWORDS). `description_lower` defaults to empty and
+    `industry` to None, so callers that have no company record — tests, repair
+    utilities, the ad-hoc audit scripts — keep their pre-PR-298 behaviour
+    exactly: that family abstains rather than guessing.
 
     Company-based checks (state-owned, PE, consulting firms) run first
     and cannot be bypassed by OPS_OVERRIDE — procurement path is
@@ -451,6 +565,16 @@ def _match_disqualifier(title_lower: str, company_lower: str) -> tuple[str, str]
     )
     if co_freelance is not None:
         return ("disqualifier_freelance", co_freelance[2])
+    # Integrator / service provider (PR-298). Runs LAST among the company
+    # families so a company that is also state-owned / a named consultancy / an
+    # academic institution keeps its more specific slug — this one is the
+    # residual "sells to our buyers" catch. Reads the company DESCRIPTION, not
+    # the name, and abstains without both halves.
+    integrator_kw = _is_integrator_service_provider(
+        description_lower, industry, industry_status
+    )
+    if integrator_kw is not None:
+        return ("disqualifier_integrator", integrator_kw)
     # Title-based: pick the EARLIEST match across the families so
     # the verdict_path reflects the dominant signal in the title.
     title_matches: list[tuple[str, tuple[int, int, str]]] = []
@@ -533,6 +657,9 @@ VERDICT_PATHS: frozenset[str] = frozenset({
     "disqualifier_freelance",
     # PR-238 medical / regulatory / clinical-affairs title family
     "disqualifier_medical_regulatory",
+    # PR-298: small integrator / service provider — "sells to our buyers",
+    # not "is one" (DESCRIPTION-keyed, conjoined with an off-ICP industry).
+    "disqualifier_integrator",
 })
 
 # The verdict paths score_prospect emits for a DETERMINISTIC pass (>75 gate,
@@ -560,6 +687,9 @@ DISQUALIFIER_VERDICT_PATHS: frozenset[str] = frozenset({
     "disqualifier_freelance",
     # PR-238 medical / regulatory / clinical-affairs title family
     "disqualifier_medical_regulatory",
+    # PR-298: small integrator / service provider — "sells to our buyers",
+    # not "is one" (DESCRIPTION-keyed, conjoined with an off-ICP industry).
+    "disqualifier_integrator",
 })
 
 
@@ -1227,7 +1357,19 @@ def score_prospect(
     # incidental). Company-based families ignore OPS_OVERRIDE; HR/Finance/
     # Innovation bypass when manufacturing-ops keywords dominate the title;
     # Consulting is bypass-exempt — see CONSULTING_TITLE_KEYWORDS.
-    disqualifier_match = _match_disqualifier(title_lower, company.lower())
+    # PR-298: the integrator family additionally reads the parent company's
+    # description, paired with the industry label already resolved above (so the
+    # two consumers of that label can never disagree).
+    # weekly_prospect._enrich_prospect_industry stamps company_description;
+    # callers without a company record leave it absent and the family abstains
+    # (see _is_integrator_service_provider).
+    disqualifier_match = _match_disqualifier(
+        title_lower,
+        company.lower(),
+        description_lower=str(prospect_data.get("company_description") or "").lower(),
+        industry=industry,
+        industry_status=industry_vertical_status,
+    )
 
     # Hybrid gate: deterministic for clear-cut, Haiku for borderline.
     # Cost control — the LLM is NEVER called for score < 40 or score > 75.

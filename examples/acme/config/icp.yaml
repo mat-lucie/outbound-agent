@@ -737,3 +737,150 @@ disqualifiers:
     - assuntos regulatorios
     - farmacovigilância
     - acesso ao mercado
+
+  # ── Integrator / service-provider COMPANY family (DESCRIPTION-keyed) ──
+  # "IS a manufacturer" vs "SELLS to manufacturers". A small automation
+  # integrator looks like an in-ICP plant on every other signal: its CRM
+  # categories are Machinery / Industrials & Manufacturing, its people carry
+  # plant-coded titles, and its company NAME is often a bare brand with no
+  # service token to catch. The company DESCRIPTION is the one field that
+  # states the business model.
+  #
+  # CONJUNCTION, never description-alone: the industry classifier must ALSO
+  # have labelled the company an off-ICP vertical ("Other") with a status other
+  # than "unknown". Description-alone is far too loose — large automation
+  # EQUIPMENT makers run real plants and describe themselves in these exact
+  # words, so they would be hard-rejected on a description-only predicate.
+  #
+  # Word-boundary matched so short tokens ("integrator") cannot substring-fire.
+  integrator_description_keywords:
+    # English — business-model statements, not industry words.
+    #
+    # NOTE bare possessives ("our clients", "nuestros clientes", "nossos
+    # clientes") are deliberately ABSENT: every B2B manufacturer writes them,
+    # they are not business-model statements, and a hit here short-circuits
+    # AHEAD of the decision-maker LLM rescue — so a real plant director whose
+    # blurb said "entregamos a nuestros clientes" would be hard-rejected
+    # without ever reaching the check designed to catch that misjudgment.
+    # Client words survive only when bound to a SERVICE verb.
+    - solutions provider
+    - provider of solutions
+    - solution provider
+    - service provider
+    - systems integrator
+    - system integrator
+    - systems integration
+    - integrator
+    - integration services
+    - industrial automation
+    - automation solutions
+    - automation company
+    - engineering services
+    - consulting
+    - consultancy
+    - consulting services
+    - turnkey solutions
+    - turnkey projects
+    - software development
+    - it services
+    - our customers include
+    # Both inflections of each verb — first person ("we help manufacturers")
+    # and third ("helps manufacturers") are the same signal, and listing only
+    # one silently drops half of them.
+    - helps companies
+    - help companies
+    - helps manufacturers
+    - help manufacturers
+    - helps its clients
+    - help our clients
+    - serving manufacturers
+    - serves manufacturers
+    - specializing in industry 4.0
+    - systems house
+    # Spanish
+    - automatización industrial
+    - automatizacion industrial
+    - integrador de sistemas
+    - integradora de sistemas
+    - soluciones de automatización
+    - soluciones de automatizacion
+    - proveedor de soluciones
+    - proveedor de servicios
+    - prestador de servicios
+    - servicios de ingeniería
+    - servicios de ingenieria
+    - consultoría
+    - consultoria
+    - llave en mano
+    # Portuguese ("integrador de sistemas" / "consultoria" are shared with the
+    # Spanish block above — listed once, not per language).
+    - automação industrial
+    - automacao industrial
+    - soluções de automação
+    - solucoes de automacao
+    - prestadora de serviços
+    - prestadora de servicos
+    - serviços de engenharia
+    - servicos de engenharia
+    - fornecedor de soluções
+    - fornecedor de solucoes
+    - chave na mão
+    - chave na mao
+
+  # Carve-outs — description phrases in which the company asserts that IT runs
+  # production. A company that both integrates and manufactures is judged on
+  # the plant it owns, so any hit suppresses the family. Substring-matched, so
+  # a shorter phrase subsumes its plural ("our plant" covers "our plants").
+  #
+  # Every phrase MUST carry its own SUBJECT:
+  #   * A bare stem ("manufactur") reads as a carve-out in "a systems
+  #     integrator serving discrete MANUFACTURERS" and un-catches the whole
+  #     population this family exists for.
+  #   * A bare genitive ("manufacturer of", "fabricante de") matches the OEM an
+  #     integrator RESELLS — naming your vendor is standard integrator copy.
+  # Deliberately NARROW: the industry half already requires the classifier to
+  # have labelled the company a non-manufacturer, so a genuine manufacturer
+  # reaching this carve-out is already a classification error, while an
+  # over-loose carve-out silently re-admits integrators.
+  integrator_manufacturer_carveouts:
+    # English — "we make it" claims.
+    - is a manufacturer
+    - are a manufacturer
+    - we manufacture
+    - manufactures
+    - leading manufacturer
+    - largest manufacturer
+    - we produce
+    - we run our plant
+    - our factory
+    - our factories
+    - our plant
+    - our own plant
+    - our production facilit
+    - our manufacturing plant
+    - our manufacturing facilit
+    # Spanish
+    - es fabricante
+    - somos fabricante
+    - fabricamos
+    - producimos
+    - fabricante líder
+    - fabricante lider
+    - principal fabricante
+    - nuestra planta
+    - nuestras plantas
+    - nuestra fábrica
+    - nuestra fabrica
+    - nuestras fábricas
+    - nuestras fabricas
+    - plantas de producción propias
+    # Portuguese ("somos fabricante" / "fabricamos" are shared with Spanish).
+    - é fabricante
+    - produzimos
+    - nossa fábrica
+    - nossa fabrica
+    - nossas fábricas
+    - nossas fabricas
+    - nossa planta
+    - nossas plantas
+

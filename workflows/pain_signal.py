@@ -1141,6 +1141,7 @@ def run_pain_signal_discovery(
     )
     from workflows.industry_classifier import build_anthropic_client
     from workflows.weekly_prospect import (
+        CompanySignals,
         _attio_inner_client,
         _build_name_index,
         _load_in_list_canonical_urls,
@@ -1887,7 +1888,7 @@ def run_pain_signal_discovery(
         # (Schema preflight already ran pre-spend, before Phase 1.)
 
         seen_urls: set[str] = set()
-        industry_cache: dict[str, tuple[str | None, str | None]] = {}
+        industry_cache: dict[str, CompanySignals] = {}
         today = date.today().isoformat()
         for language, rows in sorted(candidates_by_language.items()):
             if not rows:

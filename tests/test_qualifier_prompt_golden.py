@@ -80,6 +80,8 @@ _BASE_TOY_YAML = textwrap.dedent(
       competitor_company_keywords: ["rival systems"]
       freelance_employer_keywords: ["freelance"]
       medical_regulatory_title_keywords: ["medical affairs"]
+      integrator_description_keywords: ["systems integrator"]
+      integrator_manufacturer_carveouts: ["we manufacture"]
     """
 )
 

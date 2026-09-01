@@ -446,6 +446,22 @@ def first_option_title(raw) -> str:
     return ""
 
 
+def first_text_value(raw) -> str:
+    """Extract the first plain value from a CRM text-attribute value list.
+
+    Companion to ``first_option_title`` for attrs shaped
+    ``[{"value": "Acme makes widgets"}]`` (e.g. ``description``). Returns
+    ``""`` for None/empty/malformed values, and tolerates the bare-scalar
+    shape some fixtures use.
+    """
+    if raw and isinstance(raw, list):
+        first = raw[0]
+        if isinstance(first, dict):
+            return str(first.get("value", "") or "")
+        return str(first)
+    return ""
+
+
 class AttioClient:
     """Client for the Attio REST API v2."""
 

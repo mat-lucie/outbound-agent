@@ -21,6 +21,8 @@ from clients.attio import (
     AttioClient,
     _canonical_linkedin_url,
     first_option_title,
+    first_text_value,
+    is_linkedin_clearbit_corrupted,
     linkedin_identity_key,
 )
 from clients.pb_config import (
@@ -1913,18 +1915,45 @@ def _load_in_list_canonical_urls(
     return urls
 
 
-def _resolve_company_industry(
+class CompanySignals(NamedTuple):
+    """The parent-company fields `score_prospect` reads, resolved once per
+    company per run (see `_resolve_company_signals`).
+
+    `description` (PR-298) feeds the integrator / service-provider disqualifier
+    family, paired with the industry label. It comes from CRM company
+    enrichment, so it is empty for a company this pipeline has never seen —
+    that family abstains rather than guessing, by design.
+
+    Deliberately NOT carrying a headcount/size field: those are premium CRM
+    enrichment attributes a base API entitlement reads as empty on every
+    record, so a field plumbed through here would be permanently blank — see
+    the note in quality_gate's integrator block.
+    """
+
+    industry: str | None = None
+    industry_status: str | None = None
+    description: str = ""
+
+
+def _resolve_company_signals(
     attio: AttioClient,
     company_name: str,
     domain: str | None,
-    cache: dict[str, tuple[str | None, str | None]],
+    cache: dict[str, CompanySignals],
     *,
     dry_run: bool,
     anthropic_client=None,
     summary: dict | None = None,
-) -> tuple[str | None, str | None]:
-    """Resolve `(industry_vertical, industry_vertical_status)` for a prospect's
-    parent company, classifying at ingest time when the company has no label yet.
+) -> CompanySignals:
+    """Resolve the scoring signals carried by a prospect's parent company —
+    `(industry_vertical, industry_vertical_status, description)` — classifying
+    industry at ingest time when the company has no label yet.
+
+    `description` is read straight off the company record when one exists; it is
+    an enrichment field this pipeline never writes, so it is simply empty when
+    the CRM has not enriched the company yet (and for a company with no record
+    at all). Empty is the abstain signal for the integrator family — never a
+    default.
 
     Resolution order (PR-25 follow-up — closes the TODO at quality_gate.py
     `score_prospect`, which read `industry`/`industry_vertical_status` from
@@ -1946,28 +1975,43 @@ def _resolve_company_industry(
     never-seen companies, consistent with dry-run being a content QA pass, not
     a score preview.
 
-    Returns (None, None) when the company is unknown and unclassifiable —
-    score_prospect treats missing industry as neutral, never as "Other".
-    Transient per-company CRM errors degrade to (None, None) with a warning;
-    auth errors (401/403) propagate so the run fails loud. (PR-225)
+    Returns an all-empty CompanySignals when the company is unknown and
+    unclassifiable — score_prospect treats missing industry as neutral, never as
+    an off-ICP label. Transient per-company CRM errors degrade to empty signals
+    with a warning; auth errors (401/403) propagate so the run fails loud.
+    (PR-225, PR-298)
     """
     if not company_name:
-        return None, None
+        return CompanySignals()
     cache_key = normalize_company_name(company_name) or company_name.strip().lower()
     if cache_key in cache:
         return cache[cache_key]
 
     from workflows.industry_classifier import build_classifier_payload, classify_industry
 
-    result: tuple[str | None, str | None] = (None, None)
+    result = CompanySignals()
     try:
         record = find_company_record(attio, company_name, domain or None)
         if record is not None:
             values = record.get("values", {})
+            # Enrichment field, read off the record already in hand. Free — no
+            # extra request — and available in dry-run, unlike the
+            # classify-on-miss branch below.
+            #
+            # SKIPPED on a Clearbit-corrupted record: those carry LinkedIn's own
+            # enrichment payload under the real employer's name, so their
+            # description describes LinkedIn, not this company. Scoring on it
+            # would be a confident wrong answer; abstaining is the honest one.
+            # (industry_vertical below is pipeline-written, not Clearbit-written,
+            # so it stays trusted.)
+            if not is_linkedin_clearbit_corrupted(record):
+                result = result._replace(
+                    description=first_text_value(values.get("description")),
+                )
             label: str | None = first_option_title(values.get("industry_vertical"))
             if label:
                 status = first_option_title(values.get("industry_vertical_status"))
-                result = (label, status or None)
+                result = result._replace(industry=label, industry_status=status or None)
             elif not dry_run:
                 label = classify_industry(
                     company_name, domain or None, anthropic_client=anthropic_client
@@ -1976,7 +2020,9 @@ def _resolve_company_industry(
                     record_id = record.get("id", {}).get("record_id", "")
                     if record_id:
                         attio.update_company(record_id, build_classifier_payload(label))
-                    result = (label, "low_confidence")
+                    result = result._replace(
+                        industry=label, industry_status="low_confidence"
+                    )
                     if summary is not None:
                         summary["industry_classified_at_ingest"] = (
                             summary.get("industry_classified_at_ingest", 0) + 1
@@ -1984,11 +2030,15 @@ def _resolve_company_industry(
         elif not dry_run:
             # No company record yet — classify now so the score carries the
             # industry signal; _commit_prospect stamps the label on CREATE.
+            # description stays empty: there is no record to read it from, and
+            # this pipeline never writes it.
             label = classify_industry(
                 company_name, domain or None, anthropic_client=anthropic_client
             )
             if label:
-                result = (label, "low_confidence")
+                result = result._replace(
+                    industry=label, industry_status="low_confidence"
+                )
                 if summary is not None:
                     summary["industry_classified_at_ingest"] = (
                         summary.get("industry_classified_at_ingest", 0) + 1
@@ -1997,14 +2047,14 @@ def _resolve_company_industry(
         if err.response.status_code in (401, 403):
             raise  # auth failure — every later call fails too; abort loud
         logger.warning(
-            "_resolve_company_industry: HTTP %s for %r — scoring without industry",
+            "_resolve_company_signals: HTTP %s for %r — scoring without industry",
             err.response.status_code, company_name,
         )
         if summary is not None:
             summary["industry_resolve_errors"] = summary.get("industry_resolve_errors", 0) + 1
     except (httpx.ConnectError, httpx.TimeoutException) as err:
         logger.warning(
-            "_resolve_company_industry: network error for %r — scoring without "
+            "_resolve_company_signals: network error for %r — scoring without "
             "industry: %s", company_name, err,
         )
         if summary is not None:
@@ -2018,17 +2068,21 @@ def _enrich_prospect_industry(
     attio: AttioClient,
     prospect_data: dict,
     raw: dict,
-    cache: dict[str, tuple[str | None, str | None]],
+    cache: dict[str, CompanySignals],
     *,
     dry_run: bool,
     anthropic_client=None,
     summary: dict | None = None,
 ) -> None:
-    """Stamp `industry` / `industry_vertical_status` onto prospect_data from
-    the parent company (see _resolve_company_industry). Mutates in place; the
-    status key is only set when a status exists — an absent key means
-    score_prospect's back-compat "confirmed" default applies. (PR-225)"""
-    industry, industry_status = _resolve_company_industry(
+    """Stamp the parent company's scoring signals onto prospect_data (see
+    `_resolve_company_signals`). Mutates in place. (PR-225, PR-298)
+
+    Every key is written only when the signal actually resolved, so an absent
+    key means "no signal" rather than a defaulted one. `industry_vertical_status`
+    absent means score_prospect's back-compat "confirmed" default applies;
+    `company_description` absent means the integrator disqualifier family
+    abstains."""
+    signals = _resolve_company_signals(
         attio,
         prospect_data["company"],
         extract_real_domain(raw),
@@ -2037,10 +2091,17 @@ def _enrich_prospect_industry(
         anthropic_client=anthropic_client,
         summary=summary,
     )
-    if industry:
-        prospect_data["industry"] = industry
-        if industry_status:
-            prospect_data["industry_vertical_status"] = industry_status
+    if signals.industry:
+        prospect_data["industry"] = signals.industry
+        if signals.industry_status:
+            prospect_data["industry_vertical_status"] = signals.industry_status
+    if signals.description:
+        # Truncated at the stamp site: prospect_data is serialized whole into
+        # the borderline-staging JSONL, and an uncapped enrichment blurb is an
+        # unbounded growth vector on a file that has already blown up once. The
+        # integrator keywords are business-model statements that sit in the
+        # opening sentence, so the head of the description carries the signal.
+        prospect_data["company_description"] = signals.description[:500]
 
 
 def new_process_summary() -> dict[str, Any]:
@@ -2139,7 +2200,7 @@ def _process_prospects(
     seen_urls_midmarket: set[str] | None = None,
     in_list_canonical_urls: set[str] | None = None,
     name_index: NameIndex | None = None,
-    industry_cache: dict[str, tuple[str | None, str | None]] | None = None,
+    industry_cache: dict[str, CompanySignals] | None = None,
     lane_entry_attrs: Callable[[dict], dict] | None = None,
     default_language: str | None = None,
     agent_gate: bool = True,
@@ -2839,7 +2900,7 @@ def run_weekly_prospecting(
     # same company routinely surfaces in multiple SN searches (enterprise +
     # midmarket personas over one geo); sharing prevents duplicate CRM lookups
     # and duplicate LLM classifications of the same company. (PR-225)
-    industry_cache: dict[str, tuple[str | None, str | None]] = {}
+    industry_cache: dict[str, CompanySignals] = {}
 
     for i, (persona_key, geo_key, sn_url) in enumerate(searches, 1):
         click.echo(f"[{i}/{len(searches)}] {persona_key} / {geo_key}")
