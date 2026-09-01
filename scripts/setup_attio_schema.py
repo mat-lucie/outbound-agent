@@ -20,6 +20,14 @@ replied to an outreach email. Also DISABLED by default: the detector
 no-ops without a Gmail token, and these writes 400 until provisioned. See
 GETTING_STARTED.md → Email Response Detection.
 
+The optional Botdog transport feature (``--feature botdog``) provisions the
+single ``send_channel`` list-entry attribute the delivery-transport routing
+reads. PhantomBuster owns sending, so a normal install never needs it: the
+resolver treats an absent/unset value as ``pb``. Provision it only if you
+wire the optional Botdog transport and need to mark rows it owns. Nothing in
+this engine WRITES the attribute — it is read-only routing state whose sole
+writer is an operator's own migration.
+
 The optional Migration Provenance feature (``--feature provenance``)
 creates the ``last_migrated_by`` back-pointer on the record objects
 ``MigrationRunWriter`` stamps (``people`` and ``companies``). Without it
@@ -35,6 +43,7 @@ Usage:
   python3 scripts/setup_attio_schema.py --feature radar       # add radar attrs
   python3 scripts/setup_attio_schema.py --feature phase06     # add email-detection attrs
   python3 scripts/setup_attio_schema.py --feature provenance  # add last_migrated_by
+  python3 scripts/setup_attio_schema.py --feature botdog      # add send_channel
   python3 scripts/setup_attio_schema.py --feature all         # all of the above
 """
 from __future__ import annotations
@@ -290,6 +299,49 @@ def _provision_provenance(client: AttioClient, dry_run: bool) -> None:
         raise click.ClickException(
             f"{failed} provenance item(s) failed to provision."
         )
+
+
+# ── Botdog delivery-transport routing (OPTIONAL) ───────────────────────────
+# One list-entry attribute. OFF by default: PhantomBuster owns sending, and
+# `_resolve_send_channel` reads an absent/unset value as "pb", so a fresh
+# install never needs this attribute at all.
+_BOTDOG_SEND_CHANNEL_SLUG = "send_channel"
+_BOTDOG_SEND_CHANNEL_OPTIONS = ["pb", "botdog"]
+_BOTDOG_SEND_CHANNEL_DESCRIPTION = (
+    "Delivery transport that owns this prospect's LinkedIn sends. "
+    "Missing/unset resolves to 'pb' (PhantomBuster) — the default and only "
+    "wired send transport. A row stamped 'botdog' is HELD OUT of PB invites "
+    "and DMs and out of the Phase 0 / 0.5 scrape detectors, so it receives "
+    "no outreach from any transport until it is re-stamped 'pb'. Read-only "
+    "routing state: no code in this engine writes it."
+)
+
+
+def _provision_botdog(client: AttioClient, list_id: str, dry_run: bool) -> None:
+    """Idempotently create the `send_channel` routing attribute.
+
+    `ensure_attribute` skips an attribute that already exists, so re-running
+    is free.
+    """
+    click.echo("\nBotdog delivery-transport routing (optional):")
+    target = f"linkedin_outreach.{_BOTDOG_SEND_CHANNEL_SLUG}"
+    try:
+        action = ensure_attribute(
+            client, "list", list_id, _BOTDOG_SEND_CHANNEL_SLUG, "select",
+            options=_BOTDOG_SEND_CHANNEL_OPTIONS,
+            description=_BOTDOG_SEND_CHANNEL_DESCRIPTION,
+            dry_run=dry_run,
+        )
+    except Exception as exc:  # noqa: BLE001
+        click.echo(f"  ✗ {target}: FAILED — {exc}", err=True)
+        raise click.ClickException(
+            "send_channel failed to provision."
+        ) from exc
+    if action in ("created", "would_create"):
+        tag = "[dry-run] would create" if dry_run else "created"
+        click.echo(f"  + {target} (select: pb | botdog): {tag}")
+    else:
+        click.echo(f"  ✓ {target}: exists ({action})")
 
 
 # Spec: each entry is (parent_kind, parent_id_or_slug, attribute body).
@@ -551,7 +603,9 @@ def _create_option(
 @click.option("--dry-run", is_flag=True, help="List actions without writing.")
 @click.option(
     "--feature",
-    type=click.Choice(["core", "radar", "phase06", "provenance", "all"]),
+    type=click.Choice(
+        ["core", "radar", "phase06", "provenance", "botdog", "all"]
+    ),
     default="core",
     show_default=True,
     help=(
@@ -559,9 +613,10 @@ def _create_option(
         "persistence attrs only. 'radar' = Follow-up Radar attrs only. "
         "'phase06' = email response detection attrs only (PR-243). "
         "'provenance' = the §3.13 last_migrated_by back-pointers only. "
-        "'all' = all of them. Radar, phase06 and provenance are off by "
-        "default; provision them only when you want those features (see "
-        "GETTING_STARTED.md)."
+        "'botdog' = the optional send_channel routing attribute only. "
+        "'all' = all of them. Radar, phase06, provenance and botdog are "
+        "off by default; provision them only when you want those features "
+        "(see GETTING_STARTED.md)."
     ),
 )
 def main(dry_run: bool, feature: str) -> int:
@@ -577,6 +632,9 @@ def main(dry_run: bool, feature: str) -> int:
             return 0
         if feature == "provenance":
             _provision_provenance(client, dry_run)
+            return 0
+        if feature == "botdog":
+            _provision_botdog(client, list_id, dry_run)
             return 0
         # Cache existing slugs per parent so we make one GET per parent
         cache: dict[tuple[str, str], set[str]] = {}
@@ -629,6 +687,7 @@ def main(dry_run: bool, feature: str) -> int:
             _provision_radar(client, list_id, dry_run)
             _provision_phase06(client, dry_run)
             _provision_provenance(client, dry_run)
+            _provision_botdog(client, list_id, dry_run)
     return 0
 
 
