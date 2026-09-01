@@ -163,6 +163,42 @@ Requires Gmail email-response detection (above) for the conversation-ledger
 side; without it the radar still runs on CRM-resident signals and simply skips
 the email sweep.
 
+#### The 90-day Gmail conversation sweep
+
+`scripts/gmail_sweep.py` is the radar's blind-spot cover: the engine only sees
+accounts that have a CRM record, while the sweep reads the last 90 days of
+Gmail directly and reports every live counterparty with its true recency and
+direction-of-ball. Run it by hand or from your review skill; it prints one JSON
+object on stdout (warnings go to stderr, so the output stays parseable) and
+writes nothing anywhere.
+
+```bash
+python3 scripts/gmail_sweep.py
+```
+
+It needs the same `[gmail]` extra and read-only token as email-response
+detection, plus your own mail domains — set `OUTBOUND_INTERNAL_DOMAINS`
+(comma-separated) or let it fall back to the domain in `EMAIL_FROM` /
+`EMAIL_REPLY_TO`. With neither, it exits with an error instead of guessing:
+without knowing which addresses are yours it cannot tell a sent message from a
+received one, and every thread would come back as "you owe a reply".
+
+Two things worth knowing before you tune it:
+
+- **Silencing is structural.** Robots, vendors and bulk senders are dropped
+  from the sweep entirely — a silenced counterparty leaves no trace in the
+  output. That is why the filter is an allow-list of ESP registrable domains
+  rather than a shape rule: a corporate `mail.<brand>.com` and
+  `mail.sendgrid.net` are indistinguishable by shape, and the cost of guessing
+  is a hidden prospect. Add your own tools with
+  `OUTBOUND_SWEEP_VENDOR_DOMAINS`, and only domains that can never be a
+  counterparty.
+- **Incomplete is reported, not hidden.** `sweep_complete: false` means an API
+  error, a repeated page token, or the page cap stopped the sweep early and
+  counterparties may be MISSING; `failed_thread_ids` names the threads that
+  could not be fetched. Anything consuming the JSON should say so rather than
+  present a partial sweep as a complete one.
+
 ### (Optional) Migration provenance back-pointers
 
 **Off by default.** Only needed if you run the `scripts/migrate_*` or
