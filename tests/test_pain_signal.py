@@ -2483,3 +2483,135 @@ class TestSharedIngestGates:
                 default_language="pt",
             )
             assert captured["language"] == expected
+
+
+# ── CLI wiring: the off-by-default posture ───────────────────────────
+
+
+class TestPainSignalCli:
+    def _invoke(self, argv):
+        from click.testing import CliRunner
+
+        from cli import cli
+
+        return CliRunner().invoke(cli, argv, catch_exceptions=False)
+
+    def test_disabled_aborts_before_any_work(self, monkeypatch):
+        """Default install: the command refuses and names the flag. Nothing
+        is constructed — no CRM client, no PB client, no lock."""
+        monkeypatch.delenv(PAIN_SIGNAL_ENABLED_ENV, raising=False)
+        result = self._invoke(
+            ["pain-signal", "--posts-worker-id", "w", "--dry-run"]
+        )
+        assert result.exit_code == 1
+        assert "ABORT" in result.stderr
+        assert PAIN_SIGNAL_ENABLED_ENV in result.stderr
+
+    def test_enabled_but_unconfigured_posts_worker_aborts(self, monkeypatch):
+        monkeypatch.setenv(PAIN_SIGNAL_ENABLED_ENV, "1")
+        result = self._invoke(
+            ["pain-signal", "--posts-worker-id", "",
+             "--sales-nav-profile-scraper-id", "sn", "--dry-run"]
+        )
+        assert result.exit_code == 1
+        assert "posts worker is not configured" in result.stderr
+
+    def test_placeholder_worker_id_is_treated_as_unconfigured(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(PAIN_SIGNAL_ENABLED_ENV, "1")
+        result = self._invoke(
+            ["pain-signal",
+             "--posts-worker-id", "REPLACE_WITH_POSTS_WORKER_PHANTOM_ID",
+             "--sales-nav-profile-scraper-id", "sn", "--dry-run"]
+        )
+        assert result.exit_code == 1
+        assert "posts worker is not configured" in result.stderr
+
+    def test_missing_sn_scraper_aborts(self, monkeypatch):
+        monkeypatch.setenv(PAIN_SIGNAL_ENABLED_ENV, "1")
+        result = self._invoke(
+            ["pain-signal", "--posts-worker-id", "w",
+             "--sales-nav-profile-scraper-id", "", "--dry-run"]
+        )
+        assert result.exit_code == 1
+        assert "PB_SALES_NAV_PROFILE_SCRAPER_ID" in result.stderr
+
+    @pytest.mark.parametrize(
+        ("value", "unconfigured"),
+        [
+            ("", True), ("REPLACE_WITH_X", True), ("todo", True),
+            ("1111111111111111", False),  # synthetic — never a real agent id
+        ],
+    )
+    def test_agent_unconfigured_predicate(self, value, unconfigured):
+        from cli import _pb_agent_unconfigured
+
+        assert _pb_agent_unconfigured(value) is unconfigured
+
+    def test_worker_ids_default_from_pb_config(self, monkeypatch):
+        """Fork seam: the ids resolve through clients/pb_config (yaml → env →
+        ""), read LIVE, so no agent id is ever baked into the tree."""
+        from clients.pb_config import load_pb_config
+
+        monkeypatch.setenv("PB_PAIN_POSTS_WORKER_ID", "posts-123")
+        monkeypatch.setenv("PB_PAIN_COMMENTERS_WORKER_ID", "com-456")
+        monkeypatch.setenv("PB_PAIN_LIKERS_WORKER_ID", "lik-789")
+        cfg = load_pb_config()
+        assert cfg.pain_posts_worker_id == "posts-123"
+        assert cfg.pain_commenters_worker_id == "com-456"
+        assert cfg.pain_likers_worker_id == "lik-789"
+
+    def test_worker_ids_default_empty_without_config(self, monkeypatch):
+        from clients.pb_config import load_pb_config
+
+        for var in (
+            "PB_PAIN_POSTS_WORKER_ID",
+            "PB_PAIN_COMMENTERS_WORKER_ID",
+            "PB_PAIN_LIKERS_WORKER_ID",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        cfg = load_pb_config()
+        assert cfg.pain_posts_worker_id == ""
+        assert cfg.pain_commenters_worker_id == ""
+        assert cfg.pain_likers_worker_id == ""
+
+    def test_example_yaml_ships_no_agent_ids(self):
+        """The shipped template must never carry a real phantom id."""
+        from pathlib import Path
+
+        import yaml
+
+        repo_root = Path(__file__).resolve().parent.parent
+        agents = yaml.safe_load(
+            (repo_root / "config" / "phantombuster.example.yaml").read_text()
+        )["agents"]
+        for key in (
+            "pain_posts_worker",
+            "pain_commenters_worker",
+            "pain_likers_worker",
+        ):
+            assert agents[key] == ""
+
+
+class TestDailyPhase09Gate:
+    """The daily run degrades to ONE visible status line when the lane is
+    off — the same ship posture as the radar / email lanes."""
+
+    def test_daily_source_wires_phase_09_behind_the_gate(self):
+        """Structural guard: Phase 0.9 must stay gated on
+        is_pain_signal_enabled() and must never halt the daily run."""
+        import inspect
+
+        import cli as cli_module
+
+        source = inspect.getsource(cli_module)
+        assert "--- Phase 0.9: Pain-Signal Discovery ---" in source
+        phase = source.split("--- Phase 0.9: Pain-Signal Discovery ---", 1)[1]
+        phase = phase.split("Pipeline starvation check", 1)[0]
+        assert "is_pain_signal_enabled()" in phase
+        assert "unset — " in phase and "off by default" in phase
+        # The lane must never take down the sends that run after it: a
+        # broad except, a warn, and no re-raise.
+        assert "Pain-signal discovery SKIPPED" in phase
+        assert "raise" not in phase

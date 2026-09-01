@@ -1,7 +1,7 @@
 """Three-arm experiment-registry pre-flight (2026-08-23 silent-failure review).
 
 Covers ``cli._experiment_registry_preflight``, the helper shared by the
-``daily``, ``send-dms``, and ``weekly`` commands:
+``daily``, ``send-dms``, ``weekly``, and ``pain-signal`` commands:
 
 - arm (a): MultipleRunningExperimentsError → SystemExit(1), ABORT on stderr
   (unchanged behaviour, previously duplicated inline per command).
@@ -92,7 +92,7 @@ class TestPreflightHelperArms:
         """The abort names the command so cron logs are attributable."""
         from cli import _experiment_registry_preflight
 
-        for command in ("daily", "send-dms", "weekly"):
+        for command in ("daily", "send-dms", "weekly", "pain-signal"):
             with patch(
                 "models.experiment.get_current_experiment_id",
                 side_effect=OSError("boom"),
@@ -131,4 +131,38 @@ def test_cli_commands_abort_on_registry_failure(argv):
     assert result.exit_code == 1
     assert b"ABORT" not in result.stdout_bytes  # not stdout
     assert "ABORT" in result.stderr             # stderr
+    assert "unreadable" in result.stderr
+
+
+def test_pain_signal_aborts_on_registry_failure():
+    """pain-signal shares the three-arm preflight (PR-283) — a registry
+    failure aborts it too.
+
+    The command's own gates (the lane-enabled flag, the PB agent ids) sit
+    BEFORE the preflight, so both are satisfied to reach it.
+    """
+    from click.testing import CliRunner
+
+    from cli import cli
+
+    runner = CliRunner()
+    with patch(
+        "workflows.pain_signal.is_pain_signal_enabled", return_value=True,
+    ), patch(
+        "models.experiment.get_current_experiment_id",
+        side_effect=OSError("Permission denied: experiments.tsv"),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "pain-signal",
+                "--posts-worker-id", "fake-posts-worker-id",
+                "--sales-nav-profile-scraper-id", "fake-sn-id",
+            ],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 1
+    assert "ABORT" in result.stderr
+    assert "cannot run pain-signal" in result.stderr
     assert "unreadable" in result.stderr
