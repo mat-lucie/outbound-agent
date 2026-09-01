@@ -9,8 +9,8 @@ are passed as a list — no shell injection possible.
 
 Usage:
     python scripts/qualify_borderline.py \\
-        --scored exports/reizin-scored.json \\
-        --output exports/reizin-qualified.json \\
+        --scored exports/referrals-scored.json \\
+        --output exports/referrals-qualified.json \\
         [--concurrency 20] \\
         [--max-runtime-min 30]
 """
@@ -353,12 +353,12 @@ def main() -> None:
         "--scored",
         required=True,
         help="Path to scored JSON produced by score_referral_csv.py "
-             "(e.g. exports/reizin-scored.json)",
+             "(e.g. exports/referrals-scored.json)",
     )
     parser.add_argument(
         "--output",
         required=True,
-        help="Path for qualified JSON output (e.g. exports/reizin-qualified.json)",
+        help="Path for qualified JSON output (e.g. exports/referrals-qualified.json)",
     )
     parser.add_argument(
         "--concurrency",
