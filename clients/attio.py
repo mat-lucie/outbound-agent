@@ -13,6 +13,7 @@ from urllib.parse import unquote
 import httpx
 
 from models.pipeline import STAGE_RANK, PipelineStage
+from models.resolution import LANGUAGE_OVERRIDE_READ_FAILED
 
 logger = logging.getLogger(__name__)
 
@@ -376,6 +377,13 @@ class AttioClient:
         # DM/connection language guard (PR-240) costs at most one company fetch
         # per distinct company per run.
         self._company_hq_country_cache: dict[str, str | None] = {}
+        # person_record_id → raw `people.language` code, or None when the
+        # person carries no override. Populated as a SIDE EFFECT of
+        # extract_record_info (same idiom as _person_to_company) so the
+        # language override rides the existing bulk person preload and
+        # costs zero extra API calls on the send path — which matters,
+        # since this lives inside the send-dms latency budget.
+        self._person_language_cache: dict[str, str | None] = {}
         # Count of stage-regressing add_list_entry PATCHes the defense-in-depth
         # backstop neutralized over this client's lifetime. A batch orchestrator
         # can read this after a run and escalate if it fired — escalate() can't
@@ -796,6 +804,15 @@ class AttioClient:
         the private cache dict.
         """
         self._company_hq_country_cache.pop(company_id, None)
+
+    def invalidate_person_language(self, person_record_id: str) -> None:
+        """Drop one person from the language-override read cache.
+
+        Public seam for writers that set `people.language` and then verify
+        through `person_language_override` (scripts/set_person_language.py),
+        without reaching into the private cache dict.
+        """
+        self._person_language_cache.pop(person_record_id, None)
 
     def search_company_by_domain(self, domain: str) -> dict | None:
         """Find a company record by domain. Returns None if not found."""
@@ -1451,6 +1468,97 @@ class AttioClient:
                 metrics.bulk_fetch_companies_returned += 1
         return primed
 
+    @staticmethod
+    def extract_person_select_value(values: dict, field: str) -> str:
+        """Extract a select attribute value from a PERSON RECORD's ``values``.
+
+        Handles the shapes ``GET /v2/objects/people/records/{id}`` returns:
+        - ``{field: [{"value": "pt"}]}``                 (plain value)
+        - ``{field: [{"option": {"title": "pt"}}]}``     (select option)
+        - ``{field: "pt"}``                              (scalar, test fakes)
+
+        Returns "" when absent or off-shape — never raises.
+
+        Canonical home for this shape handling: person-record values carry
+        no ``attribute_type`` discriminator, so ``_extract_value`` (which
+        targets LIST-ENTRY values and branches on it) cannot read them.
+        """
+        raw = values.get(field)
+        if raw is None:
+            return ""
+        if isinstance(raw, str):
+            return raw.strip()
+        if isinstance(raw, list) and raw:
+            item = raw[0]
+            if isinstance(item, dict):
+                opt = item.get("option") or {}
+                if isinstance(opt, dict) and opt.get("title"):
+                    return str(opt["title"]).strip()
+                v = item.get("value")
+                if v is not None:
+                    return str(v).strip()
+        return ""
+
+    @staticmethod
+    def _extract_person_language(values: dict) -> str | None:
+        """Raw `people.language` override code, or None when unset.
+
+        Returns the code verbatim (lower-cased) WITHOUT validating it
+        against the `Language` enum — the CRM select may also offer codes
+        the copy library has no templates for. Validation is the
+        resolver's job (`models.resolution.coerce_language`), so an
+        unsupported value degrades to "no override" at exactly one place
+        instead of being silently dropped here.
+        """
+        code = AttioClient.extract_person_select_value(values, "language")
+        return code.lower() or None
+
+    def person_language_override(self, person_record_id: str) -> str | None:
+        """Return this person's explicit `people.language` override, or None.
+
+        The person-level override outranks every company-derived language
+        inference (see `models.resolution` module docstring). It is a
+        NARROW exception list — empty for almost everyone — so None is the
+        normal answer and means "no human has contradicted the inference".
+
+        Cost: free for any person the run already resolved through
+        `RecordCache.get` / `preload_pipeline_persons`, which is every
+        prospect on the send path. Falls back to a single lazy fetch for
+        an unseen person.
+
+        Never raises. Returns None when the id is empty or the record has
+        no override, and the `LANGUAGE_OVERRIDE_READ_FAILED` sentinel when
+        the fetch itself errored.
+
+        The sentinel matters: None is the NORMAL answer here, and a row
+        with no override can still classify as a corroborated source that
+        prints nothing. Collapsing a failed read into None would therefore
+        make a prospect whose override was just lost look HEALTHIER than an
+        ordinary row — and ship the very message the override existed to
+        prevent. The sentinel keeps the two apart all the way to the
+        operator's screen, and the failure is deliberately NOT cached, so a
+        one-off blip is retried rather than frozen in for the whole run.
+        """
+        if not person_record_id:
+            return None
+        if person_record_id in self._person_language_cache:
+            return self._person_language_cache[person_record_id]
+
+        try:
+            record = self.get_person(person_record_id)
+        except Exception as exc:  # noqa: BLE001 — never raise into the send path
+            print(
+                f"  WARN: person_language_override({person_record_id!r}) hit "
+                f"{type(exc).__name__}: {exc}. Language override UNKNOWN for "
+                f"this prospect (not cached; will retry).",
+                file=sys.stderr,
+            )
+            return LANGUAGE_OVERRIDE_READ_FAILED
+
+        code = self._extract_person_language(record.get("values", {})) if record else None
+        self._person_language_cache[person_record_id] = code
+        return code
+
     def extract_record_info(
         self, record: dict,
     ) -> tuple[str | None, str | None, str, str | None, str]:
@@ -1460,6 +1568,14 @@ class AttioClient:
         Industry comes from the company's industry_vertical field. Title is the
         person's own job_title, surfaced so dry-run output can show it for ICP
         review before sending.
+
+        PRECONDITION — `record` must be a COMPLETE person record, not a
+        projection. This method populates the `_person_language_cache`
+        side-effect cache from `record["values"]`, and a partial record
+        would cache "no override" for a person who has one, silently
+        disabling the override with no signal
+        (`person_language_override` trusts the cache and won't re-fetch).
+        Every caller today passes a full `get_person` / bulk-fetch record.
         """
         values = record.get("values", {})
 
@@ -1477,6 +1593,16 @@ class AttioClient:
             title = str(tv.get("value", tv) if isinstance(tv, dict) else tv)
 
         person_record_id = record.get("id", {}).get("record_id", "")
+        if person_record_id:
+            # Side-effect cache, same idiom as _person_to_company below:
+            # the person record is already in hand, so harvesting the
+            # language override here makes person_language_override() free
+            # for every person the run has resolved. The returned tuple is
+            # deliberately NOT widened — many call sites unpack it
+            # positionally, and none of them want this field.
+            self._person_language_cache[person_record_id] = (
+                self._extract_person_language(values)
+            )
         company = ""
         industry = ""
         company_data = values.get("company", values.get("primary_company", []))

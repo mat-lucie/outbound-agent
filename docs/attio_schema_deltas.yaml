@@ -1622,6 +1622,36 @@ attributes:
   # written via AttioWriter (§3.15 registry-gated); email_last_resend_id is
   # written via direct attio.update_person on the email lane (registry entry
   # exists for manifest parity only).
+  # ---------- People: language override ----------
+  - object: people
+    slug: language
+    type: select
+    options: [es, en, pt]
+    pr_id: person-language-override
+    status: shipped
+    write_owner_module: scripts.set_person_language
+    note: |
+      Person-level outreach-language override. Outranks the company-HQ
+      inference in models.resolution (person override > company HQ > lane
+      default), so it survives scripts.backfill_company_hq_country instead
+      of being contradicted by it. Added because company HQ is the wrong
+      key for LATAM-based staff of non-LATAM multinationals — a
+      Portuguese-speaking director at a Europe-HQ group resolves to EN
+      otherwise.
+
+      NARROW EXCEPTION LIST: empty for almost everyone; an empty value
+      means "the inference was never contradicted", NOT a data gap. Do not
+      write a bulk backfill against this attribute.
+
+      A workspace whose select carries extra options this codebase cannot
+      render (no copy for them) is handled, not ignored:
+      models.resolution.coerce_language rejects the value and the send path
+      reports the row as `override-unusable` rather than silently
+      discarding the operator's input.
+
+      Read path is LinkedIn DM/connection-note only — workflows.email_campaign
+      derives language independently from domain + country.
+
   - object: people
     slug: email_response_classification
     type: select

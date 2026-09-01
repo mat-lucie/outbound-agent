@@ -696,6 +696,13 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
     ("deals", "awaiting_reply_note_id"): "workflows.followup_state",
     ("deals", "awaiting_reply_nudge_count"): "workflows.followup_state",
 
+    # language: the person-level outreach-language override that outranks
+    # company-HQ inference in models.resolution. A NARROW human-curated
+    # exception list — empty for almost everyone — so the script is the
+    # only code writer; operators may also set it by hand in the CRM UI,
+    # which the resolver reads the same way.
+    ("people", "language"): "scripts.set_person_language",
+
     # ---- People: email response detection (Phase 0.6, PR-243) ----
     # Sole writer: the daily-run email reply detector. Note that
     # email_campaign_stage itself stays OUTSIDE the registry (the email
