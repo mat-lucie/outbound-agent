@@ -230,6 +230,8 @@ NAMES_DENYLIST = (
     "pepe",                         # nickname carried in a dedup fixture
     # other real companies from private notes
     "bachoco", "suzano", "canela", "bafar",
+    "creditex", "tajin", "tajín",   # real companies carried in report fixtures
+    "reizin",                       # real referrer surname from example CLI paths
 )
 
 for _name in NAMES_DENYLIST:

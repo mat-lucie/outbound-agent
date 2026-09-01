@@ -131,13 +131,13 @@ class TestParseDeal:
         assert out["record_id"] == "rec_acme_foods"
 
     def test_parses_blank_value(self):
-        rec = _deal_record("Tajin", "In Progress")
+        rec = _deal_record("Fabrikam", "In Progress")
         out = AttioClient.parse_deal(rec)
         assert out["value"] is None
         assert out["currency"] is None
 
     def test_parses_blank_country(self):
-        rec = _deal_record("Creditex", "In Progress", value=100_000)
+        rec = _deal_record("Northwind", "In Progress", value=100_000)
         out = AttioClient.parse_deal(rec)
         assert out["country"] is None
 
@@ -242,7 +242,7 @@ class TestBuildReportHtml:
     def test_renders_active_deals_section_with_blanks(self):
         deals = [
             AttioClient.parse_deal(_deal_record("Acme Foods", "In Progress")),
-            AttioClient.parse_deal(_deal_record("Tajin", "In Progress")),
+            AttioClient.parse_deal(_deal_record("Fabrikam", "In Progress")),
             AttioClient.parse_deal(_deal_record("X", "Lead")),
         ]
         active = compute_active_deals(deals)
@@ -250,7 +250,7 @@ class TestBuildReportHtml:
 
         assert "Active Deals" in html
         assert "Acme Foods" in html
-        assert "Tajin" in html
+        assert "Fabrikam" in html
         assert "ACV fallback" in html
         assert "missing" in html  # hygiene banner
         assert "1 leads" in html
