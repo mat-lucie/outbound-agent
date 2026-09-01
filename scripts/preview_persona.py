@@ -45,9 +45,11 @@ def main() -> int:
     sn_urls = persona.get("search_queries", {}).get("sn_search_urls", {})
     # Pick the first available geo URL (mx, co, cl, br, etc.)
     sn_url = ""
-    for _geo, url in sn_urls.items():
+    geo_key = ""
+    for geo, url in sn_urls.items():
         if url and "PLACEHOLDER" not in url:
             sn_url = url
+            geo_key = geo
             break
     if not sn_url:
         print(f"Error: persona '{persona_key}' has no SN URL configured.")
@@ -70,14 +72,28 @@ def main() -> int:
     crm = AttioProvider(AttioClient(api_key=attio_api_key))
 
     print("Launching PhantomBuster Search Export...")
-    csv_text = _launch_and_download(pb, pb_search_export_id, sn_url, batch_size=50)
-    if not csv_text:
+    # A preview must leave production scrape state exactly as it found it, on
+    # BOTH sides of the stable-csvName change:
+    #   * `use_cursor=False` — our ingest cursor is neither read nor written,
+    #     so a preview can never consume rows the real weekly then never sees.
+    #   * `preview-` prefixed persona key — a distinct csvName, so PB's own
+    #     filename-keyed resume position for the production file does not
+    #     advance either. (The prefix is the whole lever for that; it is not
+    #     a workaround for the cursor, which is off above.)
+    delta = _launch_and_download(
+        pb,
+        pb_search_export_id,
+        sn_url,
+        50,
+        persona_key=f"preview-{persona_key}",
+        geo_key=geo_key,
+        use_cursor=False,
+    )
+    if not delta.rows:
         print("No results from PhantomBuster.")
         return 0
 
-    import csv as csv_lib
-    import io
-    prospects_raw = list(csv_lib.DictReader(io.StringIO(csv_text)))
+    prospects_raw = delta.rows
     print(f"Exported {len(prospects_raw)} raw profiles.\n")
 
     summary = {"exported": len(prospects_raw), "scored": 0, "qualified": 0, "duplicates": 0, "rejected": 0, "added": 0}

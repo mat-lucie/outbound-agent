@@ -11,6 +11,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict
 
@@ -54,6 +55,11 @@ from workflows.quality_gate import (
     NON_COMPETITOR_CREDIT,
     score_band,
     score_prospect,
+)
+from workflows.scrape_cursor import (
+    CursorStateCorruptError,
+    advance_cursor,
+    read_cursor_state,
 )
 
 if TYPE_CHECKING:
@@ -443,26 +449,141 @@ def _join_name(raw: dict) -> str:
     return f"{first} {last}".strip()
 
 
+_CSV_NAME_UNSAFE_RE = re.compile(r"[^a-z0-9]+")
+
+
+def weekly_csv_name(persona_key: str, geo_key: str) -> str:
+    """Stable PB result-file name for one (persona, geo) saved search.
+
+    e.g. ``("us_operations_leaders", "us_1") -> "wk-us-operations-leaders-us-1"``.
+    Stability is the whole point — see `_launch_and_download` for why — so this
+    must stay a pure function of the two keys with no timestamp or run id.
+    """
+    slug = _CSV_NAME_UNSAFE_RE.sub("-", f"{persona_key}-{geo_key}".lower()).strip("-")
+    return f"wk-{slug}"
+
+
+def _row_profile_url(raw: dict) -> str:
+    """LinkedIn profile URL out of one raw PB/SN export row.
+
+    Same key order `_process_prospects` uses to build `linkedin_url`, so the
+    cursor's file-prefix anchor is the identity the ingest actually reads.
+    Falls through on an EMPTY value too (not just a missing key): an anchor
+    that is blank could never match on the next run and would reset the
+    cursor forever.
+    """
+    return (
+        raw.get("defaultProfileUrl")
+        or raw.get("linkedinProfileUrl")
+        or raw.get("linkedInUrl")
+        or raw.get("profileUrl")
+        or ""
+    )
+
+
+class ScrapeStatus(StrEnum):
+    """Outcome of one `_launch_and_download` call, for the caller's counters.
+
+    `StrEnum` (Python 3.11+, the repo's floor) rather than upstream's
+    `str, Enum` mixin — same value semantics, and it is what the fork's lint
+    profile requires (UP042).
+    """
+
+    OK = "ok"
+    # Nothing came back at all: no cookie, or PB served an empty body. Not the
+    # same as ZERO_DELTA — this is an infra/config miss, not a drained search.
+    NO_DATA = "no_data"
+    # PB served the accumulating file unchanged: `file_total == cursor`. Either
+    # the saved search is drained or PB logged "already scraped" and re-served
+    # the old file (the silent-zero hazard PR #179 named).
+    ZERO_DELTA = "zero_delta"
+
+
+@dataclass(frozen=True)
+class ScrapeDelta:
+    """The new rows of one saved search, plus what the caller needs to commit.
+
+    `rows` are PARSED rows (the CSV is parsed exactly once, here) — callers
+    must not re-serialize and re-parse them. `csv_name` + `file_total` are
+    the cursor commit info: the caller advances the cursor with them AFTER
+    ingest succeeds, never before (see `workflows.scrape_cursor`).
+    """
+
+    status: ScrapeStatus
+    rows: list[dict]
+    csv_name: str
+    file_total: int
+    cursor_reset: bool = False
+
+
 def _launch_and_download(
     pb: PhantomBusterClient,
     search_export_id: str,
     sn_url: str,
     batch_size: int,
-) -> str | None:
-    """Launch PB Search Export for a single URL and return CSV text."""
+    *,
+    persona_key: str,
+    geo_key: str,
+    use_cursor: bool = True,
+) -> ScrapeDelta:
+    """Launch PB Search Export for one saved search and return the NEW rows.
+
+    `persona_key`/`geo_key`/`use_cursor` are keyword-only: the two key
+    strings are interchangeable at the type level and a transposition would
+    silently derive a different (but valid-looking) csvName, orphaning the
+    cursor AND resetting PB's resume position.
+
+    With `use_cursor=False` the ingest cursor is neither read nor written and
+    every row of the file is returned — the preview path, which must not move
+    production state.
+    """
     li_cookie = li_session_cookie()
     li_ua = li_user_agent_raw()
     if not li_cookie:
         click.echo("Error: PB_LI_SESSION_COOKIE not set.")
-        return None
+        return ScrapeDelta(ScrapeStatus.NO_DATA, [], "", 0)
 
-    # PR #179 pattern applied to the weekly scrape: PB keys its
-    # processed-inputs dedup database on the result CSV filename. A static
-    # csvName (the default "result") makes a re-run of the same saved search
-    # return PB's frozen cached set instead of re-scraping. A fresh per-launch
-    # name busts that dedup AND yields a CSV with only this run's rows.
-    from workflows.daily_check_helpers import _fresh_csv_name
-    csv_name = _fresh_csv_name("wk")
+    # STABLE per-search csvName (replaces the PR #179 fresh-name pattern that
+    # used to live here). PB keys BOTH its processed-profiles dedup database
+    # AND its per-search resume cursor on the result CSV filename. A fresh
+    # name per launch reset PB to page 1 of every saved search, so the weekly
+    # re-exported the same top-N people forever (98% recycling measured on the
+    # run that triggered this fix). A stable name restores the resume cursor:
+    # PB continues where it stopped and APPENDS into one accumulating file per
+    # (persona, geo).
+    #
+    # The hazard PR #179 was defending against is real and is now handled by
+    # the two layers below instead of by name-busting:
+    #
+    #   1. A pipeline-owned ingest cursor (workflows/scrape_cursor) tracking
+    #      how many rows of THIS file we have already consumed. The file
+    #      accumulates across weeks; we only ever hand the delta to scoring.
+    #   2. A loud zero-delta guard — when PB logs "already scraped", appends
+    #      nothing, and re-serves the unchanged file, `file_total == cursor`
+    #      and we say so instead of ingesting the whole file as fresh data.
+    #
+    # `removeDuplicateProfiles` stays True: it is PB-side hygiene within the
+    # accumulating file and is orthogonal to our cursor.
+    csv_name = weekly_csv_name(persona_key, geo_key)
+
+    # Read the cursor BEFORE the launch. This function NEVER advances it — the
+    # caller does, and only once `_process_prospects` has actually ingested the
+    # rows (see `workflows.scrape_cursor` for the async-safety rationale).
+    cursor = 0
+    cursor_reset = False
+    prefix_anchor: str | None = None
+    if use_cursor:
+        state = read_cursor_state(csv_name, sn_url=sn_url)
+        cursor = state.consumed_rows
+        prefix_anchor = state.last_row_url
+        if state.url_changed:
+            cursor_reset = True
+            click.echo(
+                f"  ⚠️  SEARCH URL CHANGED for {csv_name} — resetting ingest "
+                "cursor; PB's own resume position may still carry over, "
+                "consider a fresh csvName",
+                err=True,
+            )
 
     launch_args = {
         "inputType": "salesNavigatorSearchUrl",
@@ -488,10 +609,86 @@ def _launch_and_download(
         launch, poll_interval=15, max_wait=scrape_max_wait(batch_size)
     )
 
-    # F-PR-5: CSV keyed to launch.container_id, not "latest". The per-launch
-    # csvName MUST be passed here too, or the agent-scoped fallback fetches a
-    # stale file (see clients/phantombuster.download_result_csv).
-    return pb.download_result_csv(launch, csv_name=csv_name)
+    # F-PR-5: CSV keyed to launch.container_id, not "latest". The per-search
+    # csvName MUST be passed here too, or the agent-scoped fallback fetches
+    # whatever file the agent wrote last (see
+    # clients/phantombuster.download_result_csv). With a stable name the two
+    # paths converge on the same accumulating file, which is what we want.
+    csv_text = pb.download_result_csv(launch, csv_name=csv_name)
+    if not csv_text:
+        return ScrapeDelta(ScrapeStatus.NO_DATA, [], csv_name, 0, cursor_reset)
+
+    # Parse ONCE, here. "Row N" is not "line N" — SN exports carry quoted
+    # fields with embedded newlines (job descriptions, multi-line locations) —
+    # so the delta must be a slice of parsed rows, and re-serializing them for
+    # the caller to re-parse would only add failure modes (ragged rows crash
+    # DictWriter; a header-valued cell corrupts the round-trip).
+    rows = list(csv.DictReader(io.StringIO(csv_text)))
+    for row in rows:
+        # DictReader parks the overflow of a ragged row under a None key.
+        # Drop it so downstream `.get()` callers see a plain str-keyed dict,
+        # exactly as they did when the raw CSV text was passed through.
+        row.pop(None, None)
+    file_total = len(rows)
+
+    if not use_cursor:
+        click.echo(f"  {file_total} rows in {csv_name} (cursor bypassed).")
+        return ScrapeDelta(ScrapeStatus.OK, rows, csv_name, file_total, False)
+
+    if file_total < cursor:
+        # The file SHRANK. PB storage was reset or the result file deleted —
+        # and PB's own resume cursor lives in that same storage, so the
+        # phantom restarted from page 1 too. Re-consuming from 0 is the
+        # correct read of the new file; the ingest-side dedup in
+        # `_process_prospects` (in_list_canonical_urls / seen_urls /
+        # name_index) absorbs any people it re-serves.
+        click.echo(
+            f"  ⚠️  CURSOR RESET: {csv_name} returned {file_total} total rows "
+            f"but our cursor was at {cursor} — PB result file was reset or "
+            "deleted; re-consuming the file from row 0",
+            err=True,
+        )
+        cursor = 0
+        cursor_reset = True
+    elif (
+        cursor > 0
+        and prefix_anchor
+        and _row_profile_url(rows[cursor - 1]) != prefix_anchor
+    ):
+        # Same length or longer, but a DIFFERENT prefix: the file was rebuilt
+        # (PB re-ran the search from page 1 into the same name, or the rows
+        # were re-ordered). A row count alone cannot see this, and slicing on
+        # a stale count would skip real people. Re-consume; dedup absorbs it.
+        click.echo(
+            f"  ⚠️  FILE PREFIX CHANGED for {csv_name} — row {cursor} is no "
+            "longer the person we last consumed; the result file was rebuilt. "
+            "Re-consuming from row 0.",
+            err=True,
+        )
+        cursor = 0
+        cursor_reset = True
+    elif file_total == cursor:
+        # Zero append. Either the saved search is genuinely drained, or PB
+        # logged "already scraped" and re-served the unchanged file — the
+        # exact silent-zero hazard PR #179 named. Loud, and no rows: the run
+        # moves on to the next search, same as a drained search today.
+        click.echo(
+            f"  ⚠️  ZERO-DELTA: {csv_name} returned {file_total} total rows, "
+            f"cursor already at {cursor} — search drained OR PB served a "
+            "stale file; verify in the PhantomBuster dashboard",
+            err=True,
+        )
+        return ScrapeDelta(
+            ScrapeStatus.ZERO_DELTA, [], csv_name, file_total, cursor_reset
+        )
+
+    click.echo(
+        f"  {file_total} rows in {csv_name} (consumed {cursor}) — "
+        f"ingesting {file_total - cursor} new."
+    )
+    return ScrapeDelta(
+        ScrapeStatus.OK, rows[cursor:], csv_name, file_total, cursor_reset
+    )
 
 
 def _quarantine_business_days() -> int:
@@ -2145,6 +2342,16 @@ def new_process_summary() -> dict[str, Any]:
         "size_abstained": 0,
         "industry_missing": 0,
         "write_errors": 0,
+        # Ingest-cursor visibility (stable-csvName change). Both states used
+        # to be invisible in the summary: a run where every search returned
+        # zero new rows read exactly like a healthy small run.
+        # `searches_zero_delta` — searches whose accumulating file did not
+        # grow (drained, or PB re-served a stale file).
+        # `cursor_resets` — searches whose cursor was force-reset to 0 (file
+        # shrank, search URL swapped, or the file prefix was rebuilt); each
+        # one means re-consumed rows and therefore re-spent LLM budget.
+        "searches_zero_delta": 0,
+        "cursor_resets": 0,
         # Never-contact denylist hard block — enforced for every lane in
         # `_process_prospects`; counted here so the drop is never silent.
         "denylist_blocked": 0,
@@ -2835,6 +3042,20 @@ def run_weekly_prospecting(
         click.echo("No valid Sales Navigator search URLs configured.")
         return summary
 
+    # Slug collision guard: two searches deriving the SAME csvName would share
+    # one PB result file AND one ingest cursor, so each would consume the
+    # other's rows and both would look "drained". Fail loud at run start
+    # rather than mis-attribute rows for weeks.
+    _csv_names = [weekly_csv_name(p, g) for p, g, _url in searches]
+    if len(set(_csv_names)) != len(_csv_names):
+        _dupes = sorted({n for n in _csv_names if _csv_names.count(n) > 1})
+        raise RuntimeError(
+            f"csvName collision across saved searches: {_dupes} — two "
+            "(persona, geo) pairs slugify to the same PB result filename; "
+            "rename one of the keys in the persona config "
+            "(search_queries.sn_search_urls)"
+        )
+
     click.echo(f"=== Running {len(searches)} searches ===\n")
 
     # Phase 0: Backfill companies missing industry_vertical so new DMs
@@ -2917,17 +3138,23 @@ def run_weekly_prospecting(
         # signal-health verdict always runs on whatever WAS scored. Auth
         # failures (401/403) still abort loud — every later call fails too.
         try:
-            if not dry_run:
-                csv_text = _launch_and_download(pb, search_export_id, sn_url, batch_size)
-                if not csv_text:
-                    click.echo("  No results. Skipping.\n")
-                    continue
-            else:
+            if dry_run:
                 click.echo("  [DRY RUN] Skipping PhantomBuster launch.\n")
                 continue
 
-            # Parse CSV
-            prospects_raw = list(csv.DictReader(io.StringIO(csv_text)))
+            delta = _launch_and_download(
+                pb, search_export_id, sn_url, batch_size,
+                persona_key=persona_key, geo_key=geo_key,
+            )
+            if delta.cursor_reset:
+                summary["cursor_resets"] += 1
+            if delta.status is ScrapeStatus.ZERO_DELTA:
+                summary["searches_zero_delta"] += 1
+            if not delta.rows:
+                click.echo("  No new results. Skipping.\n")
+                continue
+
+            prospects_raw = delta.rows
             summary["exported"] += len(prospects_raw)
             click.echo(f"  Exported {len(prospects_raw)} prospects.")
 
@@ -2944,6 +3171,24 @@ def run_weekly_prospecting(
                 name_index=name_index,
                 industry_cache=industry_cache,
             )
+
+            # Cursor advances HERE and only here — after the rows are actually
+            # ingested. Any failure above (PB timeout, CRM outage, a raise
+            # mid-scoring) leaves the cursor put, so next week re-serves the
+            # same delta and the ingest-side dedup absorbs the re-scored rows.
+            # Losing rows is unrecoverable; re-scoring them costs LLM budget.
+            advance_cursor(
+                delta.csv_name,
+                delta.file_total,
+                sn_url=sn_url,
+                last_row_url=_row_profile_url(prospects_raw[-1]),
+            )
+        except CursorStateCorruptError:
+            # Untrustworthy cursor state is NOT a per-search hiccup: every
+            # remaining search reads the same file, and degrading to 0 would
+            # re-ingest whole accumulating searches. Abort with the error's
+            # own message — it names the file and the remediation.
+            raise
         except httpx.HTTPStatusError as err:
             if err.response.status_code in (401, 403):
                 raise  # auth failure cascades — abort the whole run loud
@@ -2989,6 +3234,14 @@ def run_weekly_prospecting(
         from workflows.run_provenance import format_provenance
         click.echo(f"Code:       {format_provenance(code_provenance)}")
     click.echo(f"Searches:   {len(searches)}")
+    click.echo(
+        f"   ├ zero-delta (no new rows appended): "
+        f"{summary.get('searches_zero_delta', 0)}"
+    )
+    click.echo(
+        f"   └ ingest-cursor resets (rows re-consumed): "
+        f"{summary.get('cursor_resets', 0)}"
+    )
     click.echo(f"Exported:   {summary['exported']}")
     click.echo(f"Scored:     {summary['scored']}")
     click.echo(f"Qualified:  {summary['qualified']}")
@@ -3051,6 +3304,36 @@ def run_weekly_prospecting(
     click.echo(f"Added:      {summary['added']}")
     click.echo(f"   ├ net-new pipeline entries: {net_new}")
     click.echo(f"   └ already-listed records re-stamped: {restamped}")
+
+    # Loud all-drained alarm: EVERY search returned an unchanged accumulating
+    # file. Deliberately independent of `qualified` — the supply alarm below
+    # only fires when the run qualified someone, so a run that ingested
+    # literally nothing would otherwise print a tidy row of zeros and no
+    # alarm at all. This is either "every saved search is exhausted" or a
+    # PB-side stall re-serving stale files, and both need an operator.
+    if (
+        not dry_run
+        and searches
+        and summary.get("searches_zero_delta", 0) == len(searches)
+    ):
+        click.echo("", err=True)
+        click.echo(
+            f"⚠️  ZERO-DELTA ALARM: all {len(searches)} search(es) returned no "
+            "new rows this run.",
+            err=True,
+        )
+        click.echo(
+            "   Every accumulating PB result file was unchanged since the last "
+            "run — either every Sales Nav saved search is drained, or PB "
+            "stalled and re-served stale files for all of them.",
+            err=True,
+        )
+        click.echo(
+            "   Check the PhantomBuster dashboard for 'already scraped' "
+            "launches first; if the launches really did append nothing, "
+            "refresh the configured search inputs (the persona search URLs).",
+            err=True,
+        )
 
     # Loud supply alarm: a run that qualifies candidates but sources zero
     # net-new prospects means the saved searches are exhausted (re-scoring the

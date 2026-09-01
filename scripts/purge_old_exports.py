@@ -7,6 +7,8 @@ Pass ``--delete`` to actually remove files.
 Selection rules:
   - Files older than ``--days N`` (default 60) are candidates.
   - ``.gitkeep`` is always excluded.
+  - ``scrape_cursors.json`` is always excluded (live ingest state, not an
+    export artifact — see workflows/scrape_cursor.py).
   - Files matching ``weekly_borderline_*.jsonl`` that are newer than
     30 days are excluded (they are forensic records; keep the recent ones).
 
@@ -40,6 +42,13 @@ def _should_keep(
 
     # Always keep .gitkeep.
     if name == ".gitkeep":
+        return True
+
+    # Always keep the weekly ingest cursor. It is live pipeline STATE, not an
+    # export artifact: deleting it makes the next weekly re-consume every
+    # accumulating PB result file from row 0 (workflows/scrape_cursor.py). It
+    # is also naturally old — a drained search's entry is never rewritten.
+    if name == "scrape_cursors.json":
         return True
 
     # Keep weekly borderline files that are still recent.

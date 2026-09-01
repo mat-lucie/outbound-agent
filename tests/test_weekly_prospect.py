@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 from clients.crm.attio_provider import AttioProvider
+from tests.conftest import scrape_delta_from_csv
 from workflows.weekly_prospect import _commit_prospect, _process_prospects
 
 if TYPE_CHECKING:
@@ -1069,13 +1070,15 @@ class TestNetNewSupplyAccounting:
 
 
 class TestWeeklyScrapeCsvNameBust:
-    """The weekly scrape must set a unique per-launch csvName (PR #179 pattern)
-    so PhantomBuster's filename-keyed dedup is busted and the same saved search
-    can re-scrape fresh rows instead of returning a frozen cached set.
+    """The weekly scrape must set a STABLE per-search csvName (replaces the
+    PR #179 fresh-name pattern). PB keys its per-search resume cursor on the
+    result filename, so a fresh name every launch reset every saved search to
+    page 1 and the weekly re-exported the same top-N people. The
+    pipeline-owned ingest cursor now handles the stale-file hazard.
     """
 
-    def test_launch_sets_fresh_csv_name_and_downloads_with_it(self, monkeypatch):
-        from workflows.weekly_prospect import _launch_and_download
+    def test_launch_sets_stable_csv_name_and_downloads_with_it(self, monkeypatch):
+        import workflows.weekly_prospect as wp
 
         monkeypatch.setenv("PB_LI_SESSION_COOKIE", "cookie-abc")
 
@@ -1084,14 +1087,26 @@ class TestWeeklyScrapeCsvNameBust:
         pb.launch_agent.return_value = launch
         pb.download_result_csv.return_value = "firstName,lastName\nA,B\n"
 
-        out = _launch_and_download(pb, "agent-1", "https://linkedin.com/sales/search/x", 100)
+        out = wp._launch_and_download(
+            pb, "agent-1", "https://linkedin.com/sales/search/x", 100,
+            persona_key="operations_leaders", geo_key="mexico",
+        )
 
-        assert out == "firstName,lastName\nA,B\n"
+        assert [dict(r) for r in out.rows] == [{"firstName": "A", "lastName": "B"}]
         launch_args = pb.launch_agent.call_args.args[1]
         csv_name = launch_args.get("csvName")
-        assert csv_name and csv_name.startswith("wk-")
-        # Same name MUST be passed to the download so the per-launch CSV is fetched.
+        assert csv_name == "wk-operations-leaders-mexico"
+        assert out.csv_name == csv_name
+        # Same name MUST be passed to the download or the agent-scoped
+        # fallback fetches whatever file the agent wrote last.
         assert pb.download_result_csv.call_args.kwargs.get("csv_name") == csv_name
+        # Stable across launches — that IS the fix.
+        pb.launch_agent.reset_mock()
+        wp._launch_and_download(
+            pb, "agent-1", "https://linkedin.com/sales/search/x", 100,
+            persona_key="operations_leaders", geo_key="mexico",
+        )
+        assert pb.launch_agent.call_args.args[1]["csvName"] == csv_name
 
 
 class TestDeepScrapeWindow:
@@ -1102,13 +1117,16 @@ class TestDeepScrapeWindow:
     """
 
     def _launch(self, monkeypatch, batch_size):
-        from workflows.weekly_prospect import _launch_and_download
+        import workflows.weekly_prospect as wp
 
         monkeypatch.setenv("PB_LI_SESSION_COOKIE", "cookie-abc")
         pb = MagicMock()
         pb.launch_agent.return_value = MagicMock()
         pb.download_result_csv.return_value = "firstName,lastName\nA,B\n"
-        _launch_and_download(pb, "agent-1", "https://linkedin.com/sales/search/x", batch_size)
+        wp._launch_and_download(
+            pb, "agent-1", "https://linkedin.com/sales/search/x", batch_size,
+            persona_key="operations_leaders", geo_key="mexico",
+        )
         return pb
 
     def test_number_of_profiles_tracks_deep_batch_size(self, monkeypatch):
@@ -1172,7 +1190,8 @@ class TestLedgerUnavailableAlarm:
              _patch.object(wp, "load_personas", return_value=personas), \
              _patch.object(wp, "_check_all_persona_target_lists_fresh"), \
              _patch.object(wp, "_load_in_list_canonical_urls", return_value=set()), \
-             _patch.object(wp, "_launch_and_download", return_value=csv_text), \
+             _patch.object(wp, "_launch_and_download",
+                           return_value=scrape_delta_from_csv(csv_text)), \
              _patch(
                  "workflows.llm_dispatch.request_llm_dispatch",
                  side_effect=LLMBudgetLedgerUnavailable(
