@@ -41,6 +41,10 @@ class WarmLane(Enum):
     PARTNER = "partner"
     OWED = "owed"
     WAITING = "waiting"
+    # LinkedIn twin of WAITING: a RESPONDED prospect whose LAST message is the
+    # operator's own hand-written DM and who has gone quiet since. Renders a
+    # paste-ready manual DM — never auto-sent, never an email draft.
+    COLD_RESPONDER = "cold_responder"
     NUDGE = "nudge"
 
 
@@ -60,6 +64,10 @@ class FollowupReason(Enum):
     PARTNER_INTRO_UNWORKED = "partner_intro_unworked"
     DEAL_LEAD_UNWORKED = "deal_lead_unworked"
     RESPONDED_NO_NEXT_STEP = "responded_no_next_step"
+    # RESPONDED, but the ball is THEIRS: our manual DM was the last message
+    # (inbox-scrape evidence via manual_touch_state). Distinct from
+    # RESPONDED_NO_NEXT_STEP, where the CRM can't tell who spoke last.
+    RESPONDED_COLD = "responded_cold"
     QUALIFIED_STALE = "qualified_stale"
     DEAL_IN_PROGRESS_STALE = "deal_in_progress_stale"
     NURTURE_POSITIVE_STALE = "nurture_positive_stale"
@@ -117,6 +125,15 @@ POLICY: dict[FollowupReason, ReasonPolicy] = {
     FollowupReason.RESPONDED_NO_NEXT_STEP: ReasonPolicy(
         WarmLane.NUDGE, heat=4, threshold_days=3, business_days=True,
         label="replied, no next step",
+    ),
+    # "Replied, then went quiet after your DM". Same 7-CALENDAR-day floor as
+    # AWAITING_REPLY on purpose: this is post-send silence on OUR message, and
+    # a DM nudge at day 3 reads as pressure — the exact failure the WAITING
+    # threshold was tuned against. Calendar days because a DM ages over
+    # weekends too. Heat matches WAITING (a real conversation, ball theirs).
+    FollowupReason.RESPONDED_COLD: ReasonPolicy(
+        WarmLane.COLD_RESPONDER, heat=4, threshold_days=7, business_days=False,
+        label="replied, then went quiet after your DM",
     ),
     FollowupReason.QUALIFIED_STALE: ReasonPolicy(
         WarmLane.NUDGE, heat=4, threshold_days=5, business_days=True,

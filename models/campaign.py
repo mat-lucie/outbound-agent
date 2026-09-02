@@ -128,6 +128,20 @@ def load_messages() -> dict:
         return json.load(f)
 
 
+def load_followup_dm_templates() -> dict:
+    """Load the paste-ready follow-up DM copy from followup_dm.json.
+
+    Deliberately a SEPARATE file from messages.json: that file is the
+    automated cadence's copy surface and is the corpus the Phase 0.5
+    self-echo matcher compares scraped threads against. If this copy lived
+    there, a manually pasted follow-up DM would be classified as one of our
+    own template sends and never recorded as a manual touch — the
+    cold-responder row would never clear.
+    """
+    with open(CONTENT_DIR / "followup_dm.json") as f:
+        return json.load(f)
+
+
 def load_personas() -> dict:
     """Load persona definitions from personas.json.
 

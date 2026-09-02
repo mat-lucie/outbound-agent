@@ -31,6 +31,17 @@ Tiers 1–2 are real recency (synthetic=False); every candidate carries
 ``last_touch_source`` so learned metrics can segment verified vs joined vs
 synthetic and never blend them.
 
+Cold-responder lane ("replied, then went quiet after your DM"): a RESPONDED
+entry whose LAST message is the operator's own hand-written LinkedIn DM,
+quiet for 7+ calendar days. The ONLY "ours last" evidence is the local
+``exports/manual_touch_state.json`` written by Phase 0.5's manual-touch pass
+(inbox-scrape truth, incl. the prospect reply the CRM can't see — see
+``_thread_direction`` for why CRM stamps were rejected as evidence). Each row
+carries the exchange (their reply, our DM) and a paste-ready manual DM in the
+prospect's language, rendered from ``content/followup_dm.json``.
+Paste-by-hand only: never auto-sent, never an email draft, no CRM write — the
+next Phase 0.5 scrape records the pasted DM and the row clears itself.
+
 Out of scope here, done by the skill layer via MCP (see SKILL.md Phase C):
   * true last-touch verification (email thread direction, call transcript)
   * the 3-fact draft-context extraction and Gmail draft creation
@@ -79,6 +90,7 @@ from models.followup import (
     is_positive_nurture,
     urgency_score,
 )
+from models.resolution import coerce_language
 from workflows.cross_channel_suppression import (
     EmailLaneNotProvisioned,
     build_suppression_set,
@@ -130,6 +142,49 @@ _WAITING_TTL_DAYS = 60
 # so an uncapped WAITING lane would eventually crowd Partner/Owed out of the
 # skill layer's draft slots (and >2 nudge drafts per day is noise regardless).
 _WAITING_DRAFT_SLOT_CAP = 2
+
+# ── Cold-responder lane ─────────────────────────────────────────────────
+# Slot cap inside the --limit trim, same rationale as WAITING: silence grows
+# urgency monotonically, and these rows are paste-by-hand work that must not
+# crowd Partner/Owed out of the skill layer's verify+draft budget. 3 not 2:
+# a DM paste costs the operator seconds, a Gmail draft costs the skill layer
+# a verified thread.
+_COLD_RESPONDER_SLOT_CAP = 3
+# Per-lane caps applied by the trim (a MAXIMUM, never a reservation).
+_LANE_SLOT_CAPS: dict[WarmLane, int] = {
+    WarmLane.WAITING: _WAITING_DRAFT_SLOT_CAP,
+    WarmLane.COLD_RESPONDER: _COLD_RESPONDER_SLOT_CAP,
+}
+_COLD_RESPONDER_PREVIEW = 5
+_COLD_SNIPPET_CHARS = 160
+_COLD_DM_LANGS = ("es", "pt", "en")
+# Silence buckets for the ``{when}`` placeholder (upper bounds in calendar
+# days; the last is open-ended). Calibrated so the phrase never contradicts
+# the real silence at a boundary: "a few days ago" at 13 days and "a few
+# weeks back" at 59 days both read as not having checked. The BUCKETS are
+# engine policy and the phrases are plain time vocabulary for the three
+# languages the engine supports, so both stay in code; the DM BODY is
+# operator copy and lives in ``content/followup_dm.json``.
+_COLD_DM_WHEN_BUCKETS = (10, 35, 75)
+_COLD_DM_WHEN: dict[str, tuple[str, str, str, str]] = {
+    "es": ("hace unos días", "hace unas semanas", "hace un mes", "hace un tiempo"),
+    "pt": ("uns dias atrás", "umas semanas atrás", "um mês atrás", "um tempo atrás"),
+    "en": ("a few days ago", "a few weeks back", "about a month ago", "a while back"),
+}
+# Rendered when followup_dm.json is missing/corrupt or a language is absent
+# from it. Deliberately unusable as outreach: a broken copy file must read as
+# broken in the digest, never as a generic bot line someone might paste.
+_COLD_DM_FALLBACK = (
+    "{name} - [content/followup_dm.json is missing, unreadable, or has no "
+    "copy for this language — write your follow-up DM there] ({when})"
+)
+# Prepended to the DM when the prospect's language is not on record, so a
+# fast paste cannot ship Spanish to a Brazilian without a visible cue.
+_COLD_DM_LANG_WARNING = (
+    "[language not on record - defaulting to ES, check before pasting]"
+)
+# Shown when the person's name did not resolve — the operator fills it in.
+_COLD_DM_NAME_PLACEHOLDER = "[Name]"
 
 
 @dataclass
@@ -200,6 +255,17 @@ class FollowupCandidate:
     # forgotten, but a human owns that thread — the skill layer renders it
     # and must never auto-draft on it (any channel).
     email_responded: bool = False
+    # Cold-responder lane context — populated only on RESPONDED_COLD rows,
+    # None everywhere else (stable JSON schema). ``their_last_reply`` is the
+    # entry's last_response_text; ``our_last_dm`` / ``our_last_dm_at`` are the
+    # operator's DM body + date from manual_touch_state; ``dm_language`` is
+    # the resolved es/pt/en code (person override > entry attr) or None when
+    # unset/unsupported (the DM then defaults to ES and the row is flagged).
+    their_last_reply: str | None = None
+    their_last_reply_at: date | None = None
+    our_last_dm: str | None = None
+    our_last_dm_at: date | None = None
+    dm_language: str | None = None
     notes: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -796,6 +862,151 @@ def _responded_email_person_ids(attio: AttioClient) -> tuple[set[str], bool]:
     return email_person_ids_in_stages(attio, _EMAIL_RESPONDED_STAGES, "responded")
 
 
+def _read_manual_touch_state() -> tuple[dict, bool]:
+    """Phase 0.5's ``exports/manual_touch_state.json``, read-only → (state, ok).
+
+    Missing file → ``({}, True)`` (nothing hand-worked yet). Unreadable /
+    corrupt → ``({}, False)``: the cold-responder lane is OFF for the run
+    (it has no other trusted evidence) and the run is flagged degraded, so a
+    hand-worked row falls back to the plain nudge path instead of silently
+    disappearing. Never raises — a side input must not kill detection.
+    """
+    try:
+        from workflows.detect_responses import (
+            MANUAL_TOUCH_STATE_PATH,
+            _load_manual_touch_state,
+        )
+        state = _load_manual_touch_state(MANUAL_TOUCH_STATE_PATH)
+    except Exception as exc:  # noqa: BLE001 — read-only side input, see docstring
+        print(
+            f"WARNING: follow-up radar: manual-touch state unreadable "
+            f"({type(exc).__name__}: {exc}) — cold-responder lane OFF this run.",
+            file=sys.stderr,
+        )
+        return {}, False
+    if state is None:
+        return {}, False
+    return state, True
+
+
+def _thread_direction(state_entry: object) -> tuple[str, date | None]:
+    """Who spoke last on a RESPONDED entry, per the manual-touch state entry →
+    ``("ours" | "theirs" | "unknown", date)``.
+
+    * ``"ours"``   — our manual DM is the last message; date = its
+      ``touch_date``. Entries written before ball tracking (no ``ball`` key)
+      count as ours: they were only ever written when ours was last.
+    * ``"theirs"`` — a later scrape saw the prospect's message last; date =
+      ``ball_observed``. A REAL touch the CRM never records (RESPONDED
+      entries skip the reply loop), so the caller uses it as the last touch.
+    * ``"unknown"``— no (valid) entry.
+
+    This is deliberately the ONLY "ours last" evidence. The CRM rule
+    ``last_contact_date > response_received_at`` was tried and rejected:
+    cadence drift repair (``terminal_dm_step_low``), the dedup MAX-merge and
+    the consistency sweep all bump ``last_contact_date`` on Responded entries
+    with no message from us, so that rule renders a paste-ready nudge to
+    someone who wrote last — the worst outcome this lane guards against. And
+    ``response_received_at`` is never rewritten after the first flip, so it
+    cannot say who spoke last either.
+    """
+    se = state_entry if isinstance(state_entry, dict) else None
+    if not se:
+        return "unknown", None
+    if str(se.get("ball") or "ours") == "theirs":
+        return "theirs", _parse_attio_date(se.get("ball_observed"))
+    return "ours", _parse_attio_date(se.get("touch_date"))
+
+
+def _normalize_dm_language(raw: object) -> str | None:
+    """A stored language value → "es"/"pt"/"en", or None when unset or not a
+    language we have DM copy for (the CRM also offers ``fr``; never ship a
+    mixed-language DM — the digest flags the row instead). Same strict code
+    parsing as the send path (``coerce_language``)."""
+    lang = coerce_language(raw)
+    return lang.value if lang is not None and lang.value in _COLD_DM_LANGS else None
+
+
+def _snippet(text: object, limit: int = _COLD_SNIPPET_CHARS) -> str:
+    """One-line, whitespace-collapsed excerpt for a digest context line."""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+_COLD_DM_COPY: object = None
+_COLD_DM_COPY_WARNED = False
+
+
+def _reset_cold_dm_copy_cache() -> None:
+    """Clear the memoized follow-up DM copy (test hook / long-lived procs)."""
+    global _COLD_DM_COPY, _COLD_DM_COPY_WARNED
+    _COLD_DM_COPY = None
+    _COLD_DM_COPY_WARNED = False
+
+
+def _cold_dm_template(lang: str) -> str:
+    """The operator's paste-ready DM template for ``lang``.
+
+    Copy lives in ``content/followup_dm.json`` (``cold_responder`` group) so
+    it is operator-editable like every other outreach template — but NOT in
+    messages.json, whose entries are the corpus the Phase 0.5 self-echo
+    matcher compares scraped threads against (copy there would make a pasted
+    DM look like one of our own template sends, and the row would never
+    clear). A missing/corrupt file degrades to a visibly-broken placeholder:
+    rendering happens inside the digest, which must never raise.
+    """
+    global _COLD_DM_COPY, _COLD_DM_COPY_WARNED
+    if _COLD_DM_COPY is None:
+        try:
+            from models.campaign import load_followup_dm_templates
+
+            group = load_followup_dm_templates().get("cold_responder") or {}
+            _COLD_DM_COPY = {
+                k: v for k, v in group.items() if isinstance(v, str) and v.strip()
+            }
+        except Exception as exc:  # noqa: BLE001 — digest render must not raise
+            _COLD_DM_COPY = {}
+            if not _COLD_DM_COPY_WARNED:
+                _COLD_DM_COPY_WARNED = True
+                print(
+                    f"WARNING: follow-up radar: could not load "
+                    f"content/followup_dm.json ({type(exc).__name__}: {exc}) — "
+                    f"cold-responder rows render a placeholder DM.",
+                    file=sys.stderr,
+                )
+    template = _COLD_DM_COPY.get(lang) if isinstance(_COLD_DM_COPY, dict) else None
+    return template or _COLD_DM_FALLBACK
+
+
+def render_manual_dm(c: FollowupCandidate) -> str:
+    """The paste-ready manual DM for a cold-responder row.
+
+    Operator copy in the prospect's language (ES when unknown — flagged in
+    the digest AND prefixed with a warning line inside the text so it cannot
+    be pasted unnoticed), first name only (a ``[Name]`` placeholder when the
+    name didn't resolve), ``{when}`` scaled to the silence. This is a
+    starting text: the skill layer may tailor it to the exchange in the same
+    register, and the operator pastes it by hand. It is never sent by code.
+    """
+    lang = c.dm_language or "es"
+    first = (c.name or "").split()[0] if (c.name or "").strip() else ""
+    name = first or _COLD_DM_NAME_PLACEHOLDER
+    bucket = sum(c.silent_days >= bound for bound in _COLD_DM_WHEN_BUCKETS)
+    # .get, not [] — nothing in the engine sets dm_language outside
+    # _COLD_DM_LANGS, but this renders inside the digest and a directly
+    # constructed candidate must not be able to raise here.
+    when = _COLD_DM_WHEN.get(lang, _COLD_DM_WHEN["es"])[bucket]
+    try:
+        text = _cold_dm_template(lang).format(name=name, when=when)
+    except (KeyError, IndexError, ValueError):
+        # An operator template with an unknown/malformed placeholder must not
+        # blow up the whole digest — show the broken-copy placeholder instead.
+        text = _COLD_DM_FALLBACK.format(name=name, when=when)
+    if c.dm_language is None:
+        text = f"{_COLD_DM_LANG_WARNING}\n{text}"
+    return text
+
+
 def _resolve_list_id(list_id: str | None) -> str:
     return (list_id or os.environ.get("ATTIO_LIST_ID", "")).strip()
 
@@ -1034,6 +1245,11 @@ def detect_candidates(
             "attribute and re-run"
         )
 
+    # Cold-responder lane side input. Unreadable → the lane is OFF this run
+    # (no other evidence is trusted), flagged degraded below; hand-worked rows
+    # fall back to the plain RESPONDED nudge path.
+    manual_state, manual_state_ok = _read_manual_touch_state()
+
     candidates: list[FollowupCandidate] = []
     dropped_no_touch = 0
     parked = {"muted": 0, "snoozed": 0, "callback": 0}
@@ -1073,6 +1289,12 @@ def detect_candidates(
         degraded.append(
             "active cold-email exclusion incomplete (Attio read failed) — "
             "some rows may overlap an in-flight cold drip; verify before drafting"
+        )
+    if not manual_state_ok:
+        degraded.append(
+            "manual-touch state unreadable — cold-responder lane OFF this run "
+            "(hand-worked Responded rows fall back to Consider nudging / "
+            "LinkedIn-warm); fix or delete exports/manual_touch_state.json"
         )
 
     # State-schema preflight: a half-deployed followup-state migration reads as
@@ -1157,7 +1379,43 @@ def detect_candidates(
             if reason is None:
                 continue
 
+            # Cold-responder promotion: a RESPONDED row where OUR manual DM is
+            # the last message is not "replied, no next step" — the ball is
+            # theirs. Route it to the paste-ready DM lane, unless the person
+            # replied to the EMAIL drip (email_responded rows are render-only
+            # on every channel — no DM text either).
+            cold_note: str | None = None
+            state_entry = manual_state.get(attrs.get("entry_id") or "")
+            direction, direction_at = "unknown", None
+            if reason is FollowupReason.RESPONDED_NO_NEXT_STEP:
+                direction, direction_at = _thread_direction(state_entry)
+                if direction == "ours" and record_id not in responded_email:
+                    reason = FollowupReason.RESPONDED_COLD
+                elif direction == "theirs":
+                    cold_note = (
+                        "they wrote last (inbox scrape) — you owe a reply, not a nudge"
+                    )
+
             last_touch, synthetic = _entry_last_touch(attrs)
+            if direction == "theirs" and direction_at is not None and (
+                last_touch is None or direction_at > last_touch
+            ):
+                # Their reply is a real touch the CRM never recorded — silence
+                # counts from it, not from our older DM (otherwise the row
+                # keeps a stale urgency and the "you owe a reply" note nags
+                # daily with no clearing path).
+                last_touch, synthetic = direction_at, False
+            cold_kwargs: dict = {}
+            if reason is FollowupReason.RESPONDED_COLD:
+                reply = attrs.get("last_response_text")
+                body = state_entry.get("last_body") if isinstance(state_entry, dict) else None
+                cold_kwargs = {
+                    "their_last_reply": (str(reply).strip() or None) if reply else None,
+                    "their_last_reply_at": _parse_attio_date(attrs.get("response_received_at")),
+                    "our_last_dm": (str(body).strip() or None) if body else None,
+                    "our_last_dm_at": direction_at,
+                    "dm_language": _normalize_dm_language(attrs.get("language")),
+                }
             # Entry source: real contact/response stamps vs created-at fallback.
             if last_touch is None:
                 touch_source = TOUCH_SOURCE_NONE
@@ -1229,7 +1487,8 @@ def detect_candidates(
                     urgency=urgency_score(policy.heat, silent, policy.threshold_days, vmult),
                     last_touch_synthetic=synthetic,
                     last_touch_source=touch_source,
-                    notes=[gate_note] if gate_note else [],
+                    notes=[n for n in (gate_note, cold_note) if n],
+                    **cold_kwargs,
                     email_campaign_stage=email_stage,
                     email_address=email_addr,
                     channel_hint=_derive_channel_hint(
@@ -1489,6 +1748,16 @@ def enrich_names(attio: AttioClient, candidates: list[FollowupCandidate]) -> Non
                 name, company, *_ = attio.extract_record_info(rec)
                 c.name = name
                 c.company = company
+            if c.lane is WarmLane.COLD_RESPONDER:
+                # The person-level `people.language` override outranks the
+                # entry attr on the send path; honor it for the paste text
+                # too (free when the record above was fetched — the client
+                # caches it from extract_record_info).
+                override = _normalize_dm_language(
+                    attio.person_language_override(c.record_id)
+                )
+                if override:
+                    c.dm_language = override
         elif c.object == "deals" and c.company_id and not c.company:
             comp = attio.get_company(c.company_id)
             if comp:
@@ -1536,6 +1805,20 @@ def to_json(candidates: list[FollowupCandidate]) -> list[dict]:
             # True → surface only, NEVER auto-draft (a human owns the email
             # thread — see SKILL.md C.3).
             "email_responded": c.email_responded,
+            # Operator notes (stale draft, "they wrote last — you owe a
+            # reply", …) — the skill layer must see them, not just the digest.
+            "notes": list(c.notes),
+            # Cold-responder lane — None outside that lane. dm_text is the
+            # paste-ready manual DM; the skill layer shows it (and may tailor
+            # it to the exchange in the same register) — never sends.
+            "their_last_reply": c.their_last_reply,
+            "their_last_reply_at": (
+                c.their_last_reply_at.isoformat() if c.their_last_reply_at else None
+            ),
+            "our_last_dm": c.our_last_dm,
+            "our_last_dm_at": c.our_last_dm_at.isoformat() if c.our_last_dm_at else None,
+            "dm_language": c.dm_language,
+            "dm_text": render_manual_dm(c) if c.lane is WarmLane.COLD_RESPONDER else None,
         }
         for c in candidates
     ]
@@ -1614,7 +1897,7 @@ def _parked_str(parked: dict | None) -> str:
 def partition_lanes(
     candidates: list[FollowupCandidate],
 ) -> dict[str, list[FollowupCandidate]]:
-    """Split candidates into the five DISJOINT digest sections (stable-sorted).
+    """Split candidates into the six DISJOINT digest sections (stable-sorted).
 
     Single source of truth for the lane/channel split — both the digest header
     counts (render_digest) and the summary dict (run_followup_radar) derive from
@@ -1626,13 +1909,17 @@ def partition_lanes(
                             by construction (the stamp requires a C.2-verified
                             Gmail thread), so it is NEVER pulled into
                             linkedin_warm regardless of channel_hint.
+      * ``cold_responder``— COLD_RESPONDER lane: paste-by-hand LinkedIn DMs.
+                            Own section regardless of channel_hint — never
+                            pulled into linkedin_warm (which is "DM likely,
+                            you decide"; this lane is "DM text ready").
       * ``linkedin_warm`` — remaining non-partner candidates with
                             ``channel_hint == "linkedin_only"`` — surfaced in
                             their own DM section, never silently dropped,
                             never double-listed under Owed/Nudge.
       * ``owed``/``nudge``— the remaining OWED/NUDGE candidates (email/unknown
                             channel).
-    Invariant (ENFORCED, not just documented): the five buckets are disjoint
+    Invariant (ENFORCED, not just documented): the six buckets are disjoint
     and their sizes sum to ``len(candidates)`` — raises ``ValueError`` naming
     the unpartitioned record_ids otherwise.
     """
@@ -1641,9 +1928,13 @@ def partition_lanes(
     waiting = sorted(
         (c for c in non_partner if c.lane is WarmLane.WAITING), key=_stable_key
     )
+    cold = sorted(
+        (c for c in non_partner if c.lane is WarmLane.COLD_RESPONDER), key=_stable_key
+    )
+    _own_section = (WarmLane.WAITING, WarmLane.COLD_RESPONDER)
     linkedin_warm = sorted(
         (c for c in non_partner
-         if c.lane is not WarmLane.WAITING and c.channel_hint == "linkedin_only"),
+         if c.lane not in _own_section and c.channel_hint == "linkedin_only"),
         key=_stable_key,
     )
     owed = sorted(
@@ -1661,11 +1952,14 @@ def partition_lanes(
     # channel_hint) would otherwise make candidates vanish SILENTLY from both
     # the digest and the summary counts — the exact failure mode this feature
     # exists to prevent. Loud > silent.
-    assigned = len(partner) + len(owed) + len(waiting) + len(linkedin_warm) + len(nudge)
+    assigned = (
+        len(partner) + len(owed) + len(waiting) + len(cold) + len(linkedin_warm)
+        + len(nudge)
+    )
     if assigned != len(candidates):
         placed = {
             id(c)
-            for bucket in (partner, owed, waiting, linkedin_warm, nudge)
+            for bucket in (partner, owed, waiting, cold, linkedin_warm, nudge)
             for c in bucket
         }
         leftover = [c.record_id for c in candidates if id(c) not in placed]
@@ -1678,6 +1972,7 @@ def partition_lanes(
         "partner": partner,
         "owed": owed,
         "waiting": waiting,
+        "cold_responder": cold,
         "linkedin_warm": linkedin_warm,
         "nudge": nudge,
     }
@@ -1696,11 +1991,13 @@ def render_digest(
     waiting_capped: int = 0,
     email_declined_suppressed: int = 0,
     full: bool = False,
+    cold_capped: int = 0,
 ) -> str:
     """Render the scannable operator digest (markdown).
 
     Sections in stakes order: Partner intros (highest stakes — a dropped intro
-    burns a partner), then Owed (near-certain actions), then LinkedIn-warm
+    burns a partner), then Owed (near-certain actions), then Waiting, then
+    Cold responders (paste-ready manual DMs), then LinkedIn-warm
     (channel_hint == "linkedin_only" — no email on file, DM likely; collapsed),
     then Nudge (judgment calls, collapsed). Partner rows stay in the Partner section
     regardless of channel; every other linkedin_only row is pulled out of
@@ -1753,6 +2050,7 @@ def render_digest(
     partner = lanes["partner"]
     owed = lanes["owed"]
     waiting = lanes["waiting"]
+    cold = lanes["cold_responder"]
     linkedin_warm = lanes["linkedin_warm"]
     nudge = lanes["nudge"]
 
@@ -1770,13 +2068,14 @@ def render_digest(
             )
         else:
             approx = ""
-        note = f" · ⚠ {c.notes[0]}" if c.notes else ""
-        # email_reply_seen (PR-214) renders as its OWN marker, NOT via notes[0]:
-        # a WAITING "nudge N/2 sent" or state-gate "drafted Nd ago" note already
-        # owns notes[0], so folding the reply-seen signal into notes[0] would
-        # bury the reconciliation line exactly when it matters most — a
-        # drafted-stale/waiting account that actually REPLIED must not read
-        # "you went quiet, N days silent" with no counter-signal.
+        note = "".join(f" · ⚠ {n}" for n in c.notes)
+        # email_reply_seen (PR-214) renders as its OWN marker, NOT as a note:
+        # notes are the row's warnings tail (a WAITING "nudge N/2 sent", a
+        # state-gate "drafted Nd ago", a "they wrote last"), so folding the
+        # reply-seen signal in there would bury the reconciliation line exactly
+        # when it matters most — a drafted-stale/waiting account that actually
+        # REPLIED must not read "you went quiet, N days silent" with no
+        # counter-signal.
         reply_seen = " · ↩ reply seen" if c.email_reply_seen else ""
         # A human owns this account's email thread (they replied to the
         # drip) — the row is informational; the skill layer never drafts it.
@@ -1798,6 +2097,32 @@ def render_digest(
             f"· urgency {c.urgency}{reply_seen}{via}{resp}{note}"
         )
 
+    def _cold_rows(c: FollowupCandidate) -> list[str]:
+        """Cold-responder row: the standard line, the exchange (their reply,
+        our DM — dates + one-line excerpts), then the paste-ready DM as a
+        blockquote so the operator can copy it whole."""
+        out = [_row(c)]
+        for who, at, body in (
+            ("them", c.their_last_reply_at, c.their_last_reply),
+            ("you", c.our_last_dm_at, c.our_last_dm),
+        ):
+            if at or body:
+                when = f" ({at.isoformat()})" if at else ""
+                text = f': "{_snippet(body)}"' if body else ""
+                out.append(f"  - {who}{when}{text}")
+        lang = (c.dm_language or "es").upper()
+        flag = (
+            ""
+            if c.dm_language
+            else " · ⚠ language not on record — ES by default, check before pasting"
+        )
+        out.append(f"  - paste-ready DM ({lang}){flag}:")
+        out.extend(
+            f"    > {line}" if line else "    >"
+            for line in render_manual_dm(c).split("\n")
+        )
+        return out
+
     lines: list[str] = ["**Follow-up Radar**"]
     lines.extend(banner)
     # Transparent lane split so a silently-empty email lane can't hide that most
@@ -1811,6 +2136,9 @@ def render_digest(
         count_parts.append(f"{len(owed)} owed")
     if waiting:
         count_parts.append(f"{len(waiting)} waiting")
+    if cold:
+        # Wording must match the cli.py footer exactly.
+        count_parts.append(f"{len(cold)} cold responder")
     if linkedin_warm:
         count_parts.append(f"{len(linkedin_warm)} LinkedIn-warm")
     if nudge:
@@ -1824,13 +2152,17 @@ def render_digest(
         lines.append(f"_Top {len(top)} to act on:_")
         lines.extend(_row(c) for c in top)
 
-    def _section(title: str, rows: list[FollowupCandidate], preview: int, tail: str) -> None:
+    def _section(
+        title: str, rows: list[FollowupCandidate], preview: int, tail: str,
+        row_fn=None,
+    ) -> None:
         if not rows:
             return
         lines.append("")
         lines.append(f"### {title} ({len(rows)})")
         shown = rows if full else rows[:preview]
-        lines.extend(_row(c) for c in shown)
+        for c in shown:
+            lines.extend(row_fn(c) if row_fn else [_row(c)])
         if not full and len(rows) > preview:
             lines.append(
                 f"- …+{len(rows) - preview} {tail} — run `sales followup --full` to see all."
@@ -1848,6 +2180,12 @@ def render_digest(
     _section(
         "Waiting on them — you sent, no reply",
         waiting, _WAITING_PREVIEW, "more waiting",
+    )
+    # Cold responders below Waiting (same "ball is theirs" semantics, but a
+    # LinkedIn DM the operator pastes by hand) and above the speculative DM lane.
+    _section(
+        "Cold responders — replied, then went quiet (paste by hand)",
+        cold, _COLD_RESPONDER_PREVIEW, "more cold responders", row_fn=_cold_rows,
     )
     # "no email on file" states the evidence, not a verdict — rows below the
     # skill layer's verify limit are never Gmail-checked, and a person mid
@@ -1893,6 +2231,18 @@ def render_digest(
             f"{_WAITING_DRAFT_SLOT_CAP}-slot draft cap — `sales followup "
             "--full` shows all._"
         )
+    if cold:
+        footer += (
+            " _Cold-responder DMs are paste-by-hand on LinkedIn — never "
+            "auto-sent, never an email draft; the next Phase 0.5 inbox scrape "
+            "records your DM and the row clears itself._"
+        )
+    if cold_capped:
+        footer += (
+            f" _{cold_capped} more cold-responder row(s) displaced by the "
+            f"{_COLD_RESPONDER_SLOT_CAP}-slot cap — `sales followup --full` "
+            "shows all._"
+        )
     if email_declined_suppressed:
         footer += (
             f" _{email_declined_suppressed} record(s) hidden by an email "
@@ -1906,10 +2256,12 @@ def render_digest(
     return "\n".join(lines)
 
 
-def _trim_with_waiting_cap(
+def _trim_with_lane_caps(
     candidates: list[FollowupCandidate], limit: int | None,
-) -> tuple[list[FollowupCandidate], int]:
-    """The ``--limit`` trim, with WAITING capped at ``_WAITING_DRAFT_SLOT_CAP``.
+) -> tuple[list[FollowupCandidate], dict[WarmLane, int]]:
+    """The ``--limit`` trim, with per-lane slot caps (``_LANE_SLOT_CAPS``:
+    WAITING at ``_WAITING_DRAFT_SLOT_CAP``, COLD_RESPONDER at
+    ``_COLD_RESPONDER_SLOT_CAP``).
 
     The trim decides which candidates the skill layer verifies + drafts, and
     it is won on raw urgency — but WAITING urgency grows monotonically with
@@ -1920,27 +2272,28 @@ def _trim_with_waiting_cap(
     candidates. No limit → no trim (the full digest keeps its own per-lane
     preview caps).
 
-    Returns ``(trimmed, waiting_capped)`` — the second element counts WAITING
-    rows the CAP specifically displaced (they'd have made the limit
+    Returns ``(trimmed, capped_by_lane)`` — the dict counts, per capped lane,
+    the rows the CAP specifically displaced (they'd have made the limit
     otherwise). Surfaced in the digest footer so cap displacement is never a
     silent drop: unlike ordinary below-the-limit truncation, these rows lose
     their slot to a rule, and the operator must be able to see that.
     """
+    capped = dict.fromkeys(_LANE_SLOT_CAPS, 0)
     if not limit:
-        return candidates, 0
+        return candidates, capped
     out: list[FollowupCandidate] = []
-    waiting_taken = 0
-    waiting_capped = 0
+    taken = dict.fromkeys(_LANE_SLOT_CAPS, 0)
     for c in candidates:
         if len(out) >= limit:
             break
-        if c.lane is WarmLane.WAITING:
-            if waiting_taken >= _WAITING_DRAFT_SLOT_CAP:
-                waiting_capped += 1
+        cap = _LANE_SLOT_CAPS.get(c.lane)
+        if cap is not None:
+            if taken[c.lane] >= cap:
+                capped[c.lane] += 1
                 continue
-            waiting_taken += 1
+            taken[c.lane] += 1
         out.append(c)
-    return out, waiting_capped
+    return out, capped
 
 
 def _resolve_gmail_sweep_enabled(override: bool | None) -> bool:
@@ -2059,11 +2412,13 @@ def run_followup_radar(
 ) -> dict:
     """Detect → rank → enrich top-N → render. Read-only.
 
-    Returns a summary dict: ``{"total", "surfaced", "partner", "owed", "nudge",
-    "linkedin_warm", "degraded", "dropped_no_touch", "candidates", "digest"}``.
-    The four lane counts come from ``partition_lanes`` (the same partition the
+    Returns a summary dict: ``{"total", "surfaced", "partner", "owed",
+    "waiting", "cold_responder", "nudge", "linkedin_warm", "degraded",
+    "dropped_no_touch", "candidates", "digest", ...}``.
+    The six lane counts come from ``partition_lanes`` (the same partition the
     digest header renders from) so they are DISJOINT and
-    ``partner + owed + linkedin_warm + nudge == surfaced``.
+    ``partner + owed + waiting + cold_responder + linkedin_warm + nudge ==
+    surfaced``.
     Never writes to the CRM — the write-back (followup_draft_at etc.) is the
     skill layer's stamp step. ``full`` renders every lane in full instead of a
     preview.
@@ -2082,7 +2437,9 @@ def run_followup_radar(
     result = detect_candidates(attio, today=today, list_id=list_id)
     candidates = result.candidates
     total = len(candidates)
-    surfaced, waiting_capped = _trim_with_waiting_cap(candidates, limit)
+    surfaced, capped = _trim_with_lane_caps(candidates, limit)
+    waiting_capped = capped.get(WarmLane.WAITING, 0)
+    cold_capped = capped.get(WarmLane.COLD_RESPONDER, 0)
     # Name resolution is COSMETIC — detection already fully succeeded. A
     # transient Attio error mid-enrichment must not crash the run and lose the
     # whole digest: degrade instead, and _who falls back to record_id[:8] for
@@ -2122,9 +2479,11 @@ def run_followup_radar(
         waiting_capped=waiting_capped,
         email_declined_suppressed=result.email_declined_suppressed,
         full=full,
+        cold_capped=cold_capped,
     )
     # Disjoint counts from the SAME partition the digest header uses —
-    # partner + owed + waiting + linkedin_warm + nudge == surfaced, always.
+    # partner + owed + waiting + cold_responder + linkedin_warm + nudge ==
+    # surfaced, always.
     lanes = partition_lanes(surfaced)
     return {
         "total": total,
@@ -2132,6 +2491,7 @@ def run_followup_radar(
         "partner": len(lanes["partner"]),
         "owed": len(lanes["owed"]),
         "waiting": len(lanes["waiting"]),
+        "cold_responder": len(lanes["cold_responder"]),
         "nudge": len(lanes["nudge"]),
         "linkedin_warm": len(lanes["linkedin_warm"]),
         "degraded": result.degraded,
@@ -2141,6 +2501,7 @@ def run_followup_radar(
         "waiting_expired": result.waiting_expired,
         "waiting_exhausted": result.waiting_exhausted,
         "waiting_capped": waiting_capped,
+        "cold_capped": cold_capped,
         "email_declined_suppressed": result.email_declined_suppressed,
         "candidates": to_json(surfaced),
         "digest": digest,

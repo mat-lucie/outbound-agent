@@ -199,6 +199,43 @@ Two things worth knowing before you tune it:
   could not be fetched. Anything consuming the JSON should say so rather than
   present a partial sweep as a complete one.
 
+#### The cold-responder lane (paste-ready manual DMs)
+
+Prospects you answer **by hand** on LinkedIn are invisible to the CRM: Phase 0.5
+only acts on prospect replies, so a hand-worked `Responded` row keeps a stale
+`last_contact_date` and the radar ranks it as neglected. Two pieces close that:
+
+- **Phase 0.5 records your manual DMs.** When the inbox scrape shows *your* last
+  message on a `Responded` entry and the body is not one of your own DM
+  templates, the run stamps `last_contact_date` to that message's date and files
+  the body as a `DM manual — <date>` note on the person record. Idempotency lives
+  in `exports/manual_touch_state.json` (local, gitignored) so the same message is
+  never re-stamped. The pass is fail-open — it can never break Phase 0.5 — and it
+  skips itself entirely when the self-echo template matcher is offline, rather
+  than recording your own automated sends as manual touches. Every outcome is
+  counted (`manual_touch_*` keys) and printed at the end of the phase.
+- **The radar surfaces the ones that went cold.** A `Responded` entry whose LAST
+  message is your manual DM and that has been quiet for 7+ calendar days renders
+  in its own **Cold responders** section with the exchange (their reply, your DM)
+  and a paste-ready DM in the prospect's language. If a later scrape shows the
+  prospect wrote back, the state file flips to "their ball", the row leaves the
+  lane and picks up a "you owe a reply" note instead.
+
+That local state file is the **only** evidence the lane trusts. CRM stamps are
+not usable here: drift repair, dedup merges and the consistency sweep all bump
+`last_contact_date` on `Responded` rows without any message from you, and a
+false "you spoke last" would nudge someone who is waiting on *you*. If the file
+is missing the lane is simply empty; if it is corrupt the run is flagged
+degraded and the lane is OFF (rows fall back to the plain nudge path).
+
+The DM copy is yours: `content/followup_dm.json` (`cold_responder` → `es` / `en`
+/ `pt`, with `{name}` and `{when}` placeholders). It is deliberately **not** in
+`messages.json` — that file is the corpus the self-echo matcher compares scraped
+threads against, so copy living there would make your pasted DM look like one of
+your own automated sends and the row would never clear. Nothing in this lane is
+ever sent by code: no DM send, no Gmail draft, no CRM write. You paste it by
+hand, and the next Phase 0.5 scrape records it and clears the row.
+
 ### (Optional) Migration provenance back-pointers
 
 **Off by default.** Only needed if you run the `scripts/migrate_*` or
@@ -447,6 +484,9 @@ You have two ways to supply real content:
   `[Company]` tokens; remove every `REPLACE_THIS_TEMPLATE`).
 - **`content/emails.json`** — your email templates (keep the `{{first_name}}` /
   `{{company}}` tokens; remove every `REPLACE_THIS_TEMPLATE`).
+- **`content/followup_dm.json`** — the paste-ready follow-up DM the radar's
+  cold-responder lane renders (keep the `{name}` / `{when}` placeholders). Only
+  used if you run the optional Follow-up Radar; it is never sent by code.
 - **`content/personas.json`**, the `content/*-midmarket-targets.json` lists,
   **`content/synthetic_personas.json`**, **`content/evidence_refs.json`**, and
   **`sales-program.md`** — your segments, target lists, and outreach voice/rules.
@@ -454,7 +494,7 @@ You have two ways to supply real content:
 
 **Option B — point `OUTBOUND_CONTENT_DIR` at a filled-in directory.** Set the
 env var to any directory that holds your own `messages.json`, `emails.json`,
-`personas.json`, etc. The four content loaders honor it; absent the var they
+`personas.json`, etc. The content loaders honor it; absent the var they
 read repo-root `content/`. The bundled **`examples/acme/content/`** is a
 complete, synthetic filled-in set you can point at to see the gate clear:
 

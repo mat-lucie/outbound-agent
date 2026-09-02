@@ -3064,8 +3064,9 @@ def sales_finalize_borderline_cmd(ctx, batch: str, dry_run: bool) -> None:
 # ── Follow-up Radar (Phase C) ──────────────────────────────────────────────
 def _followup_lane_counts(summary: dict) -> str:
     """Lane-count suffix for the radar footer, mirroring render_digest's
-    split-count convention: partner → owed → waiting → LinkedIn-warm → nudge,
-    with zero-count lanes omitted so an empty lane doesn't add noise."""
+    split-count convention: partner → owed → waiting → cold responder →
+    LinkedIn-warm → nudge, with zero-count lanes omitted so an empty lane
+    doesn't add noise."""
     parts = []
     if summary["partner"]:
         parts.append(f"{summary['partner']} partner intro")
@@ -3073,6 +3074,8 @@ def _followup_lane_counts(summary: dict) -> str:
         parts.append(f"{summary['owed']} owed")
     if summary.get("waiting"):
         parts.append(f"{summary['waiting']} waiting")
+    if summary.get("cold_responder"):
+        parts.append(f"{summary['cold_responder']} cold responder")
     if summary["linkedin_warm"]:
         parts.append(f"{summary['linkedin_warm']} LinkedIn-warm")
     if summary["nudge"]:
