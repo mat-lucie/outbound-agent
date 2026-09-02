@@ -157,6 +157,12 @@ WRITE_OWNER_REGISTRY: dict[tuple[str, str], WriteOwner] = {
         # phases apply, through the same AttioWriter path, but only
         # for entries stamped send_channel=botdog.
         "workflows.botdog_ingest.apply_lead_events",
+        # Manual-DM touch detection (Phase 0.5): when the inbox scrape shows
+        # OUR non-template last message on a RESPONDED entry, advance
+        # last_contact_date to that message's date so the follow-up radar
+        # stops ranking hand-worked prospects as neglected.
+        # Brownfield attr — registry-only.
+        "workflows.detect_responses._detect_manual_touches",
     ],
     ("linkedin_outreach", "quality_score"):
         "workflows.quality_gate.score_prospect",

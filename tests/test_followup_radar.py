@@ -158,6 +158,7 @@ class FakeAttio:
         persons=None, bulk_fetch_exc=None, bulk_fetch_failed=0,
         declined_ids=(), responded_ids=(),
         decline_fetch_exc=None, responded_fetch_exc=None,
+        lang_overrides=None,
     ):
         self._entries = entries or []
         self._deals = deals or []
@@ -178,6 +179,8 @@ class FakeAttio:
         self._bulk_fetch_exc = bulk_fetch_exc
         self._bulk_fetch_failed = bulk_fetch_failed
         self.bulk_fetch_calls: list[set] = []
+        # Cold-responder lane: people.language overrides {record_id: code}.
+        self._lang_overrides = dict(lang_overrides or {})
 
     @property
     def inner_client(self):
@@ -241,6 +244,9 @@ class FakeAttio:
     def get_company(self, cid):
         return None
 
+    def person_language_override(self, record_id):
+        return self._lang_overrides.get(record_id)
+
 
 @pytest.fixture
 def identity_parsers(monkeypatch):
@@ -249,6 +255,9 @@ def identity_parsers(monkeypatch):
     monkeypatch.setattr(AttioClient, "parse_entry", staticmethod(lambda e: e))
     monkeypatch.setattr(AttioClient, "parse_deal", staticmethod(lambda r: r))
     monkeypatch.setattr(followup_radar, "build_suppression_set", lambda attio: set())
+    # Cold-responder lane: never read the real manual_touch_state file from a
+    # test; tests that need scrape evidence patch this themselves.
+    monkeypatch.setattr(followup_radar, "_read_manual_touch_state", lambda: ({}, True))
 
 
 def _entry(record_id, stage, *, last_contact="2026-06-20", **extra):
@@ -2354,3 +2363,497 @@ def test_run_followup_radar_enrich_failure_degrades_and_renders(identity_parsers
     # Detection succeeded and the digest still renders the row (fallback name).
     assert summary["surfaced"] == 1
     assert "**r1**" in summary["digest"]
+
+
+# ── Cold-responder lane: "replied, then went quiet after your DM" ───────────
+#
+# RESPONDED entries whose LAST message is the operator's manual DM (per Phase
+# 0.5's manual_touch_state.json — the only trusted evidence) route to their own
+# lane with a paste-ready DM. Never auto-sent — the skill layer renders only.
+
+from workflows.followup_radar import (  # noqa: E402
+    _reset_cold_dm_copy_cache,
+    _thread_direction,
+    render_manual_dm,
+)
+
+
+def _cold_entry(record_id="r1", *, replied="2026-06-10", last_contact="2026-06-20",
+                language="es", reply_text="Suena interesante, mándame más info", **extra):
+    return _entry(
+        record_id, "Responded", last_contact=last_contact,
+        response_received_at=replied, last_response_text=reply_text,
+        language=language, **extra,
+    )
+
+
+def _ours(touch_date, body="Te dejo la propuesta que comentamos.", **over):
+    base = {
+        "fingerprint": "fp", "stamped_date": touch_date, "touch_date": touch_date,
+        "note_written": True, "ball": "ours", "last_body": body,
+    }
+    base.update(over)
+    return base
+
+
+def _patch_state(monkeypatch, state, ok=True):
+    monkeypatch.setattr(followup_radar, "_read_manual_touch_state", lambda: (state, ok))
+
+
+def _cold_case(monkeypatch, record_ids=("r1",), touch="2026-06-20", **entry_kw):
+    """Entries at Responded + a state entry saying our DM (dated ``touch``)
+    is the last message for each. Returns the entries."""
+    entry_kw.setdefault("last_contact", touch)
+    _patch_state(monkeypatch, {f"ent-{rid}": _ours(touch) for rid in record_ids})
+    return [_cold_entry(rid, **entry_kw) for rid in record_ids]
+
+
+def test_policy_cold_responder_lane_and_floor():
+    pol = POLICY[FollowupReason.RESPONDED_COLD]
+    assert pol.lane is WarmLane.COLD_RESPONDER
+    assert pol.threshold_days == 7
+    assert pol.business_days is False
+    assert pol.heat == POLICY[FollowupReason.AWAITING_REPLY].heat
+
+
+def test_thread_direction_helper():
+    assert _thread_direction(None) == ("unknown", None)
+    assert _thread_direction("garbage") == ("unknown", None)
+    assert _thread_direction({}) == ("unknown", None)
+    assert _thread_direction({"touch_date": "2026-06-20"}) == ("ours", date(2026, 6, 20))
+    assert _thread_direction({"ball": "ours", "touch_date": "bad"}) == ("ours", None)
+    assert _thread_direction({"ball": "theirs", "ball_observed": "2026-06-22"}) == (
+        "theirs", date(2026, 6, 22),
+    )
+
+
+def test_cold_responder_from_state(identity_parsers, monkeypatch):
+    entries = _cold_case(monkeypatch)
+    out = detect_candidates(FakeAttio(entries=entries), today=TODAY).candidates
+    assert len(out) == 1
+    c = out[0]
+    assert c.reason is FollowupReason.RESPONDED_COLD
+    assert c.lane is WarmLane.COLD_RESPONDER
+    assert c.silent_days == 11  # calendar days since our DM (06-20 → 07-01)
+    assert c.their_last_reply == "Suena interesante, mándame más info"
+    assert c.their_last_reply_at == date(2026, 6, 10)
+    assert c.our_last_dm == "Te dejo la propuesta que comentamos."
+    assert c.our_last_dm_at == date(2026, 6, 20)
+    assert c.dm_language == "es"
+    assert c.last_touch_source == TOUCH_SOURCE_CONTACT_STAMP
+    assert c.notes == []
+
+
+def test_cold_responder_floor_is_seven_calendar_days(identity_parsers, monkeypatch):
+    # 6 days since our DM → NOT surfaced (a day-3 nudge on our own message is
+    # pressure — stricter than the plain RESPONDED nudge, on purpose).
+    six = _cold_case(monkeypatch, touch="2026-06-25")
+    assert detect_candidates(FakeAttio(entries=six), today=TODAY).candidates == []
+    seven = _cold_case(monkeypatch, touch="2026-06-24")
+    out = detect_candidates(FakeAttio(entries=seven), today=TODAY).candidates
+    assert len(out) == 1 and out[0].reason is FollowupReason.RESPONDED_COLD
+    assert out[0].silent_days == 7
+
+
+def test_crm_stamps_alone_never_promote(identity_parsers):
+    # last_contact_date > response_received_at is NOT evidence (cadence drift
+    # repair / dedup bump it without any message from us) — without a state
+    # entry the row stays on the plain RESPONDED nudge path.
+    out = detect_candidates(FakeAttio(entries=[_cold_entry()]), today=TODAY).candidates
+    assert len(out) == 1
+    assert out[0].reason is FollowupReason.RESPONDED_NO_NEXT_STEP
+    assert out[0].lane is WarmLane.NUDGE
+    assert out[0].our_last_dm_at is None
+
+
+def test_state_entry_without_ball_key_counts_as_ours(identity_parsers, monkeypatch):
+    st = {"ent-r1": _ours("2026-06-20")}
+    del st["ent-r1"]["ball"]
+    del st["ent-r1"]["last_body"]
+    _patch_state(monkeypatch, st)
+    out = detect_candidates(FakeAttio(entries=[_cold_entry()]), today=TODAY).candidates
+    assert out[0].reason is FollowupReason.RESPONDED_COLD
+    assert out[0].our_last_dm is None
+
+
+def test_state_ball_theirs_uses_their_reply_as_touch_and_notes(identity_parsers, monkeypatch):
+    # The scrape saw THEIR reply on 06-22 (invisible to the CRM, whose latest
+    # stamp is 06-20): not cold, silence counts from 06-22, and the row says
+    # the operator owes a reply.
+    _patch_state(monkeypatch, {"ent-r1": _ours("2026-06-20", ball="theirs",
+                                                ball_observed="2026-06-22")})
+    out = detect_candidates(FakeAttio(entries=[_cold_entry()]), today=TODAY).candidates
+    assert len(out) == 1
+    c = out[0]
+    assert c.reason is FollowupReason.RESPONDED_NO_NEXT_STEP
+    assert c.lane is WarmLane.NUDGE
+    assert c.last_touch == date(2026, 6, 22)
+    assert c.silent_days == 7  # business days 06-22 → 07-01
+    assert c.last_touch_synthetic is False
+    assert any("you owe a reply" in n for n in c.notes)
+    md = render_digest(out)
+    assert "you owe a reply" in md
+    assert "paste-ready DM" not in md
+
+
+def test_state_ball_theirs_older_than_crm_keeps_crm_touch(identity_parsers, monkeypatch):
+    _patch_state(monkeypatch, {"ent-r1": _ours("2026-06-12", ball="theirs",
+                                                ball_observed="2026-06-15")})
+    out = detect_candidates(FakeAttio(entries=[_cold_entry()]), today=TODAY).candidates
+    assert out[0].reason is FollowupReason.RESPONDED_NO_NEXT_STEP
+    assert out[0].last_touch == date(2026, 6, 20)
+    assert any("you owe a reply" in n for n in out[0].notes)
+
+
+def test_theirs_fresh_reply_suppresses_row_entirely(identity_parsers, monkeypatch):
+    # They replied yesterday: below every threshold → nothing surfaces, and
+    # in particular no "went cold" nudge.
+    _patch_state(monkeypatch, {"ent-r1": _ours("2026-06-20", ball="theirs",
+                                                ball_observed="2026-06-30")})
+    assert detect_candidates(FakeAttio(entries=[_cold_entry()]), today=TODAY).candidates == []
+
+
+def test_email_responded_rows_are_never_promoted(identity_parsers, monkeypatch):
+    # The person replied to the email drip → render-only on EVERY channel:
+    # no DM text, plain nudge path with the ✉ marker.
+    entries = _cold_case(monkeypatch)
+    out = detect_candidates(
+        FakeAttio(entries=entries, responded_ids={"r1"}), today=TODAY,
+    ).candidates
+    assert len(out) == 1
+    assert out[0].reason is FollowupReason.RESPONDED_NO_NEXT_STEP
+    assert out[0].email_responded is True
+    md = render_digest(out)
+    assert "replied by email" in md
+    assert "paste-ready DM" not in md
+
+
+def test_state_unreadable_degrades_and_lane_is_off(identity_parsers, monkeypatch):
+    _patch_state(monkeypatch, {}, ok=False)
+    res = detect_candidates(FakeAttio(entries=[_cold_entry()]), today=TODAY)
+    assert any("cold-responder lane OFF" in d for d in res.degraded)
+    assert res.candidates[0].reason is FollowupReason.RESPONDED_NO_NEXT_STEP
+    assert "Detection degraded" in render_digest(res.candidates, degraded=res.degraded)
+
+
+def test_cold_responder_honors_parked_state(identity_parsers, monkeypatch):
+    muted = _cold_case(monkeypatch, followup_muted=True)
+    res = detect_candidates(FakeAttio(entries=muted), today=TODAY)
+    assert res.candidates == []
+    assert res.parked["muted"] == 1
+    snoozed = _cold_case(monkeypatch, followup_snooze_until="2026-07-10")
+    assert detect_candidates(FakeAttio(entries=snoozed), today=TODAY).candidates == []
+
+
+def test_cold_responder_suppressed_by_hard_declines(identity_parsers, monkeypatch):
+    entries = _cold_case(monkeypatch)
+    monkeypatch.setattr(followup_radar, "build_suppression_set", lambda attio: {"r1"})
+    assert detect_candidates(FakeAttio(entries=entries), today=TODAY).candidates == []
+
+
+def test_multiple_notes_all_render(identity_parsers, monkeypatch):
+    # Stale-draft gate note + "they wrote last" note on the same row: both
+    # must reach the digest and the JSON (previously only notes[0] rendered).
+    _patch_state(monkeypatch, {"ent-r1": _ours("2026-06-10", ball="theirs",
+                                                ball_observed="2026-06-15")})
+    entries = [_cold_entry(last_contact="2026-06-10", followup_draft_at="2026-06-16")]
+    out = detect_candidates(FakeAttio(entries=entries), today=TODAY).candidates
+    assert len(out) == 1
+    assert len(out[0].notes) == 2
+    md = render_digest(out)
+    assert "still unsent" in md and "you owe a reply" in md
+    assert to_json(out)[0]["notes"] == out[0].notes
+
+
+def test_partition_has_cold_bucket_and_keeps_invariant(identity_parsers, monkeypatch):
+    entries = _cold_case(monkeypatch, record_ids=("c1",)) + [
+        _entry("li1", "Responded", last_contact="2026-06-20"),  # linkedin_only nudge
+        _entry("owed1", "Call Booked", last_contact="2026-06-20", email_address="a@x.com"),
+    ]
+    out = detect_candidates(FakeAttio(entries=entries), today=TODAY).candidates
+    lanes = partition_lanes(out)
+    assert [c.record_id for c in lanes["cold_responder"]] == ["c1"]
+    # channel_hint is linkedin_only on every entry, but cold rows must NOT be
+    # swallowed by the LinkedIn-warm bucket.
+    assert [c.record_id for c in lanes["linkedin_warm"]] == ["li1"]
+    assert [c.record_id for c in lanes["owed"]] == ["owed1"]
+    assert sum(len(v) for v in lanes.values()) == len(out) == 3
+
+
+def _named(c, name="Vanessa Solis", company="Acme"):
+    c.name = name
+    c.company = company
+    return c
+
+
+def test_render_cold_section_with_paste_ready_dm(identity_parsers, monkeypatch):
+    entries = _cold_case(monkeypatch)
+    out = detect_candidates(FakeAttio(entries=entries), today=TODAY).candidates
+    _named(out[0])
+    md = render_digest(out)
+    assert "Cold responders" in md
+    assert "1 cold responder" in md.split("\n")[2]  # split-count line
+    assert "Vanessa Solis · Acme" in md
+    assert "replied, then went quiet after your DM" in md
+    assert "11 days silent" in md
+    # Exchange context: their reply and our DM, each with its date.
+    assert 'them (2026-06-10): "Suena interesante, mándame más info"' in md
+    assert 'you (2026-06-20): "Te dejo la propuesta que comentamos."' in md
+    # Paste-ready DM from the operator's followup_dm.json copy.
+    assert "paste-ready DM (ES)" in md
+    assert "> Vanessa - cómo estás?" in md
+    assert "dos horarios" in md
+    # Paste-by-hand footer, never an email draft.
+    assert "never auto-sent" in md
+
+
+def test_render_cold_dm_in_prospect_language(identity_parsers, monkeypatch):
+    pt = detect_candidates(
+        FakeAttio(entries=_cold_case(monkeypatch, language="pt")), today=TODAY,
+    ).candidates
+    _named(pt[0], name="Fabiano Souza")
+    md_pt = render_digest(pt)
+    assert "paste-ready DM (PT)" in md_pt
+    assert "> Fabiano - tudo bem?" in md_pt
+    assert "dois horários" in md_pt
+    en = detect_candidates(
+        FakeAttio(entries=_cold_case(monkeypatch, language="en")), today=TODAY,
+    ).candidates
+    _named(en[0], name="Niklas Berg")
+    md_en = render_digest(en)
+    assert "paste-ready DM (EN)" in md_en
+    assert "> Niklas - how are you?" in md_en
+    assert "two slots" in md_en
+
+
+def test_render_cold_dm_missing_language_defaults_es_and_flags(identity_parsers, monkeypatch):
+    out = detect_candidates(
+        FakeAttio(entries=_cold_case(monkeypatch, language=None)), today=TODAY,
+    ).candidates
+    assert out[0].dm_language is None
+    md = render_digest(out)
+    assert "language not on record" in md
+    assert "cómo estás?" in md
+    # Unsupported or sloppy codes degrade the same way — never a mixed-language DM.
+    for raw in ("fr", "esp", "en-US"):
+        bad = detect_candidates(
+            FakeAttio(entries=_cold_case(monkeypatch, language=raw)), today=TODAY,
+        ).candidates
+        assert bad[0].dm_language is None, raw
+
+
+def test_person_language_override_wins_for_dm_text(identity_parsers, monkeypatch):
+    entries = _cold_case(monkeypatch, language="es")
+    summary = run_followup_radar(
+        FakeAttio(entries=entries, lang_overrides={"r1": "pt"}), today=TODAY,
+    )
+    row = summary["candidates"][0]
+    assert row["dm_language"] == "pt"
+    assert "tudo bem?" in row["dm_text"]
+    assert "paste-ready DM (PT)" in summary["digest"]
+
+
+def test_render_cold_dm_missing_name_uses_placeholder(identity_parsers, monkeypatch):
+    out = detect_candidates(
+        FakeAttio(entries=_cold_case(monkeypatch)), today=TODAY,
+    ).candidates
+    assert out[0].name is None
+    assert render_manual_dm(out[0]).startswith("[Name] - cómo estás?")
+    pt = detect_candidates(
+        FakeAttio(entries=_cold_case(monkeypatch, language="pt")), today=TODAY,
+    ).candidates
+    assert render_manual_dm(pt[0]).startswith("[Name] - tudo bem?")
+
+
+def _cold_candidate(silent_days, language="es", name="Omar Ruiz"):
+    return FollowupCandidate(
+        object="linkedin_outreach", record_id="x", reason=FollowupReason.RESPONDED_COLD,
+        lane=WarmLane.COLD_RESPONDER, last_touch=date(2026, 6, 1), silent_days=silent_days,
+        heat=4, value_mult=1.0, urgency=4.0, name=name, dm_language=language,
+        last_touch_source=TOUCH_SOURCE_CONTACT_STAMP,
+    )
+
+
+def test_cold_dm_time_phrase_scales_with_silence():
+    # Buckets <10 / <35 / <75 / older — calibrated so the phrase never
+    # contradicts the real silence at a boundary (13d is not "a few days",
+    # 59d is not "a few weeks").
+    assert "hace unos días" in render_manual_dm(_cold_candidate(8))
+    assert "hace unas semanas" in render_manual_dm(_cold_candidate(10))
+    assert "hace unas semanas" in render_manual_dm(_cold_candidate(20))
+    assert "hace un mes" in render_manual_dm(_cold_candidate(35))
+    assert "hace un mes" in render_manual_dm(_cold_candidate(59))
+    assert "hace un tiempo" in render_manual_dm(_cold_candidate(75))
+    assert "uns dias atrás" in render_manual_dm(_cold_candidate(8, "pt"))
+    assert "um mês atrás" in render_manual_dm(_cold_candidate(40, "pt"))
+    assert "a few weeks back" in render_manual_dm(_cold_candidate(20, "en"))
+    assert "a while back" in render_manual_dm(_cold_candidate(100, "en"))
+
+
+def test_cold_dm_names_the_topic_and_splits_the_ask():
+    """The bundled Acme reference copy (examples/acme/content/followup_dm.json)
+    names the topic and splits the ask — the shape the lane is designed for."""
+    es = render_manual_dm(_cold_candidate(8))
+    assert "sobre planeación de producción" in es
+    assert "dos horarios esta semana? Y agendo 20 min." in es
+    assert "planejamento de produção" in render_manual_dm(_cold_candidate(8, "pt"))
+    en = render_manual_dm(_cold_candidate(8, "en"))
+    assert "about production planning" in en
+    assert "If the timing is off, tell me and I'll drop it." in en
+
+
+def test_cold_dm_unknown_language_carries_a_visible_warning():
+    dm = render_manual_dm(_cold_candidate(8, language=None))
+    assert dm.startswith("[language not on record")
+    assert "Omar - cómo estás?" in dm
+    assert not render_manual_dm(_cold_candidate(8, "pt")).startswith("[")
+
+
+def test_cold_dm_reference_copy_respects_hand_typed_register():
+    # Hand-typed register: no opening ¿/¡, no em-dash, spaced-hyphen greeting,
+    # short (well under 80 words), LATAM-neutral Spanish, no pitch/pricing.
+    for lang in ("es", "pt", "en"):
+        for days in (8, 20, 70):
+            dm = render_manual_dm(_cold_candidate(days, lang))
+            assert "¿" not in dm and "¡" not in dm, (lang, dm)
+            assert "—" not in dm, (lang, dm)
+            assert " - " in dm.split("\n")[0], (lang, dm)
+            assert len(dm.split()) < 80, (lang, len(dm.split()))
+            # Exactly two question marks: greeting + one ask, not a scaffold.
+            assert dm.count("?") == 2, (lang, dm)
+            low = dm.lower()
+            for banned in ("usd", "$", "precio", "preço", "price", "última oportunidad",
+                           "last chance", "leverage", "synergy", "platicamos"):
+                assert banned not in low, (lang, banned)
+
+
+def test_cold_dm_first_name_only():
+    assert render_manual_dm(_cold_candidate(8, name="María José Pérez")).startswith("María - ")
+    assert render_manual_dm(_cold_candidate(8, name="  Omar  Ruiz ")).startswith("Omar - ")
+    assert render_manual_dm(_cold_candidate(8, name="   ")).startswith("[Name] - ")
+
+
+def test_cold_dm_falls_back_visibly_when_copy_file_is_unusable(monkeypatch):
+    """Fork seam: the DM body is operator copy in content/followup_dm.json.
+    An unreadable/absent file must render a visibly-broken placeholder — never
+    a generic bot line someone might paste — and must not raise inside the
+    digest."""
+    def _boom():
+        raise FileNotFoundError("followup_dm.json missing")
+
+    _reset_cold_dm_copy_cache()
+    monkeypatch.setattr("models.campaign.load_followup_dm_templates", _boom)
+    try:
+        dm = render_manual_dm(_cold_candidate(8))
+        assert "followup_dm.json" in dm
+        assert dm.startswith("Omar - [")
+        # Digest rendering still succeeds end-to-end.
+        assert "paste-ready DM (ES)" in render_digest([_cold_candidate(8)])
+    finally:
+        _reset_cold_dm_copy_cache()
+
+
+def test_cold_dm_missing_language_in_copy_file_falls_back(monkeypatch):
+    """A copy file that only defines ES must not crash a PT row."""
+    _reset_cold_dm_copy_cache()
+    monkeypatch.setattr(
+        "models.campaign.load_followup_dm_templates",
+        lambda: {"cold_responder": {"es": "{name} - hola ({when})"}},
+    )
+    try:
+        assert render_manual_dm(_cold_candidate(8)) == "Omar - hola (hace unos días)"
+        pt = render_manual_dm(_cold_candidate(8, "pt"))
+        assert "followup_dm.json" in pt and "uns dias atrás" in pt
+    finally:
+        _reset_cold_dm_copy_cache()
+
+
+def test_shipped_neutral_copy_is_a_replaceable_placeholder():
+    """The repo-root content/ ships neutral placeholder copy carrying the
+    sentinel, exactly like messages.json — the Acme example carries the real
+    worked copy."""
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    shipped = json.loads((root / "content" / "followup_dm.json").read_text())
+    group = shipped["cold_responder"]
+    assert set(group) == {"es", "en", "pt"}
+    for lang, text in group.items():
+        assert "REPLACE_THIS_TEMPLATE" in text, lang
+        assert "{name}" in text and "{when}" in text, lang
+
+
+def test_to_json_carries_cold_fields(identity_parsers, monkeypatch):
+    out = detect_candidates(
+        FakeAttio(entries=_cold_case(monkeypatch)), today=TODAY,
+    ).candidates
+    _named(out[0])
+    row = to_json(out)[0]
+    assert row["lane"] == "cold_responder"
+    assert row["reason"] == "responded_cold"
+    assert row["their_last_reply"] == "Suena interesante, mándame más info"
+    assert row["their_last_reply_at"] == "2026-06-10"
+    assert row["our_last_dm"] == "Te dejo la propuesta que comentamos."
+    assert row["our_last_dm_at"] == "2026-06-20"
+    assert row["dm_language"] == "es"
+    assert row["dm_text"].startswith("Vanessa - cómo estás?")
+    assert row["notes"] == []
+    # Non-cold rows carry the fields as None (stable schema for the skill layer).
+    other = to_json(detect_candidates(
+        FakeAttio(entries=[_entry("n1", "Responded", last_contact="2026-06-20")]), today=TODAY,
+    ).candidates)[0]
+    assert other["dm_text"] is None and other["our_last_dm_at"] is None
+
+
+def test_run_summary_counts_cold_responder_and_cli_footer(identity_parsers, monkeypatch):
+    from cli import _followup_lane_counts
+    entries = _cold_case(monkeypatch, record_ids=("c1",)) + [
+        _entry("li1", "Responded", last_contact="2026-06-20"),
+        _entry("owed1", "Call Booked", last_contact="2026-06-20", email_address="a@x.com"),
+    ]
+    summary = run_followup_radar(FakeAttio(entries=entries), today=TODAY)
+    assert summary["cold_responder"] == 1
+    assert (
+        summary["partner"] + summary["owed"] + summary["waiting"] + summary["cold_responder"]
+        + summary["linkedin_warm"] + summary["nudge"] == summary["surfaced"] == 3
+    )
+    assert summary["cold_capped"] == 0
+    assert "1 cold responder" in summary["digest"]
+    assert " · 1 cold responder" in _followup_lane_counts(summary)
+
+
+def test_trim_caps_cold_responder_slots(identity_parsers, monkeypatch):
+    # 5 cold rows (older → higher urgency than the fresh nudges) + 3 email
+    # nudges, limit 6 → only 3 cold rows take slots, 2 displaced and reported.
+    entries = _cold_case(
+        monkeypatch, record_ids=tuple(f"c{i}" for i in range(5)),
+        touch="2026-05-01", replied="2026-04-01",
+    ) + [
+        _entry(f"n{i}", "Responded", last_contact="2026-06-20", email_address=f"n{i}@x.com")
+        for i in range(3)
+    ]
+    summary = run_followup_radar(FakeAttio(entries=entries), today=TODAY, limit=6)
+    assert summary["cold_responder"] == 3
+    assert summary["cold_capped"] == 2
+    assert summary["nudge"] == 3
+    assert "cold-responder row(s) displaced by the 3-slot cap" in summary["digest"]
+
+
+def test_cold_preview_collapses_and_expands(identity_parsers, monkeypatch):
+    entries = _cold_case(monkeypatch, record_ids=tuple(f"c{i}" for i in range(7)))
+    out = detect_candidates(FakeAttio(entries=entries), today=TODAY).candidates
+    collapsed = render_digest(out)
+    assert "…+2 more cold responders" in collapsed
+    full = render_digest(out, full=True)
+    assert "more cold responders" not in full
+    assert full.count("paste-ready DM") == 7
+
+
+def test_cold_row_snippet_is_truncated_and_flattened(identity_parsers, monkeypatch):
+    long_reply = ("Claro que sí,\n muy interesante " * 20).strip()
+    entries = _cold_case(monkeypatch, reply_text=long_reply)
+    md = render_digest(detect_candidates(FakeAttio(entries=entries), today=TODAY).candidates)
+    line = next(ln for ln in md.split("\n") if "them (2026-06-10)" in ln)
+    assert "\n" not in line and len(line) < 220
+    assert line.endswith('…"')

@@ -5,11 +5,17 @@ which don't match the vanity URLs stored in Attio (linkedin.com/in/...).
 Matching is done by participant name instead.
 """
 
+import contextlib
 import csv
+import hashlib
 import io
+import json
 import os
+import tempfile
+import traceback
 import unicodedata
 from datetime import date
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
@@ -118,6 +124,19 @@ def _empty_counts() -> dict:
         "drift_detected": 0,
         "drift_auto_repaired": 0,
         "drift_repair_failed": 0,
+        # Manual-DM touch detection (see _detect_manual_touches).
+        "manual_touches_detected": 0,
+        "manual_touch_failed": 0,
+        "manual_touch_note_failed": 0,
+        "manual_touch_state_unreadable": 0,
+        "manual_touch_state_write_failed": 0,
+        "manual_touch_pass_crashed": 0,
+        "manual_touch_guard_offline": 0,
+        "manual_touch_ambiguous_name": 0,
+        "manual_touch_date_fallback": 0,
+        # Prospect replied AFTER a recorded manual DM (ball flipped to
+        # "theirs" in the state file; the CRM cannot see this reply).
+        "manual_touch_prospect_replied": 0,
     }
 
 
@@ -1057,6 +1076,418 @@ def _handle_manual_reply(
                     err=True,
                 )
                 raise
+
+
+# ---------------------------------------------------------------------------
+# Manual-DM touch detection (Phase 0.5)
+#
+# Hand-written LinkedIn DMs are invisible to the CRM: the reply loop above
+# only acts on DM-stage entries, and RESPONDED entries are in `skip_stages`.
+# Result: prospects the operator personally worked keep a stale
+# `last_contact_date`, the follow-up radar ranks them as neglected, and the
+# reply text never reaches the CRM. This pass re-uses the same inbox scrape
+# and, for RESPONDED entries whose LAST message is ours and is NOT one of
+# our DM templates, advances `last_contact_date` and files the message body
+# as a "DM manual" note on the person record.
+#
+# The stamp value is the row's `lastMessageDate` (date part) — the scraper
+# exposes the date of the LAST message per thread — so a months-old manual
+# DM seen on the first run is recorded on its real date, not on scrape day.
+# `last_contact_date` is never moved backwards: if the CRM already carries a
+# later date, only the note is filed.
+#
+# Idempotency lives in a local state file (`exports/manual_touch_state.json`,
+# gitignored): `{entry_id: {fingerprint, stamped_date, touch_date,
+# note_written}}`. The fingerprint is sha1(totalMessageCount|body): the
+# count makes a later, identical nudge a NEW touch. Without the file the same
+# unchanged thread would re-stamp on every daily run. The fingerprint is
+# recorded ONLY after the CRM stamp landed, so a failed stamp retries next
+# run; a failed note (forensics) is retried on later runs WITHOUT re-stamping.
+#
+# Guards: our own DM templates (self-echo matcher) are not manual touches,
+# and the pass SKIPS the run when that matcher is offline (missing/corrupt
+# messages.json) rather than stamping template sends as manual. A name that
+# matches several different people at RESPONDED is skipped so one prospect's
+# message text is never filed on another's record.
+#
+# Known limits: only the LAST message body per thread is visible; the state
+# file is per-checkout, so a run from a different checkout may re-note once;
+# the pass runs only when Phase 0.5 reaches the scrape (it is skipped with
+# the early return when no DM-stage prospects exist). Whole pass is
+# fail-open — it must never break Phase 0.5, whose reply_detection_status
+# gates DM sends.
+#
+# Ball tracking (read by the follow-up radar's cold-responder lane): every
+# state entry also carries ``ball`` ("ours" when written — the last message
+# was the operator's) and ``last_body`` (the DM text, truncated, for the
+# radar's context lines). When a later scrape shows the SAME RESPONDED
+# thread with the prospect's message last, the entry flips to
+# ``ball: "theirs"`` + ``ball_observed`` — the CRM never learns about that
+# reply (RESPONDED entries skip the reply loop), so without this flip the
+# radar would render a "went cold" nudge for someone who just answered.
+# Only entries already in state are flipped; a wrong flip merely suppresses
+# a nudge (the safe direction).
+# ---------------------------------------------------------------------------
+
+# Anchored to the repo root, not the cwd (same rationale as scrape_cursor).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+MANUAL_TOUCH_STATE_PATH = _REPO_ROOT / "exports" / "manual_touch_state.json"
+
+_MANUAL_TOUCH_WRITER = "workflows.detect_responses._detect_manual_touches"
+# How much of the DM body the state file keeps for the radar's context line.
+# The full text already lives in the CRM "DM manual" note.
+_MANUAL_TOUCH_BODY_KEEP = 500
+
+
+def _manual_touch_fingerprint(body: str, total_messages_raw: str) -> str:
+    """Stable fingerprint of a thread's last message: body + message count,
+    so an identical nudge sent again later (count grew) is a new touch."""
+    return hashlib.sha1(
+        f"{total_messages_raw.strip()}|{body.strip()}".encode()
+    ).hexdigest()
+
+
+def _manual_touch_date(last_message_date_raw: str, today_iso: str) -> tuple[str, bool]:
+    """Date to stamp for a touch: the row's lastMessageDate (date part) when
+    it parses, else today. Returns (iso_date, fell_back_to_today)."""
+    candidate = (last_message_date_raw or "").strip()[:10]
+    try:
+        date.fromisoformat(candidate)
+    except ValueError:
+        return today_iso, True
+    return candidate, False
+
+
+def _load_manual_touch_state(path: Path) -> dict | None:
+    """Read the fingerprint map. Missing file → {} (first run). Unparsable
+    or wrong-shaped file → None: the caller must SKIP the pass, because
+    treating corrupt state as empty would re-stamp every hand-worked entry
+    and file a duplicate note on each one."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        click.echo(
+            f"  ⚠ manual-touch: cannot read {path.name} "
+            f"({type(exc).__name__}: {exc}) — skipping manual-touch pass.",
+            err=True,
+        )
+        return None
+    try:
+        state = json.loads(raw) if raw.strip() else {}
+    except ValueError as exc:
+        click.echo(
+            f"  ⚠ manual-touch: {path.name} is not valid JSON ({exc}) — "
+            f"skipping manual-touch pass so nothing gets re-stamped. "
+            f"Fix or delete the file (delete = every current manual touch "
+            f"is re-noted once; dates are not affected).",
+            err=True,
+        )
+        return None
+    if not isinstance(state, dict) or not all(
+        isinstance(v, dict) for v in state.values()
+    ):
+        click.echo(
+            f"  ⚠ manual-touch: {path.name} has an unexpected shape — "
+            f"skipping manual-touch pass.",
+            err=True,
+        )
+        return None
+    return state
+
+
+def _save_manual_touch_state(path: Path, state: dict) -> None:
+    """Atomic, durable write (temp file + fsync + rename) so a crash
+    mid-write cannot leave a half-written file the next run refuses."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".manual_touch_state.", suffix=".tmp", dir=path.parent,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def _write_manual_touch_note(
+    attio: AttioClient,
+    *,
+    record_id: str,
+    touch_date: str,
+    body: str,
+    participant_name: str,
+    entry_id: str,
+    counts: dict,
+) -> bool:
+    """File the "DM manual" note. Returns True when it landed. Failures are
+    counted + logged; the caller keeps ``note_written=False`` in the state
+    so a later run retries the note without re-stamping the date."""
+    if not record_id:
+        counts["manual_touch_note_failed"] += 1
+        click.echo(
+            f"  ⚠ manual-touch: entry {entry_id} for {participant_name} has "
+            f"no record_id — DM manual note skipped. Forensics gap — investigate.",
+            err=True,
+        )
+        return False
+    try:
+        attio.create_note(
+            record_id=record_id,
+            title=f"DM manual — {touch_date}",
+            content=body,
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as note_exc:
+        counts["manual_touch_note_failed"] += 1
+        click.echo(
+            f"  ⚠ manual-touch: DM manual note failed for {participant_name} "
+            f"(entry {entry_id}): {type(note_exc).__name__}: {note_exc}. "
+            f"Will retry the note (not the date stamp) next run.",
+            err=True,
+        )
+        return False
+    return True
+
+
+def _detect_manual_touches(
+    *,
+    attio: AttioClient,
+    list_id: str,
+    scraped_threads: list[dict],
+    name_to_full_pipeline: dict[str, list[dict]],
+    today_iso: str,
+    counts: dict,
+    state_path: Path | None = None,
+) -> None:
+    """Stamp `last_contact_date` + a "DM manual" note for hand-written DMs
+    on RESPONDED entries. See the module comment above for the rules.
+
+    Mutates `counts` in place (all keys pre-declared in `_empty_counts`):
+      manual_touches_detected      — new touches recorded (stamp and/or note)
+      manual_touch_failed          — the CRM rejected the stamp (retry next run)
+      manual_touch_note_failed     — note write failed (retried next run)
+      manual_touch_state_unreadable / manual_touch_state_write_failed
+                                   — local state file problems (loud)
+      manual_touch_guard_offline   — template matcher unavailable → pass skipped
+      manual_touch_ambiguous_name  — name matches several people → row skipped
+      manual_touch_date_fallback   — row had no parsable lastMessageDate
+      manual_touch_prospect_replied — prospect wrote after a recorded manual
+                                   DM → state ball flipped to "theirs"
+    """
+    from clients.attio_writer import (
+        AttioError,
+        AttioWriter,
+        UnauthorizedAttioWriteError,
+        WriteIntent,
+    )
+
+    path = MANUAL_TOUCH_STATE_PATH if state_path is None else state_path
+    state = _load_manual_touch_state(path)
+    if state is None:
+        counts["manual_touch_state_unreadable"] += 1
+        return
+    if _self_echo_templates() is None:
+        # The self-echo matcher fails open for the reply loop (a missed
+        # flip is recoverable). Here failing open would stamp our own
+        # template sends as manual touches and persist that — skip instead.
+        counts["manual_touch_guard_offline"] += 1
+        click.echo(
+            "  ⚠ manual-touch: DM template set unavailable (self-echo guard "
+            "offline) — skipping the manual-touch pass this run so our own "
+            "template DMs are not recorded as manual touches.",
+            err=True,
+        )
+        return
+
+    writer = AttioWriter(attio=attio)
+    dirty = False
+    try:
+        for row in scraped_threads:
+            raw_from_me = row.get("isLastMessageFromMe", "").strip().lower()
+            if raw_from_me not in ("true", "false"):
+                # Missing/renamed column or garbage: inert. Never read an
+                # unknown value as "the prospect wrote last" — that would
+                # flip every recorded entry to theirs and black out the
+                # radar's cold-responder lane silently.
+                continue
+            from_me = raw_from_me == "true"
+            participant_name = row.get("participantFullName", "").strip()
+            last_body = row.get("lastMessageBody", "").strip()
+            if not participant_name or (from_me and not last_body):
+                continue
+            candidates = [
+                a for a in name_to_full_pipeline.get(_normalize_name(participant_name), [])
+                if a.get("stage") == PipelineStage.RESPONDED.value
+                and a.get("entry_id")
+                and not a.get("merged_into")  # §3.11 soft-deleted duplicates
+            ]
+            if not candidates:
+                continue
+            distinct_people = {str(a.get("record_id") or "") for a in candidates}
+            if not from_me:
+                # The prospect wrote last. The CRM can't record this
+                # (RESPONDED entries skip the reply loop), so flip the ball
+                # in the state file for entries we previously recorded as
+                # "ours" — the radar's cold-responder lane must not nudge
+                # someone who just answered. Local state only: no CRM write
+                # and no new state entries.
+                if len(distinct_people) > 1:
+                    # Same guard as the stamp path: we cannot tell whose
+                    # reply this is, and flipping both would silently hide
+                    # the other prospect's cold row until we DM again.
+                    counts["manual_touch_ambiguous_name"] += 1
+                    click.echo(
+                        f"  ⚠ manual-touch: {participant_name!r} matches "
+                        f"{len(distinct_people)} different people at Responded — "
+                        f"reply not attributed; neither entry's ball was flipped.",
+                        err=True,
+                    )
+                    continue
+                observed, fell_back = _manual_touch_date(
+                    row.get("lastMessageDate", ""), today_iso,
+                )
+                if fell_back:
+                    counts["manual_touch_date_fallback"] += 1
+                for attrs in candidates:
+                    entry_id = attrs["entry_id"]
+                    prior = state.get(entry_id)
+                    if not prior or prior.get("ball") == "theirs":
+                        continue
+                    state[entry_id] = {**prior, "ball": "theirs", "ball_observed": observed}
+                    dirty = True
+                    counts["manual_touch_prospect_replied"] += 1
+                    click.echo(
+                        f"  Prospect replied after your manual DM: {participant_name} "
+                        f"(entry {entry_id}, seen {observed}). The CRM does not record "
+                        f"replies on Responded entries — answer by hand; the radar "
+                        f"will not nudge them."
+                    )
+                continue
+            # Our own DM template echoed back is an automated send, not a
+            # manual touch — the cadence writers already stamped that one.
+            if _looks_like_self_echo(last_body) is not None:
+                continue
+            if len(distinct_people) > 1:
+                # Same normalized name, different people: we cannot tell
+                # which one was written to, and a wrong guess files the
+                # message on a stranger's record. Skip loudly.
+                counts["manual_touch_ambiguous_name"] += 1
+                click.echo(
+                    f"  ⚠ manual-touch: {participant_name!r} matches "
+                    f"{len(distinct_people)} different people at Responded — "
+                    f"skipped so one prospect's DM text is not filed on "
+                    f"another's record. Stamp by hand if needed.",
+                    err=True,
+                )
+                continue
+            total_raw = row.get("totalMessageCount", "").strip()
+            fingerprint = _manual_touch_fingerprint(last_body, total_raw)
+            touch_date, fell_back = _manual_touch_date(
+                row.get("lastMessageDate", ""), today_iso,
+            )
+            if fell_back:
+                counts["manual_touch_date_fallback"] += 1
+            for attrs in candidates:
+                entry_id = attrs["entry_id"]
+                record_id = str(attrs.get("record_id") or "")
+                prior = state.get(entry_id) or {}
+                if prior.get("fingerprint") == fingerprint:
+                    if prior.get("note_written", True):
+                        continue  # already recorded this exact touch
+                    # Stamp landed on an earlier run but the note did not:
+                    # retry the note only.
+                    if _write_manual_touch_note(
+                        attio,
+                        record_id=record_id,
+                        touch_date=str(prior.get("touch_date") or touch_date),
+                        body=last_body,
+                        participant_name=participant_name,
+                        entry_id=entry_id,
+                        counts=counts,
+                    ):
+                        state[entry_id] = {**prior, "note_written": True}
+                        dirty = True
+                    continue
+                existing = str(attrs.get("last_contact_date") or "")[:10]
+                if existing and existing >= touch_date:
+                    # The CRM already carries this touch or a later one —
+                    # never move last_contact_date backwards. Note only.
+                    stamped = True
+                else:
+                    try:
+                        writer.apply(WriteIntent(
+                            object="linkedin_outreach",
+                            record_id=entry_id,
+                            updates={"last_contact_date": touch_date},
+                            prior_values={"last_contact_date": attrs.get("last_contact_date")},
+                            writer_module=_MANUAL_TOUCH_WRITER,
+                            is_list_entry=True,
+                            list_id=list_id,
+                            companion_record_id=record_id or None,
+                        ))
+                        stamped = True
+                    except UnauthorizedAttioWriteError:
+                        # Registry/writer_module mismatch is a code bug — halt.
+                        raise
+                    except (AttioError, httpx.HTTPStatusError, httpx.RequestError) as exc:
+                        # AttioWriter already DLQ'd + escalated. No state
+                        # entry is written, so the next run retries.
+                        counts["manual_touch_failed"] += 1
+                        click.echo(
+                            f"  ⚠ manual-touch: last_contact_date stamp failed for "
+                            f"{participant_name} (entry {entry_id}) "
+                            f"[{type(exc).__name__}]: {exc}. Will retry next run.",
+                            err=True,
+                        )
+                        stamped = False
+                if not stamped:
+                    continue
+                counts["manual_touches_detected"] += 1
+                click.echo(
+                    f"  Manual DM detected for {participant_name} (entry {entry_id}) "
+                    f"→ last_contact_date={touch_date}, note 'DM manual — {touch_date}'."
+                )
+                note_ok = _write_manual_touch_note(
+                    attio,
+                    record_id=record_id,
+                    touch_date=touch_date,
+                    body=last_body,
+                    participant_name=participant_name,
+                    entry_id=entry_id,
+                    counts=counts,
+                )
+                state[entry_id] = {
+                    "fingerprint": fingerprint,
+                    "stamped_date": today_iso,
+                    "touch_date": touch_date,
+                    "note_written": note_ok,
+                    # Ball tracking (see module comment).
+                    "ball": "ours",
+                    "last_body": last_body[:_MANUAL_TOUCH_BODY_KEEP],
+                }
+                dirty = True
+    finally:
+        # Persist whatever landed, even if a later row raised: an unsaved
+        # fingerprint means a re-stamp + duplicate note on the next run.
+        if dirty:
+            try:
+                _save_manual_touch_state(path, state)
+            except OSError as exc:
+                counts["manual_touch_state_write_failed"] += 1
+                click.echo(
+                    f"  ⚠ manual-touch: could not write {path} "
+                    f"({type(exc).__name__}: {exc}). The touches above landed "
+                    f"in the CRM but their fingerprints were NOT saved — the "
+                    f"next run will re-stamp the same messages and file "
+                    f"duplicate notes until the file is writable.",
+                    err=True,
+                )
 
 
 class NoCSVHalt(RuntimeError):
@@ -2026,6 +2457,46 @@ def detect_responses(
         f"⚠{counts['defensive']} defensive) "
         f"[LLM: {counts['classifier_llm']}, keyword: {counts['classifier_keyword']}]."
     )
+
+    # Manual-DM touch detection. RESPONDED entries never reach the reply loop
+    # above (skip_stages), so this is a separate pass over the same scrape.
+    # Fail-open: nothing in here may break Phase 0.5 — its
+    # reply_detection_status gates DM sends — so anything short of a registry
+    # violation (a code bug that must halt) is logged with its traceback and
+    # counted, and the run continues into drift detection.
+    from clients.attio_writer import (
+        UnauthorizedAttioWriteError as _UnauthorizedManualTouch,
+    )
+    try:
+        _detect_manual_touches(
+            attio=attio,
+            list_id=list_id,
+            scraped_threads=scraped_threads,
+            name_to_full_pipeline=name_to_full_pipeline,
+            today_iso=date.today().isoformat(),
+            counts=counts,
+        )
+    except _UnauthorizedManualTouch:
+        raise
+    except Exception as exc:  # noqa: BLE001 — fail-open by design, see above
+        counts["manual_touch_pass_crashed"] += 1
+        click.echo(
+            f"  ❌ manual-touch pass crashed ({type(exc).__name__}: {exc}). "
+            f"Phase 0.5 continues. {counts['manual_touches_detected']} manual "
+            f"DM(s) were recorded before the crash (fingerprints saved); the "
+            f"rest were NOT stamped this run. Traceback:\n"
+            f"{traceback.format_exc()}",
+            err=True,
+        )
+    _manual_touch_report = {
+        k: v for k, v in counts.items() if k.startswith("manual_touch") and v
+    }
+    if _manual_touch_report:
+        click.echo(
+            "  Manual DMs: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(_manual_touch_report.items()))
+            + "."
+        )
 
     # Cadence drift detection — re-uses the inbox scrape to find any pipeline
     # entry whose Attio state disagrees with thread evidence. Monotonically-

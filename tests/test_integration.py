@@ -20,6 +20,10 @@ def _attio_with_full_schema(**extra_methods) -> MagicMock:
     tests that don't exercise the sweep directly.
     """
     attio = MagicMock()
+    # A bare MagicMock answers `_person_to_company.get()` with the SAME child
+    # mock for every record, so every prospect looks like it shares one company
+    # and the within-run same-company dedup silently drops rows. Start empty.
+    attio._person_to_company = {}
     attio.is_person_company_corrupted.return_value = False
     attio.get_list_attributes.return_value = [{"api_slug": s} for s in DM_ENTRY_WRITER_ATTRS]
     attio.get_object_attributes.return_value = [{"api_slug": s} for s in DM_COMPANY_WRITER_ATTRS]

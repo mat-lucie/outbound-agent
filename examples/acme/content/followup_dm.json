@@ -1,0 +1,7 @@
+{
+  "cold_responder": {
+    "es": "{name} - cómo estás?\n\nRetomo lo que conversamos por aquí sobre planeación de producción, {when}. No quiero insistir si no es prioridad ahora.\n\nSi tiene sentido, me mandas dos horarios esta semana? Y agendo 20 min. Si no es el momento, me avisas y lo dejo aquí.",
+    "en": "{name} - how are you?\n\nPicking up our thread about production planning from {when}. Don't want to push if it's not a priority right now.\n\nIf it makes sense, send me two slots this week and I'll set up 20 min? If the timing is off, tell me and I'll drop it.",
+    "pt": "{name} - tudo bem?\n\nRetomo nosso papo por aqui sobre planejamento de produção, {when}. Não quero insistir se não é prioridade agora.\n\nSe faz sentido, me manda dois horários esta semana? E agendo 20 min. Se não é o momento, me avisa e encerro o tópico por aqui."
+  }
+}

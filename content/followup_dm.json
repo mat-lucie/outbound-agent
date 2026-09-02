@@ -1,0 +1,7 @@
+{
+  "cold_responder": {
+    "es": "{name} - REPLACE_THIS_TEMPLATE: aquí va tu DM de seguimiento para retomar la conversación que quedó abierta {when}. Reemplázalo con tu propio mensaje.",
+    "en": "{name} - REPLACE_THIS_TEMPLATE: your follow-up DM picking the conversation back up from {when} goes here. Replace it with your own message.",
+    "pt": "{name} - REPLACE_THIS_TEMPLATE: aqui vai seu DM de retomada da conversa que ficou aberta {when}. Substitua por sua própria mensagem."
+  }
+}
