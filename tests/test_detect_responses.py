@@ -962,3 +962,542 @@ class TestSelfEchoGuard:
             assert "self-echo guard offline" not in (out2.out + out2.err)
         finally:
             dr._reset_self_echo_template_cache()
+
+
+# ── Test: manual-DM touch detection (Phase 0.5) ───────────────────────
+
+@pytest.fixture(autouse=True)
+def _isolate_manual_touch_state(tmp_path, monkeypatch):
+    """Never let a test write the real exports/manual_touch_state.json."""
+    monkeypatch.setattr(
+        "workflows.detect_responses.MANUAL_TOUCH_STATE_PATH",
+        tmp_path / "manual_touch_state.json",
+    )
+
+
+class TestManualTouchDetection:
+    """`_detect_manual_touches` stamps `last_contact_date` (to the row's
+    lastMessageDate) + a "DM manual" note when the inbox scrape shows OUR
+    last message on a RESPONDED entry, the body is not one of our
+    templates, and the (count|body) fingerprint is new for that entry.
+    Local JSON state keeps the same touch from re-recording on later runs.
+    """
+
+    NAME = "Vanessa Solis"
+    BODY = "Hola Vanessa, te dejo la propuesta que comentamos, cualquier duda me dices."
+    ROW_DATE = "2026-09-01T13:58:00Z"
+
+    def _row(self, *, body=None, from_me="true", name=None, count="5", row_date=None) -> dict:
+        return {
+            "participantProfileUrl": "https://linkedin.com/sales/people/ACw123",
+            "participantFullName": self.NAME if name is None else name,
+            "isLastMessageFromMe": from_me,
+            "lastMessageBody": self.BODY if body is None else body,
+            "lastMessageDate": self.ROW_DATE if row_date is None else row_date,
+            "totalMessageCount": count,
+        }
+
+    def _entry(self, stage=PipelineStage.RESPONDED.value, entry_id="e-resp",
+               record_id="r-resp", last_contact="2026-04-01", merged_into=None) -> dict:
+        e = _make_entry(entry_id, record_id, stage, dm_step=3)
+        e["prospect_name"] = self.NAME
+        e["company_name"] = "Acme"
+        e["last_contact_date"] = last_contact
+        e["merged_into"] = merged_into
+        return e
+
+    def _run(self, tmp_path, *, rows, entries, state=None, attio=None):
+        import json
+
+        from workflows.detect_responses import (
+            _detect_manual_touches,
+            _empty_counts,
+            _normalize_name,
+        )
+
+        state_path = tmp_path / "manual_touch_state.json"
+        if state is not None:
+            state_path.write_text(json.dumps(state) if not isinstance(state, str) else state)
+        attio = attio or MagicMock()
+        counts = _empty_counts()
+        index: dict[str, list[dict]] = {}
+        for e in entries:
+            index.setdefault(_normalize_name(e["prospect_name"]), []).append(e)
+        _detect_manual_touches(
+            attio=attio,
+            list_id="test-list-id",
+            scraped_threads=rows,
+            name_to_full_pipeline=index,
+            today_iso="2026-09-02",
+            counts=counts,
+            state_path=state_path,
+        )
+        return counts, attio, state_path
+
+    @staticmethod
+    def _state(state_path):
+        import json
+        return json.loads(state_path.read_text())
+
+    def test_counts_contract_has_manual_touch_keys(self):
+        from workflows.detect_responses import _empty_counts
+        c = _empty_counts()
+        for key in (
+            "manual_touches_detected", "manual_touch_failed", "manual_touch_note_failed",
+            "manual_touch_state_unreadable", "manual_touch_state_write_failed",
+            "manual_touch_pass_crashed", "manual_touch_guard_offline",
+            "manual_touch_ambiguous_name", "manual_touch_date_fallback",
+            "manual_touch_prospect_replied",
+        ):
+            assert c[key] == 0, key
+
+    def test_registry_authorizes_manual_touch_writer(self):
+        from clients.attio_writer_registry import is_authorized_writer
+        assert is_authorized_writer(
+            "linkedin_outreach", "last_contact_date",
+            "workflows.detect_responses._detect_manual_touches",
+        )
+
+    def test_stamps_note_and_state_on_new_manual_touch(self, tmp_path):
+        counts, attio, state_path = self._run(
+            tmp_path, rows=[self._row()], entries=[self._entry()],
+        )
+        assert counts["manual_touches_detected"] == 1
+        assert counts["manual_touch_failed"] == 0
+        attio.update_list_entry.assert_called_once()
+        kw = attio.update_list_entry.call_args[1]
+        # Stamped to the ROW's message date, not to today (2026-09-02).
+        assert kw["entry_attributes"] == {"last_contact_date": "2026-09-01"}
+        attio.create_note.assert_called_once()
+        note = attio.create_note.call_args[1]
+        assert note["record_id"] == "r-resp"
+        assert note["title"] == "DM manual — 2026-09-01"
+        assert note["content"] == self.BODY
+        saved = self._state(state_path)["e-resp"]
+        assert saved["touch_date"] == "2026-09-01"
+        assert saved["stamped_date"] == "2026-09-02"
+        assert saved["note_written"] is True
+        assert saved["fingerprint"]
+
+    def test_old_message_is_stamped_on_its_own_date(self, tmp_path):
+        """First run after deploy: a July manual DM must not become 'today'."""
+        counts, attio, _ = self._run(
+            tmp_path, rows=[self._row(row_date="2026-07-02T09:00:00Z")],
+            entries=[self._entry()],
+        )
+        assert counts["manual_touches_detected"] == 1
+        assert attio.update_list_entry.call_args[1]["entry_attributes"] == {
+            "last_contact_date": "2026-07-02"
+        }
+        assert attio.create_note.call_args[1]["title"] == "DM manual — 2026-07-02"
+
+    def test_missing_row_date_falls_back_to_today_and_counts(self, tmp_path):
+        counts, attio, _ = self._run(
+            tmp_path, rows=[self._row(row_date="")], entries=[self._entry()],
+        )
+        assert counts["manual_touches_detected"] == 1
+        assert counts["manual_touch_date_fallback"] == 1
+        assert attio.update_list_entry.call_args[1]["entry_attributes"] == {
+            "last_contact_date": "2026-09-02"
+        }
+
+    def test_never_moves_last_contact_date_backwards(self, tmp_path):
+        """The CRM already has a later touch → note only, no PATCH."""
+        counts, attio, state_path = self._run(
+            tmp_path, rows=[self._row(row_date="2026-08-20T09:00:00Z")],
+            entries=[self._entry(last_contact="2026-08-25")],
+        )
+        assert counts["manual_touches_detected"] == 1
+        attio.update_list_entry.assert_not_called()
+        attio.create_note.assert_called_once()
+        assert "e-resp" in self._state(state_path)
+
+    def test_skips_when_last_message_is_from_prospect(self, tmp_path):
+        counts, attio, _ = self._run(
+            tmp_path, rows=[self._row(from_me="false")], entries=[self._entry()],
+        )
+        assert counts["manual_touches_detected"] == 0
+        attio.update_list_entry.assert_not_called()
+        attio.create_note.assert_not_called()
+
+    def test_skips_non_responded_stage(self, tmp_path):
+        counts, attio, _ = self._run(
+            tmp_path, rows=[self._row()],
+            entries=[self._entry(stage=PipelineStage.DM1_SENT.value)],
+        )
+        assert counts["manual_touches_detected"] == 0
+        attio.update_list_entry.assert_not_called()
+
+    def test_skips_soft_deleted_duplicate(self, tmp_path):
+        counts, attio, _ = self._run(
+            tmp_path, rows=[self._row()],
+            entries=[self._entry(merged_into="e-winner")],
+        )
+        assert counts["manual_touches_detected"] == 0
+        attio.update_list_entry.assert_not_called()
+        attio.create_note.assert_not_called()
+
+    def test_same_fingerprint_does_not_rerecord(self, tmp_path):
+        counts1, _, state_path = self._run(
+            tmp_path, rows=[self._row()], entries=[self._entry()],
+        )
+        assert counts1["manual_touches_detected"] == 1
+        saved = self._state(state_path)
+        counts2, attio2, _ = self._run(
+            tmp_path, rows=[self._row()], entries=[self._entry()], state=saved,
+        )
+        assert counts2["manual_touches_detected"] == 0
+        attio2.update_list_entry.assert_not_called()
+        attio2.create_note.assert_not_called()
+
+    def test_new_body_is_a_new_touch(self, tmp_path):
+        _, _, state_path = self._run(tmp_path, rows=[self._row()], entries=[self._entry()])
+        saved = self._state(state_path)
+        counts, attio, _ = self._run(
+            tmp_path, rows=[self._row(body="Segundo mensaje manual, distinto.", count="6",
+                                      row_date="2026-09-02T10:00:00Z")],
+            entries=[self._entry()], state=saved,
+        )
+        assert counts["manual_touches_detected"] == 1
+        attio.update_list_entry.assert_called_once()
+        assert self._state(state_path)["e-resp"]["fingerprint"] != saved["e-resp"]["fingerprint"]
+
+    def test_identical_nudge_sent_again_is_a_new_touch(self, tmp_path):
+        """Same text, more messages in the thread → count is in the key."""
+        _, _, state_path = self._run(tmp_path, rows=[self._row(count="5")], entries=[self._entry()])
+        saved = self._state(state_path)
+        counts, attio, _ = self._run(
+            tmp_path, rows=[self._row(count="7", row_date="2026-09-02T10:00:00Z")],
+            entries=[self._entry()], state=saved,
+        )
+        assert counts["manual_touches_detected"] == 1
+        attio.update_list_entry.assert_called_once()
+
+    def test_own_template_body_is_not_a_manual_touch(self, tmp_path):
+        from models.campaign import load_messages
+        template = load_messages()["operations_leaders"]["dm1"]["es"]
+        echoed = template.replace("[Name]", "Vanessa").replace("[Company]", "Acme")
+        counts, attio, _ = self._run(
+            tmp_path, rows=[self._row(body=echoed)], entries=[self._entry()],
+        )
+        assert counts["manual_touches_detected"] == 0
+        attio.update_list_entry.assert_not_called()
+        attio.create_note.assert_not_called()
+
+    def test_template_guard_offline_skips_pass(self, tmp_path, capsys):
+        with patch("workflows.detect_responses._self_echo_templates", return_value=None):
+            counts, attio, _ = self._run(
+                tmp_path, rows=[self._row()], entries=[self._entry()],
+            )
+        assert counts["manual_touch_guard_offline"] == 1
+        assert counts["manual_touches_detected"] == 0
+        attio.update_list_entry.assert_not_called()
+        attio.create_note.assert_not_called()
+        assert "guard offline" in capsys.readouterr().err
+
+    def test_ambiguous_name_is_skipped_loudly(self, tmp_path, capsys):
+        two_people = [
+            self._entry(entry_id="e-a", record_id="r-a"),
+            self._entry(entry_id="e-b", record_id="r-b"),
+        ]
+        counts, attio, _ = self._run(tmp_path, rows=[self._row()], entries=two_people)
+        assert counts["manual_touch_ambiguous_name"] == 1
+        assert counts["manual_touches_detected"] == 0
+        attio.update_list_entry.assert_not_called()
+        attio.create_note.assert_not_called()
+        assert "different people" in capsys.readouterr().err
+
+    def test_same_person_two_entries_both_recorded(self, tmp_path):
+        """Two list entries for ONE record (same record_id) is not ambiguous."""
+        same_person = [
+            self._entry(entry_id="e-a", record_id="r-x"),
+            self._entry(entry_id="e-b", record_id="r-x"),
+        ]
+        counts, attio, _ = self._run(tmp_path, rows=[self._row()], entries=same_person)
+        assert counts["manual_touches_detected"] == 2
+        assert attio.update_list_entry.call_count == 2
+
+    def test_attio_write_failure_counts_and_leaves_no_state(self, tmp_path):
+        import httpx
+        attio = MagicMock()
+        attio.update_list_entry.side_effect = httpx.ConnectError("boom")
+        with patch("clients.attio_writer.AttioWriter._sleep_with_jitter", lambda *a, **k: None):
+            counts, attio, state_path = self._run(
+                tmp_path, rows=[self._row()], entries=[self._entry()], attio=attio,
+            )
+        assert counts["manual_touches_detected"] == 0
+        assert counts["manual_touch_failed"] == 1
+        attio.create_note.assert_not_called()
+        assert not state_path.exists() or "e-resp" not in self._state(state_path)
+
+    def test_note_failure_keeps_stamp_and_marks_note_pending(self, tmp_path, capsys):
+        import httpx
+        attio = MagicMock()
+        resp = MagicMock(status_code=500, text="server error")
+        attio.create_note.side_effect = httpx.HTTPStatusError(
+            "500", request=MagicMock(), response=resp,
+        )
+        counts, attio, state_path = self._run(
+            tmp_path, rows=[self._row()], entries=[self._entry()], attio=attio,
+        )
+        assert counts["manual_touches_detected"] == 1
+        assert counts["manual_touch_note_failed"] == 1
+        assert self._state(state_path)["e-resp"]["note_written"] is False
+        assert "note failed" in capsys.readouterr().err
+
+    def test_pending_note_is_retried_without_restamp(self, tmp_path):
+        import httpx
+        failing = MagicMock()
+        failing.create_note.side_effect = httpx.ConnectError("down")
+        _, _, state_path = self._run(
+            tmp_path, rows=[self._row()], entries=[self._entry()], attio=failing,
+        )
+        saved = self._state(state_path)
+        counts, attio, _ = self._run(
+            tmp_path, rows=[self._row()], entries=[self._entry()], state=saved,
+        )
+        attio.update_list_entry.assert_not_called()
+        attio.create_note.assert_called_once()
+        assert attio.create_note.call_args[1]["title"] == "DM manual — 2026-09-01"
+        assert counts["manual_touches_detected"] == 0
+        assert self._state(state_path)["e-resp"]["note_written"] is True
+
+    def test_mid_loop_crash_still_persists_landed_stamps(self, tmp_path):
+        attio = MagicMock()
+        attio.create_note.side_effect = [None, RuntimeError("unexpected")]
+        entries = [
+            self._entry(entry_id="e-1", record_id="r-1"),
+            self._entry(entry_id="e-2", record_id="r-2"),
+        ]
+        rows = [self._row(), self._row(name="Other Person")]
+        entries[1]["prospect_name"] = "Other Person"
+        with pytest.raises(RuntimeError):
+            self._run(tmp_path, rows=rows, entries=entries, attio=attio)
+        saved = self._state(tmp_path / "manual_touch_state.json")
+        assert "e-1" in saved and "e-2" not in saved
+
+    def test_corrupt_state_file_skips_pass_loudly(self, tmp_path, capsys):
+        counts, attio, _ = self._run(
+            tmp_path, rows=[self._row()], entries=[self._entry()], state="{not json",
+        )
+        assert counts["manual_touches_detected"] == 0
+        assert counts["manual_touch_state_unreadable"] == 1
+        attio.update_list_entry.assert_not_called()
+        attio.create_note.assert_not_called()
+        assert "manual_touch_state.json" in capsys.readouterr().err
+
+    def test_state_write_failure_is_loud_not_fatal(self, tmp_path, capsys):
+        import workflows.detect_responses as dr
+
+        def _boom(path, state):
+            raise OSError("disk full")
+
+        with patch.object(dr, "_save_manual_touch_state", side_effect=_boom):
+            counts, attio, _ = self._run(
+                tmp_path, rows=[self._row()], entries=[self._entry()],
+            )
+        assert counts["manual_touches_detected"] == 1
+        assert counts["manual_touch_state_write_failed"] == 1
+        assert "re-stamp" in capsys.readouterr().err
+
+    def _integration(self, pass_patch=None):
+        attio = MagicMock()
+        pb = MagicMock()
+        dm_entry = _make_entry("e-dm", "r-dm", PipelineStage.DM1_SENT.value)
+        responded = _make_entry("e-resp", "r-resp", PipelineStage.RESPONDED.value, dm_step=3)
+        attio.query_list_entries.return_value = [dm_entry, responded]
+        csv_content = _make_sn_csv(
+            self._row(),
+            {
+                "participantProfileUrl": "https://linkedin.com/sales/people/ACw9",
+                "participantFullName": "Carlos Lopez",
+                "isLastMessageFromMe": "true",
+                "lastMessageBody": "our dm1",
+                "lastMessageDate": "2026-09-01T10:00:00Z",
+                "totalMessageCount": "1",
+            },
+        )
+        pb.download_result_csv.return_value = csv_content
+        name_map = {
+            "r-dm": ("Carlos Lopez", "Beta", "https://li.com/in/carlos", "", ""),
+            "r-resp": (self.NAME, "Acme", "https://li.com/in/vanessa", "", ""),
+        }
+        with patch("workflows.detect_responses.AttioClient.parse_entry", side_effect=lambda e: e), \
+             patch("workflows.detect_responses._pb_session_args", return_value={}), \
+             patch("workflows.detect_responses.RecordCache") as MockCache:
+            MockCache.return_value = _setup_mocks(
+                attio, pb, [dm_entry, responded], csv_content, name_map,
+            )
+            if pass_patch is not None:
+                with pass_patch:
+                    result = detect_responses(attio, pb, inbox_scraper_id="scraper-123")
+            else:
+                result = detect_responses(attio, pb, inbox_scraper_id="scraper-123")
+        return result, attio
+
+    def test_detect_responses_runs_the_pass_after_reply_loop(self):
+        """Integration: a RESPONDED entry is invisible to the reply loop
+        (skip_stages) but must still be recorded by the manual-touch pass."""
+        result, attio = self._integration()
+        assert result["manual_touches_detected"] == 1
+        stamped = [
+            c for c in attio.update_list_entry.call_args_list
+            if c[1]["entry_attributes"] == {"last_contact_date": "2026-09-01"}
+        ]
+        assert len(stamped) == 1
+        titles = [c[1]["title"] for c in attio.create_note.call_args_list]
+        assert "DM manual — 2026-09-01" in titles
+
+    def test_pass_crash_is_counted_and_phase_completes(self, capsys):
+        """Fail-open: a crash inside the pass must not break Phase 0.5."""
+        result, _ = self._integration(
+            pass_patch=patch(
+                "workflows.detect_responses._detect_manual_touches",
+                side_effect=TypeError("bug"),
+            ),
+        )
+        assert result["manual_touch_pass_crashed"] == 1
+        assert result["manual_touch_failed"] == 0
+        assert "manual-touch pass crashed" in capsys.readouterr().err
+
+    def test_registry_violation_halts_phase(self):
+        from clients.attio_writer import UnauthorizedAttioWriteError
+        with pytest.raises(UnauthorizedAttioWriteError):
+            self._integration(
+                pass_patch=patch(
+                    "workflows.detect_responses._detect_manual_touches",
+                    side_effect=UnauthorizedAttioWriteError("bad writer"),
+                ),
+            )
+
+
+class TestManualTouchBallTracking:
+    """The state file also tracks WHO spoke last per entry so the follow-up
+    radar's cold-responder lane never nudges a prospect who answered a manual
+    DM (a reply the CRM cannot see)."""
+
+    NAME = TestManualTouchDetection.NAME
+    BODY = TestManualTouchDetection.BODY
+    ROW_DATE = TestManualTouchDetection.ROW_DATE
+    _row = TestManualTouchDetection._row
+    _entry = TestManualTouchDetection._entry
+    _run = TestManualTouchDetection._run
+    _state = staticmethod(TestManualTouchDetection._state)
+
+    def _ours_state(self, **over):
+        base = {
+            "fingerprint": "old-fp", "stamped_date": "2026-08-20",
+            "touch_date": "2026-08-20", "note_written": True,
+            "ball": "ours", "last_body": "Te dejo la propuesta.",
+        }
+        base.update(over)
+        return {"e-resp": base}
+
+    def test_new_state_entry_carries_ball_and_body(self, tmp_path):
+        counts, _, state_path = self._run(
+            tmp_path, rows=[self._row()], entries=[self._entry()],
+        )
+        assert counts["manual_touches_detected"] == 1
+        saved = self._state(state_path)["e-resp"]
+        assert saved["ball"] == "ours"
+        assert saved["last_body"] == self.BODY
+
+    def test_body_kept_in_state_is_truncated(self, tmp_path):
+        long_body = "x" * 900
+        counts, _, state_path = self._run(
+            tmp_path, rows=[self._row(body=long_body)], entries=[self._entry()],
+        )
+        assert counts["manual_touches_detected"] == 1
+        assert len(self._state(state_path)["e-resp"]["last_body"]) == 500
+
+    def test_prospect_reply_flips_ball_to_theirs_without_attio_write(self, tmp_path):
+        counts, attio, state_path = self._run(
+            tmp_path,
+            rows=[self._row(from_me="false", body="Gracias, lo reviso con mi equipo",
+                            row_date="2026-08-28T10:00:00Z", count="6")],
+            entries=[self._entry()],
+            state=self._ours_state(),
+        )
+        assert counts["manual_touch_prospect_replied"] == 1
+        assert counts["manual_touches_detected"] == 0
+        attio.update_list_entry.assert_not_called()
+        attio.create_note.assert_not_called()
+        saved = self._state(state_path)["e-resp"]
+        assert saved["ball"] == "theirs"
+        assert saved["ball_observed"] == "2026-08-28"
+        # The original touch record is preserved (idempotency intact).
+        assert saved["fingerprint"] == "old-fp"
+        assert saved["touch_date"] == "2026-08-20"
+
+    def test_prospect_reply_without_state_entry_is_ignored(self, tmp_path):
+        # Nothing recorded as ours → nothing to flip, no file created.
+        counts, attio, state_path = self._run(
+            tmp_path,
+            rows=[self._row(from_me="false", body="Hola, quién eres?")],
+            entries=[self._entry()],
+        )
+        assert counts["manual_touch_prospect_replied"] == 0
+        assert not state_path.exists()
+        attio.update_list_entry.assert_not_called()
+
+    def test_theirs_flip_is_idempotent(self, tmp_path):
+        state = self._ours_state(ball="theirs", ball_observed="2026-08-25")
+        counts, _, state_path = self._run(
+            tmp_path,
+            rows=[self._row(from_me="false", body="ok", row_date="2026-08-28T10:00:00Z")],
+            entries=[self._entry()],
+            state=state,
+        )
+        assert counts["manual_touch_prospect_replied"] == 0
+        assert self._state(state_path)["e-resp"]["ball_observed"] == "2026-08-25"
+
+    def test_new_manual_dm_after_their_reply_resets_ball_to_ours(self, tmp_path):
+        state = self._ours_state(ball="theirs", ball_observed="2026-08-25")
+        counts, _, state_path = self._run(
+            tmp_path,
+            rows=[self._row(count="7", body="Perfecto, te mando tres horarios.")],
+            entries=[self._entry()],
+            state=state,
+        )
+        assert counts["manual_touches_detected"] == 1
+        saved = self._state(state_path)["e-resp"]
+        assert saved["ball"] == "ours"
+        assert "ball_observed" not in saved
+        assert saved["last_body"] == "Perfecto, te mando tres horarios."
+
+    def test_unknown_from_me_value_is_inert(self, tmp_path):
+        # A renamed/missing column must never read as "prospect wrote last".
+        for raw in ("", "N/A", "yes"):
+            counts, attio, state_path = self._run(
+                tmp_path,
+                rows=[self._row(from_me=raw)],
+                entries=[self._entry()],
+                state=self._ours_state(),
+            )
+            assert counts["manual_touch_prospect_replied"] == 0, raw
+            assert counts["manual_touches_detected"] == 0, raw
+            assert self._state(state_path)["e-resp"]["ball"] == "ours", raw
+
+    def test_ambiguous_name_is_not_flipped(self, tmp_path):
+        state = {**self._ours_state(), "e-other": {**self._ours_state()["e-resp"]}}
+        counts, _, state_path = self._run(
+            tmp_path,
+            rows=[self._row(from_me="false", body="ok")],
+            entries=[self._entry(), self._entry(entry_id="e-other", record_id="r-other")],
+            state=state,
+        )
+        assert counts["manual_touch_prospect_replied"] == 0
+        assert counts["manual_touch_ambiguous_name"] == 1
+        saved = self._state(state_path)
+        assert saved["e-resp"]["ball"] == "ours" and saved["e-other"]["ball"] == "ours"
+
+    def test_flip_with_unparsable_date_falls_back_and_counts(self, tmp_path):
+        counts, _, state_path = self._run(
+            tmp_path,
+            rows=[self._row(from_me="false", body="ok", row_date="garbage")],
+            entries=[self._entry()],
+            state=self._ours_state(),
+        )
+        assert counts["manual_touch_prospect_replied"] == 1
+        assert counts["manual_touch_date_fallback"] == 1
+        assert self._state(state_path)["e-resp"]["ball_observed"] == "2026-09-02"
